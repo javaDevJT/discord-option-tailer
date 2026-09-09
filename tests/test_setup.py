@@ -523,6 +523,41 @@ class SetupManagerTests(unittest.TestCase):
             self.assertEqual(self.manager.status()["codex"]["state"], "not_connected")
         self.assertIsNone(self.manager._whitelisted_device_url("https://auth.openai.com:444/codex/device"))
 
+    def test_robinhood_inspection_failure_identifies_stage_without_private_data(self):
+        from relay.broker import RobinhoodBroker
+        original = self.path.read_bytes()
+
+        async def fake_inspect(args, config):
+            config["robinhood"]["account_number"] = "123456789"
+            try:
+                RobinhoodBroker(config)._qualified("get_accounts")
+            except Exception as error:
+                raise ExceptionGroup("private provider response", [error])
+
+        with patch("relay.setup.broker_login", AsyncMock()), patch("relay.setup.inspect_broker", fake_inspect):
+            self.manager.start_auth("robinhood")
+            self.wait_for(lambda: self.manager.status()["robinhood"]["state"] == "failed")
+        result = self.manager.status()["robinhood"]
+        self.assertIn("account inspection", result["detail"])
+        self.assertEqual(result["failure"]["phase"], "account_inspection")
+        self.assertEqual(result["failure"]["type"], "BrokerError")
+        self.assertEqual(result["failure"]["source"], "broker.py")
+        self.assertIsInstance(result["failure"]["line"], int)
+        self.assertFalse(result["token_present"])
+        self.assertNotIn("123456789", json.dumps(result))
+        self.assertNotIn("private provider response", json.dumps(result))
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_robinhood_failure_diagnostics_omit_exception_secrets(self):
+        error = RuntimeError("token=private-token code=private-code /private/path")
+        error.response = SimpleNamespace(status_code=401)
+        result = self.manager._robinhood_failure(ExceptionGroup("private response", [error]), "account_inspection")
+        self.assertEqual(result["failure"]["http_status"], 401)
+        self.assertNotIn("private", json.dumps(result))
+        timeout = self.manager._robinhood_failure(TimeoutError("private timeout"), "callback")
+        self.assertIn("expired before its callback", timeout["detail"])
+        self.assertNotIn("private", json.dumps(timeout))
+
     def test_fresh_robinhood_binding_uses_shadow_ledger(self):
         async def fake_login(config, *, authorization_handler=None):
             return {"tools": []}

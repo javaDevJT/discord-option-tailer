@@ -61,6 +61,7 @@ class _AuthCancelled(RuntimeError):
 @dataclass
 class _AuthJob:
     provider: str
+    phase: str = "initialization"
     cancelled: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
     process: subprocess.Popen[str] | None = None
@@ -206,6 +207,9 @@ class SetupManager:
         if "error" in parse_qs(actual.query):
             raise ValueError("Robinhood authorization was denied. Start sign-in again.")
         with self._lock:
+            if self._jobs.get("robinhood") is job and job.phase == "callback":
+                job.phase = "token_exchange"
+                self._auth_state["robinhood"] = {"state": "waiting", "detail": "Callback received. Completing Robinhood authorization."}
             return self._action_response_locked("robinhood_callback_received")
 
     def start_auth(self, provider: str, payload: dict | None = None) -> dict:
@@ -644,6 +648,9 @@ class SetupManager:
                 state = {"state": "not_connected", "detail": "Robinhood login is not configured."}
 
         result = self._safe_auth_projection(state)
+        result["token_present"] = token_ready
+        if isinstance(state.get("failure"), dict):
+            result["failure"] = {key: state["failure"][key] for key in ("phase", "type", "source", "line", "http_status") if key in state["failure"]}
         if account_number:
             result["last_four"] = account_number[-4:]
         report = self._read_safe_report(raw)
@@ -1140,7 +1147,9 @@ class SetupManager:
             # The broker login and inspector are the existing fixed helpers.
             # This config is only an in-memory inspection config; bind=None
             # prevents inspect_broker from writing the application config.
+            job.phase = "authorization"
             asyncio.run(self._robinhood_flow(job, temporary_config, temporary_report))
+            job.phase = "account_binding"
             selected = temporary_config.get("robinhood", {}).get("account_number")
             if not isinstance(selected, str) or not ACCOUNT_NUMBER.fullmatch(selected):
                 raise RuntimeError("Robinhood account selection was invalid")
@@ -1179,7 +1188,7 @@ class SetupManager:
                     "state": "cancelled",
                     "detail": "Robinhood setup was cancelled.",
                 }
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 if job.cancelled.is_set():
                     self._auth_state["robinhood"] = {
@@ -1189,7 +1198,7 @@ class SetupManager:
                 else:
                     self._auth_state["robinhood"] = {
                         "state": "failed",
-                        "detail": "Robinhood setup failed; check the account connection and saved binding.",
+                        **self._robinhood_failure(exc, job.phase),
                     }
         finally:
             if temporary_report is not None:
@@ -1200,6 +1209,7 @@ class SetupManager:
             with self._lock:
                 if job.cancelled.is_set():
                     raise _AuthCancelled
+                job.phase = "callback"
                 self._auth_state["robinhood"] = {
                     "state": "waiting",
                     "detail": "Open the Robinhood link in your browser. Account inspection follows authorization automatically.",
@@ -1213,12 +1223,50 @@ class SetupManager:
         with self._lock:
             if job.cancelled.is_set():
                 raise _AuthCancelled
+            job.phase = "account_inspection"
             self._auth_state["robinhood"] = {"state": "waiting", "detail": "Authorization complete. Inspecting your Robinhood account."}
         args = SimpleNamespace(bind=None, output=str(report))
         await self._await_with_cancel(
             lambda: self._invoke_fixed(inspect_broker, args, config),
             job.cancelled,
         )
+
+    @staticmethod
+    def _robinhood_failure(error: Exception, phase: str) -> dict:
+        """Expose stage/type/source, never exception text, requests, locals or tokens."""
+        pending, leaves = [error], []
+        for _ in range(20):
+            if not pending:
+                break
+            current = pending.pop(0)
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions[:20])
+            else:
+                leaves.append(current)
+        current = next((item for item in leaves if not isinstance(item, asyncio.CancelledError)), error)
+        kind = type(current).__name__
+        kind = kind if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", kind) else "Exception"
+        failure = {"phase": phase, "type": kind}
+        trace = current.__traceback__
+        while trace is not None:
+            source = Path(trace.tb_frame.f_code.co_filename)
+            if source.parent == Path(__file__).parent and source.name in {"setup.py", "broker.py", "cli.py"}:
+                failure.update(source=source.name, line=trace.tb_lineno)
+            trace = trace.tb_next
+        status = getattr(getattr(current, "response", None), "status_code", None)
+        if type(status) is int and 400 <= status <= 599:
+            failure["http_status"] = status
+        label = {"initialization": "initialization", "authorization": "authorization", "callback": "callback wait",
+                 "token_exchange": "token exchange", "account_inspection": "account inspection", "account_binding": "account binding"}.get(phase, "setup")
+        detail = f"Robinhood {label} failed ({kind}). Saved credentials were kept."
+        if isinstance(current, TimeoutError) and phase == "callback":
+            detail = "Robinhood sign-in expired before its callback arrived. Start a new attempt and finish within five minutes."
+        elif kind == "OAuthTokenError":
+            failure["phase"] = "token_exchange"
+            detail = "Robinhood rejected the token exchange. Start a new sign-in attempt; the returned URL can only be used once."
+        elif status in (401, 403):
+            detail = f"Robinhood rejected account access during {label} (HTTP {status})."
+        return {"detail": detail, "failure": failure}
 
     @staticmethod
     async def _invoke_fixed(operation, *args, **kwargs):
