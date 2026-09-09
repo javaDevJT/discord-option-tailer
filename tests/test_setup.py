@@ -1,16 +1,17 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import io
+import http.client
 import json
 import os
 import socket
-import threading
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlencode
 
 from relay.setup import SetupManager, _AuthJob, _AuthCancelled
 from relay.core import Store
@@ -380,6 +381,80 @@ class SetupManagerTests(unittest.TestCase):
             self.assertIsNone(captured["broker"].server)
             with socket.socket() as client:
                 self.assertNotEqual(client.connect_ex(captured["address"]), 0)
+
+    def test_pasted_callback_rejects_invalid_payloads_denial_and_offline_listener(self):
+        for payload in (None, {}, {"callback_url": 1}, {"callback_url": ""},
+                        {"callback_url": "x" * 8193}, {"callback_url": "x", "extra": True}):
+            with self.assertRaises(ValueError):
+                self.manager.complete_robinhood_callback(payload)
+        base = "http://127.0.0.1:8766/callback"
+        self.manager._jobs["robinhood"] = _AuthJob("robinhood")
+        self.manager._auth_state["robinhood"] = {
+            "state": "waiting", "authorization_url": "https://robinhood.com/oauth?" + urlencode({"redirect_uri": base}),
+        }
+        original = self.path.read_bytes()
+        with patch("relay.setup.http.client.HTTPConnection") as connection:
+            connection.return_value.getresponse.return_value.status = 200
+            with self.assertRaisesRegex(ValueError, "authorization was denied"):
+                self.manager.complete_robinhood_callback({"callback_url": base + "?error=access_denied&state=synthetic"})
+            connection.return_value.close.assert_called_once()
+            connection.return_value.request.side_effect = OSError("private listener detail")
+            with self.assertRaisesRegex(RuntimeError, "callback listener is unavailable"):
+                self.manager.complete_robinhood_callback({"callback_url": base + "?code=synthetic&state=synthetic"})
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_pasted_callback_reuses_listener_state_and_preserves_saved_data(self):
+        from relay.broker import RobinhoodMCP
+        started = threading.Event()
+        received = threading.Event()
+        captured = {}
+        start_server, http_connection = asyncio.start_server, http.client.HTTPConnection
+        callback_base = "http://127.0.0.1:8766/callback"
+        authorization = "https://robinhood.com/oauth?" + urlencode({
+            "state": "synthetic-callback-state", "redirect_uri": callback_base})
+        original = self.path.read_bytes()
+
+        async def temporary_listener(callback, host, port, **kwargs):
+            return await start_server(callback, host, 0, **kwargs)
+
+        async def login(config, *, authorization_handler=None):
+            broker = RobinhoodMCP(config, interactive=True, authorization_handler=authorization_handler)
+            try:
+                await broker._redirect(authorization)
+                captured["address"] = broker.server.sockets[0].getsockname()
+                started.set()
+                captured["result"] = await broker._callback()
+                received.set()
+                await asyncio.sleep(3600)  # Hold before account inspection for this callback-only check.
+            finally:
+                await broker.__aexit__(None, None, None)
+
+        def connect(host, port, **kwargs):
+            self.assertEqual((host, port), ("127.0.0.1", 8766))
+            return http_connection(*captured["address"], **kwargs)
+
+        with patch("relay.setup.broker_login", login), \
+                patch("relay.broker.asyncio.start_server", temporary_listener), \
+                patch("relay.setup.http.client.HTTPConnection", side_effect=connect) as network:
+            self.manager.start_auth("robinhood")
+            self.assertTrue(started.wait(3))
+            for url in ("https://foreign.example/callback?code=secret&state=x",
+                        callback_base + "#code=secret", callback_base + "?code=x\r\nX: y",
+                        "http://user@127.0.0.1:8766/callback?code=secret&state=x"):
+                with self.assertRaises(ValueError):
+                    self.manager.complete_robinhood_callback({"callback_url": url})
+            network.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "rejected"):
+                self.manager.complete_robinhood_callback({"callback_url": callback_base + "?code=secret&state=wrong"})
+            self.assertFalse(received.is_set())
+            result = self.manager.complete_robinhood_callback({"callback_url": callback_base + "?code=synthetic-code&state=synthetic-callback-state"})
+            self.assertTrue(received.wait(3))
+            self.assertEqual(captured["result"], ("synthetic-code", "synthetic-callback-state"))
+            self.assertNotIn("synthetic-code", json.dumps(result))
+            self.assertEqual(self.path.read_bytes(), original)
+            self.manager.cancel_auth("robinhood")
+            with self.assertRaisesRegex(RuntimeError, "No Robinhood sign-in"):
+                self.manager.complete_robinhood_callback({"callback_url": callback_base + "?code=synthetic-code&state=synthetic-callback-state"})
 
     def test_cancelled_flow_never_starts_next_provider_operation(self):
         event = threading.Event()

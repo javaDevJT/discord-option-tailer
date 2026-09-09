@@ -52,7 +52,9 @@ Select **Start Codex sign-in**, open the displayed device verification link in y
 
 ### Robinhood connection
 
-Select **Start Robinhood sign-in**, open the displayed authorization link in your normal browser, and approve the OAuth request. For a remote Docker host, set `RELAY_ROBINHOOD_REDIRECT_URI` to its dashboard address ending in `/callback` and redeploy; the callback then uses the dashboard port without a tunnel. The default remains local loopback port `8766`. After authorization, Setup performs account inspection and saves the selected account binding. Choose an explicit account only when more than one eligible account requires a choice.
+Select **Start Robinhood sign-in**, open the displayed authorization link in your normal browser, and approve the OAuth request. The default callback uses localhost port `8766`. With a remote Docker host, the returned page may show a connection error: copy the complete address from that tab, paste it into **Returned callback URL** in Setup, and select **Finish Robinhood sign-in**. Complete this within the five-minute sign-in window. Setup validates the callback against the active attempt and passes it to the existing state/PKCE flow; the pasted URL is not saved. After authorization, Setup performs account inspection and saves the selected account binding. Choose an explicit account only when more than one eligible account requires a choice.
+
+`RELAY_ROBINHOOD_REDIRECT_URI` can override the callback with an HTTP(S) address ending in `/callback`. The bundled proxy supports callbacks on the dashboard port, but public registration accepting an address does not prove Robinhood will accept it during authorization. A Robinhood-hosted connection-error page occurs before a callback and cannot be completed by pasting that error-page address.
 
 Authentication, account inspection, and order execution are separate stages. Setup does not review, place, cancel, or claim a fill for an order. Keep the relay in Shadow while verifying the connection.
 

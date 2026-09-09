@@ -19,7 +19,7 @@ class SetupHTTPTests(unittest.TestCase):
         self.app = DashboardApp(self.config)
         self.manager = Mock()
         self.manager.status.return_value = {"configured": False}
-        for name in ("save_channels", "save_notifications", "start_auth", "cancel_auth", "set_paused", "set_mode", "reconnect", "discover_discord"):
+        for name in ("save_channels", "save_notifications", "start_auth", "cancel_auth", "complete_robinhood_callback", "set_paused", "set_mode", "reconnect", "discover_discord"):
             getattr(self.manager, name).return_value = {"accepted": True}
         self.app.setup = self.manager
         self.server = DashboardHTTPServer(("127.0.0.1", 0), self.app)
@@ -60,6 +60,7 @@ class SetupHTTPTests(unittest.TestCase):
             ("reconnect", {}, "reconnect", ()),
             ("auth/codex/start", {}, "start_auth", ("codex", {})),
             ("auth/robinhood/cancel", {}, "cancel_auth", ("robinhood",)),
+            ("auth/robinhood/callback", {"callback_url": "http://127.0.0.1:8766/callback?code=synthetic&state=test"}, "complete_robinhood_callback", ({"callback_url": "http://127.0.0.1:8766/callback?code=synthetic&state=test"},)),
         ]
         for path, payload, name, args in actions:
             with self.subTest(path=path):

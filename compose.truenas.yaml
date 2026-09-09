@@ -20,7 +20,7 @@ services:
       RELAY_CONFIG: /data/config.json
       # Docker forwards the host-loopback port to the container interface.
       RELAY_OAUTH_CALLBACK_HOST: "0.0.0.0"
-      RELAY_ROBINHOOD_REDIRECT_URI: "${RELAY_ROBINHOOD_REDIRECT_URI:?Set RELAY_ROBINHOOD_REDIRECT_URI to the dashboard URL ending in /callback}"
+      RELAY_ROBINHOOD_REDIRECT_URI: "${RELAY_ROBINHOOD_REDIRECT_URI:-http://127.0.0.1:8766/callback}"
       DASHBOARD_USER: "${DASHBOARD_USER:-relay}"
       # Leave empty to let bootstrap.py create /data/dashboard.password once.
       DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"

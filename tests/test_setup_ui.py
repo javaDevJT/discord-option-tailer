@@ -197,6 +197,12 @@ class SetupUITests(unittest.TestCase):
                     )
                 elif path == "/api/setup/auth/robinhood/cancel":
                     state["status"]["robinhood"] = {"state": "cancelled", "detail": "Robinhood sign-in cancelled."}
+                elif path == "/api/setup/auth/robinhood/callback":
+                    callback_error = state.get("callback_error")
+                    if callback_error:
+                        fulfill(route, {"error": {"detail": callback_error["detail"]}}, callback_error.get("status", 400))
+                        return
+                    state["status"]["robinhood"] = {"state": "connected", "detail": "Robinhood sign-in completed."}
                 elif path == "/api/setup/channels":
                     state["status"]["channels"] = body.get("channels", [])
                     state["status"]["poll_seconds"] = body.get("poll_seconds", 3)
@@ -290,10 +296,17 @@ class SetupUITests(unittest.TestCase):
                 expect(page.locator("#browser-login-dialog")).to_be_hidden()
                 self.assertIn(("/api/setup/auth/robinhood/start", {"account_number": "12344321"}), state["requests"])
 
+                callback_form = page.locator("#robinhood-remote-callback")
+                callback_form.locator("summary").click()
+                callback_input = page.locator("#robinhood-callback-url")
+                callback_input.fill("https://127.0.0.1:8766/callback?code=cancelled&state=synthetic-state")
+
                 with page.expect_response(lambda response: response.url.endswith("/api/setup/auth/robinhood/cancel")):
                     page.locator("#robinhood-cancel").click()
                 expect(page.locator("#robinhood-authorization-url")).to_be_hidden()
                 self.assertIsNone(page.locator("#robinhood-authorization-url").get_attribute("href"))
+                expect(callback_input).to_have_value("")
+                expect(callback_form).to_be_hidden()
 
                 with page.expect_response(lambda response: response.url.endswith("/api/setup/pause")):
                     page.get_by_role("button", name="Pause relay").click()
@@ -306,6 +319,71 @@ class SetupUITests(unittest.TestCase):
                 with page.expect_response(lambda response: response.url.endswith("/api/setup/reconnect")):
                     page.get_by_role("button", name="Reconnect").click()
                 self.assertIn(("/api/setup/reconnect", {}), state["requests"])
+            finally:
+                browser.close()
+
+    def test_robinhood_remote_callback_posts_once_and_clears_on_completion(self):
+        callback_url = "http://127.0.0.1:8766/callback?code=approved&state=synthetic-state"
+        authorization_url = "https://robinhood.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A8766%2Fcallback&state=synthetic-state"
+        state = {
+            "status": self.status_payload(),
+            "headers": [],
+            "requests": [],
+            "discovery_requests": [],
+            "robinhood_authorization_url": authorization_url,
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                callback_form = page.locator("#robinhood-remote-callback")
+                callback_input = page.locator("#robinhood-callback-url")
+                callback_submit = page.locator("#robinhood-callback-submit")
+                expect(callback_form).to_be_hidden()
+                expect(callback_submit).to_be_disabled()
+
+                page.locator("#robinhood-start").click()
+                expect(callback_form).to_be_visible()
+                expect(callback_input).to_have_attribute("type", "password")
+                expect(callback_input).to_have_attribute("autocomplete", "off")
+                expect(callback_input).to_have_attribute("spellcheck", "false")
+                page.wait_for_timeout(250)
+                self.assertFalse(any(path == "/api/setup/auth/robinhood/callback" for path, _body in state["requests"]))
+
+                callback_form.locator("summary").click()
+                callback_input.fill(callback_url)
+                expect(callback_submit).to_be_enabled()
+                with page.expect_response(lambda response: response.url.endswith("/api/setup/auth/robinhood/callback")):
+                    callback_submit.click()
+
+                self.assertIn(("/api/setup/auth/robinhood/callback", {"callback_url": callback_url}), state["requests"])
+                expect(callback_input).to_have_value("")
+                expect(callback_form).to_be_hidden()
+                expect(callback_submit).to_be_disabled()
+            finally:
+                browser.close()
+
+    def test_robinhood_remote_callback_error_is_shown_without_retaining_url(self):
+        callback_url = "http://127.0.0.1:8766/callback?code=bad&state=synthetic-state"
+        authorization_url = "https://robinhood.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A8766%2Fcallback&state=synthetic-state"
+        state = {
+            "status": self.status_payload(),
+            "headers": [],
+            "requests": [],
+            "discovery_requests": [],
+            "robinhood_authorization_url": authorization_url,
+            "callback_error": {"detail": "The returned URL must match the callback address for this sign-in attempt"},
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                page.locator("#robinhood-start").click()
+                page.locator("#robinhood-remote-callback summary").click()
+                callback_input = page.locator("#robinhood-callback-url")
+                callback_input.fill(callback_url)
+                with page.expect_response(lambda response: response.url.endswith("/api/setup/auth/robinhood/callback")):
+                    page.locator("#robinhood-callback-submit").click()
+                expect(callback_input).to_have_value("")
+                expect(page.locator("#robinhood-setup-detail")).to_contain_text("Could not update setup: The returned URL must match")
             finally:
                 browser.close()
 

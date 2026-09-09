@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import http.client
 import inspect
 import json
 import os
@@ -26,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .broker import _OAuthStorage, login as broker_login
 from .cli import inspect_broker
@@ -159,6 +160,53 @@ class SetupManager:
             runtime_path = self._configured_path(raw, "runtime_status_file", self.config_path.parent / "state/runtime-status.json")
             request_discovery(runtime_path, payload)
             return self._action_response_locked("discovery_requested")
+
+    def complete_robinhood_callback(self, payload: dict) -> dict:
+        """Forward a user-pasted callback to the active, state-bound local listener."""
+        if (not isinstance(payload, dict) or set(payload) != {"callback_url"}
+                or not isinstance(payload["callback_url"], str)
+                or not 1 <= len(payload["callback_url"]) <= 8192):
+            raise ValueError("Paste the complete returned Robinhood callback URL")
+        supplied = payload["callback_url"].strip()
+        with self._lock:
+            self._ensure_open_locked()
+            active = self._auth_state.get("robinhood", {})
+            job = self._jobs.get("robinhood")
+            if (active.get("state") != "waiting" or not active.get("authorization_url")
+                    or job is None or job.cancelled.is_set()):
+                raise RuntimeError("No Robinhood sign-in is waiting. Start sign-in again.")
+            authorization_url = active["authorization_url"]
+        try:
+            expected_uris = parse_qs(urlsplit(authorization_url).query).get("redirect_uri", [])
+            if len(expected_uris) != 1:
+                raise ValueError
+            expected, actual = urlsplit(expected_uris[0]), urlsplit(supplied)
+            if (actual.scheme not in {"http", "https"}
+                    or (actual.scheme, actual.netloc, actual.path) != (expected.scheme, expected.netloc, expected.path)
+                    or actual.username is not None or actual.password is not None
+                    or actual.path != "/callback" or not actual.query
+                    or any(char in supplied for char in "#\\")
+                    or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in supplied)):
+                raise ValueError
+        except ValueError:
+            raise ValueError("The returned URL must match the callback address for this sign-in") from None
+        # The destination is fixed: pasted URLs never control a network host.
+        connection = http.client.HTTPConnection("127.0.0.1", 8766, timeout=5)
+        try:
+            connection.request("GET", "/callback?" + actual.query)
+            response = connection.getresponse()
+            status = response.status
+            response.read(4096)
+        except (OSError, http.client.HTTPException, UnicodeError):
+            raise RuntimeError("The callback listener is unavailable. Start Robinhood sign-in again.") from None
+        finally:
+            connection.close()
+        if status != 200:
+            raise ValueError("The callback was rejected. Copy the complete address from this sign-in attempt.")
+        if "error" in parse_qs(actual.query):
+            raise ValueError("Robinhood authorization was denied. Start sign-in again.")
+        with self._lock:
+            return self._action_response_locked("robinhood_callback_received")
 
     def start_auth(self, provider: str, payload: dict | None = None) -> dict:
         """Start one of the two fixed, bounded authentication jobs."""

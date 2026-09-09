@@ -943,6 +943,8 @@
     dirtyChannels: false,
     loadedChannels: false,
     authActive: { codex: false, robinhood: false },
+    robinhoodCallbackInFlight: false,
+    robinhoodCallbackAuthorizationUrl: "",
     dialogProvider: "discord",
     dialogReturnFocus: null,
     pollTimer: null,
@@ -1472,6 +1474,30 @@
       return "";
     }
   };
+  const setupIsLoopbackHost = (value) => {
+    const host = setupText(value, "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || host === "127.0.0.1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  };
+  const setupRobinhoodCallbackUrl = (part, authorizationUrl) => {
+    const explicit = setupText(part?.redirect_uri, "").trim();
+    try {
+      const authUrl = new URL(authorizationUrl);
+      const raw = explicit || authUrl.searchParams.get("redirect_uri") || "";
+      if (!raw) return null;
+      const callbackUrl = new URL(raw);
+      return ["http:", "https:"].includes(callbackUrl.protocol) ? callbackUrl : null;
+    } catch {
+      return null;
+    }
+  };
+  const setupRobinhoodRemoteCallbackRequired = (part, authorizationUrl) => {
+    const callbackUrl = setupRobinhoodCallbackUrl(part, authorizationUrl);
+    return Boolean(callbackUrl && setupIsLoopbackHost(callbackUrl.hostname) && !setupIsLoopbackHost(window.location.hostname));
+  };
+  const setupClearRobinhoodCallback = () => {
+    const input = setupById("robinhood-callback-url");
+    if (input) input.value = "";
+  };
   const setupRenderCodex = (part) => {
     const stateName = setupStatusValue(part);
     const waiting = ["starting", "waiting"].includes(stateName);
@@ -1505,6 +1531,10 @@
     setupSetStatus("robinhood-setup-status", stateName);
     setupSetText("robinhood-setup-detail", setupDetail(part, "Waiting for setup status."));
     const authorizationUrl = waiting ? setupApprovedRobinhoodUrl(part?.authorization_url) : "";
+    const authorizationChanged = authorizationUrl !== setupState.robinhoodCallbackAuthorizationUrl;
+    if (authorizationChanged) setupClearRobinhoodCallback();
+    setupState.robinhoodCallbackAuthorizationUrl = authorizationUrl;
+    if (!authorizationUrl) setupState.robinhoodCallbackInFlight = false;
     const authorizationLink = setupById("robinhood-authorization-url");
     const authorizationEmpty = setupById("robinhood-authorization-url-empty");
     if (authorizationLink) {
@@ -1515,6 +1545,16 @@
     if (authorizationEmpty) authorizationEmpty.hidden = Boolean(authorizationUrl);
     const progress = setupById("robinhood-progress");
     if (progress) progress.hidden = !authorizationUrl;
+    const remoteCallback = setupById("robinhood-remote-callback");
+    if (remoteCallback) {
+      remoteCallback.hidden = !authorizationUrl;
+      if (!authorizationUrl) remoteCallback.open = false;
+      else if (authorizationChanged && setupRobinhoodRemoteCallbackRequired(part, authorizationUrl)) remoteCallback.open = true;
+    }
+    const callbackInput = setupById("robinhood-callback-url");
+    const callbackSubmit = setupById("robinhood-callback-submit");
+    if (callbackInput) callbackInput.disabled = !authorizationUrl || setupState.robinhoodCallbackInFlight;
+    if (callbackSubmit) callbackSubmit.disabled = !authorizationUrl || setupState.robinhoodCallbackInFlight;
     const lastFour = setupAccountLastFour(part);
     const summary = setupById("robinhood-account-summary");
     if (summary) summary.hidden = !lastFour;
@@ -1753,6 +1793,28 @@
     }
     setupSchedulePoll();
   };
+  const setupCompleteRobinhoodCallback = async () => {
+    if (setupState.robinhoodCallbackInFlight || !setupState.robinhoodCallbackAuthorizationUrl) return;
+    const input = setupById("robinhood-callback-url");
+    const callbackUrl = setupText(input?.value, "").trim();
+    if (!callbackUrl) return;
+    setupState.robinhoodCallbackInFlight = true;
+    setupClearRobinhoodCallback();
+    setupRenderRobinhood(setupPart(setupState.status, "robinhood"));
+    const status = await setupPost(
+      "/api/setup/auth/robinhood/callback",
+      { callback_url: callbackUrl },
+      "robinhood-setup-detail",
+    );
+    setupState.robinhoodCallbackInFlight = false;
+    if (status) setupRenderRobinhood(setupPart(setupState.status, "robinhood"));
+    else {
+      const activeUrl = setupState.robinhoodCallbackAuthorizationUrl;
+      if (input) input.disabled = !activeUrl;
+      const submit = setupById("robinhood-callback-submit");
+      if (submit) submit.disabled = !activeUrl;
+    }
+  };
   const setupClearRowAuthors = (row) => {
     const select = setupField(row, "author_choices");
     const input = setupField(row, "authors");
@@ -1889,6 +1951,10 @@
     setupById("codex-cancel")?.addEventListener("click", () => setupAuth("codex", false));
     setupById("robinhood-start")?.addEventListener("click", () => setupAuth("robinhood", true));
     setupById("robinhood-cancel")?.addEventListener("click", () => setupAuth("robinhood", false));
+    setupById("robinhood-callback-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      setupCompleteRobinhoodCallback();
+    });
     const notificationsForm = setupById("notifications-form");
     notificationsForm?.addEventListener("input", () => {
       setupState.notificationsDirty = true;

@@ -806,6 +806,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/setup/discord/discover",
             "/api/setup/auth/codex/start", "/api/setup/auth/codex/cancel",
             "/api/setup/auth/robinhood/start", "/api/setup/auth/robinhood/cancel",
+            "/api/setup/auth/robinhood/callback",
         }
         # Close rejected writes so their unread body cannot become another request.
         self.close_connection = True
@@ -848,6 +849,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if payload:
                     raise ValueError("Reconnect does not accept parameters")
                 result = manager.reconnect()
+            elif path == "/api/setup/auth/robinhood/callback":
+                result = manager.complete_robinhood_callback(payload)
             else:
                 provider, action = path.split("/")[-2:]
                 if action == "cancel":

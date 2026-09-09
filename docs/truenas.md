@@ -11,7 +11,7 @@ RELAY_IMAGE=ghcr.io/javadevjt/discord-option-tailer:latest
 RELAY_DATA_DIR=/mnt/tank/apps/discord-option-tailer
 HTTP_BIND=192.168.1.20
 HTTP_PORT=8787
-RELAY_ROBINHOOD_REDIRECT_URI=http://192.168.1.20:8787/callback
+RELAY_ROBINHOOD_REDIRECT_URI=http://127.0.0.1:8766/callback
 DASHBOARD_USER=relay
 DASHBOARD_PASSWORD=
 ```
@@ -33,9 +33,11 @@ Open `http://192.168.1.20:8787` from a trusted LAN client. Set `HTTP_BIND` to th
 
 ## Robinhood authorization from a remote browser
 
-Set the app environment variable `RELAY_ROBINHOOD_REDIRECT_URI` to the address your browser uses for the dashboard, with the exact path `/callback`. For the example above, use `http://192.168.1.20:8787/callback`; an HTTPS reverse proxy can use `https://relay.example.com/callback`. Queries, fragments and embedded credentials are rejected. Use HTTP only on a trusted LAN; use HTTPS when available. If using another reverse proxy, disable access and error request logging for `/callback` there too so OAuth codes do not enter its logs.
+Keep the default `RELAY_ROBINHOOD_REDIRECT_URI=http://127.0.0.1:8766/callback`. Open **Setup → Start Robinhood sign-in** and complete authorization in your normal browser. If the returned localhost page cannot connect, copy its complete address into **Returned callback URL** in Setup and select **Finish Robinhood sign-in** within five minutes of starting. No tunnel or remote desktop is needed. Only a callback matching the active attempt is accepted; state and PKCE checks still apply. The returned URL contains a temporary authorization code: paste it only into your private Setup page.
 
-Redeploy after changing the environment, open **Setup → Start Robinhood sign-in**, and complete authorization in your normal browser. No SSH tunnel is needed. The dashboard proxy forwards the callback to port 8766 inside the container. A link created before redeployment must be replaced by starting sign-in again. Changing this setting does not clear saved tokens, client registration, dashboard credentials or account bindings. Keep the existing `/data` storage and environment when upgrading.
+An optional override can point to your dashboard's exact `/callback` route, such as `http://192.168.1.20:8787/callback` or `https://relay.example.com/callback`. The bundled proxy forwards that route to the internal listener. Robinhood accepting a URL during public registration does not establish that authenticated authorization accepts it; verify the complete provider flow before relying on a custom address. Queries, fragments and embedded credentials are rejected. Use HTTP only on a trusted LAN and HTTPS when available. If using another reverse proxy, disable access and error request logging for `/callback` there too.
+
+Redeploy after changing the environment and start a new sign-in attempt. Changing this setting does not clear saved tokens, client registration, dashboard credentials or account bindings. Keep the existing `/data` storage and environment when upgrading. A Robinhood-hosted error page is an authorization failure before the callback; pasting that error-page URL cannot complete sign-in.
 
 ## First run and maintenance
 

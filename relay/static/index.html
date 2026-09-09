@@ -257,6 +257,19 @@
                 <div class="auth-progress" id="robinhood-progress" hidden>
                   <p class="auth-progress-label">Continue Robinhood sign-in in your browser.</p>
                   <a id="robinhood-authorization-url" href="#" target="_blank" rel="noopener noreferrer" hidden>Open robinhood.com</a><span id="robinhood-authorization-url-empty">Waiting for authorization URL</span>
+                  <details id="robinhood-remote-callback" hidden>
+                    <summary>Finish sign-in from another computer</summary>
+                    <p class="setup-help setup-help-small" id="robinhood-remote-callback-help">After approving Robinhood, the localhost page may not connect. Copy its entire address and paste it here.</p>
+                    <form id="robinhood-callback-form" autocomplete="off" novalidate>
+                      <label class="field">
+                        <span class="field-label">Returned callback URL</span>
+                        <input id="robinhood-callback-url" type="password" inputmode="url" autocomplete="off" spellcheck="false" aria-describedby="robinhood-remote-callback-help" placeholder="Paste the complete callback address">
+                      </label>
+                      <div class="auth-actions">
+                        <button class="button button-filter" id="robinhood-callback-submit" type="submit" disabled>Finish Robinhood sign-in</button>
+                      </div>
+                    </form>
+                  </details>
                 </div>
                 <p class="setup-card-detail" id="robinhood-setup-detail">Waiting for setup status.</p>
                 <div class="account-summary" id="robinhood-account-summary" hidden>
