@@ -420,7 +420,9 @@ class DiscoveryWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_timeout_persists_bounded_failure_and_cleans_page(self):
         with tempfile.TemporaryDirectory() as directory, patch(
             "relay.discovery.REQUEST_TIMEOUT_SECONDS", 0.02
-        ):
+        ), patch("relay.discovery._expired", return_value=False):
+            # Exercise an in-flight timeout; a slow CI scheduler must not expire
+            # the queued request before the worker has even created its page.
             runtime = _runtime(Path(directory))
             request_discovery(runtime, {})
             page = _FakePage(slow=True)
@@ -434,6 +436,7 @@ class DiscoveryWorkerTests(unittest.IsolatedAsyncioTestCase):
                     await task
             self.assertEqual(status["state"], "failed")
             self.assertIn("timed out", status["detail"])
+            self.assertEqual(context.new_page_calls, 1)
             self.assertTrue(page.closed)
 
     async def test_new_page_is_closed_when_navigation_is_cancelled_before_return(self):
