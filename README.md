@@ -23,7 +23,7 @@ Private account exports, browser profiles, OAuth state, databases, and local cre
 2. The relay stores normalized messages and passes a bounded chronological context window to Codex. Codex runs through the user's ChatGPT subscription; no OpenAI API key is required.
 3. Deterministic checks require a clear standard option contract, an allowed source, fresh inputs, current quotes, account-relative sizing, and a mode-specific ledger.
 4. The dashboard shows messages, interpretations, holds, recorded orders, relay-owned positions, and recovery assessments. An optional Discord webhook reports selected setup assistance and relay actions.
-5. Robinhood access uses its normal browser OAuth flow and a local callback. Passwords and MFA stay with Robinhood; setup performs account inspection before any execution mode can be selected.
+5. Robinhood access uses its normal browser OAuth flow and a configurable callback. Passwords and MFA stay with Robinhood; setup performs account inspection before any execution mode can be selected.
 
 ## Fresh messages and recovery
 
@@ -84,7 +84,7 @@ Use the dashboard's **Setup** section to complete the four integrations:
 
 1. **Discord:** open **Browser login**, sign in to the personal account, refresh the server list, choose one channel for each of the two rows, and save. Choose `Signals` for actionable channels and `Context` for context-only channels. Author restrictions are optional; an unchecked restriction accepts all authors in that channel. The browser profile remains in the volume.
 2. **Codex:** start device sign-in, open the displayed verification link in the user's own browser, and enter the displayed code. The container keeps the subscription login in its persistent data volume and does not ask for an API key.
-3. **Robinhood:** start sign-in and open the displayed authorization link in the user's normal browser. The local callback uses port `8766`; account inspection and binding finish in Setup. Choose an explicit account only when the eligible-account choice is not unique. Setup does not place an order.
+3. **Robinhood:** start sign-in and open the displayed authorization link in the user's normal browser. For remote deployments, set `RELAY_ROBINHOOD_REDIRECT_URI` to the dashboard address ending in `/callback` (see [TrueNAS setup](docs/truenas.md)); the local default uses port `8766`. Account inspection and binding finish in Setup. Choose an explicit account only when the eligible-account choice is not unique. Setup does not place an order.
 4. **Notifications:** optionally save a Discord output webhook. It is a separate output destination from the personal Discord reader, remains hidden after saving, and reports only supported setup assistance and relay actions.
 
 Leave the relay in Shadow while validating channels, provider connections, and fresh-message behavior. To use Live later, follow the paused **Enable Live** confirmation flow in the dashboard and wait for the worker to acknowledge the mode before resuming.

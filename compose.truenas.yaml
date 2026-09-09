@@ -8,7 +8,7 @@ services:
     ports:
       # Bind the dashboard to the NAS LAN address, never a WAN/public address.
       - "${HTTP_BIND:?Set HTTP_BIND to the NAS LAN address}:${HTTP_PORT:-8787}:8080"
-      # Robinhood's fixed localhost callback stays host-loopback-only.
+      # Optional compatibility listener; remote OAuth uses the dashboard port.
       - "127.0.0.1:8766:8766"
     environment:
       HOME: /home/relay
@@ -20,6 +20,7 @@ services:
       RELAY_CONFIG: /data/config.json
       # Docker forwards the host-loopback port to the container interface.
       RELAY_OAUTH_CALLBACK_HOST: "0.0.0.0"
+      RELAY_ROBINHOOD_REDIRECT_URI: "${RELAY_ROBINHOOD_REDIRECT_URI:?Set RELAY_ROBINHOOD_REDIRECT_URI to the dashboard URL ending in /callback}"
       DASHBOARD_USER: "${DASHBOARD_USER:-relay}"
       # Leave empty to let bootstrap.py create /data/dashboard.password once.
       DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"

@@ -265,6 +265,20 @@ class RobinhoodMCP:
         self.server = None
         self.callback = None
         self.oauth_state = None
+        self.redirect_uri = os.environ.get(
+            "RELAY_ROBINHOOD_REDIRECT_URI", "http://127.0.0.1:8766/callback"
+        )
+        try:
+            redirect = urlsplit(self.redirect_uri)
+            if (redirect.scheme not in {"http", "https"} or not redirect.hostname
+                    or redirect.username is not None or redirect.password is not None
+                    or redirect.path != "/callback" or any(char in self.redirect_uri for char in "?#\\")
+                    or redirect.netloc.endswith(":")
+                    or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in self.redirect_uri)
+                    or redirect.port == 0):
+                raise ValueError
+        except ValueError:
+            raise BrokerError("RELAY_ROBINHOOD_REDIRECT_URI must be an HTTP(S) URL ending in /callback, without credentials, query or fragment") from None
 
     async def _redirect(self, url):
         if not self.interactive:
@@ -343,7 +357,7 @@ class RobinhoodMCP:
                 server_url=ROBINHOOD_ENDPOINT,
                 client_metadata=OAuthClientMetadata(
                     client_name="Discord Options Relay",
-                    redirect_uris=["http://127.0.0.1:8766/callback"],
+                    redirect_uris=[self.redirect_uri],
                     grant_types=["authorization_code", "refresh_token"],
                     response_types=["code"], token_endpoint_auth_method="none", scope="internal",
                 ),

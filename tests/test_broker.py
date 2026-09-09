@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 from relay.broker import BrokerError, PaperBroker, RobinhoodMCP, _OAuthStorage
 
@@ -192,6 +193,58 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
             browser.assert_not_called()
             await broker.__aexit__(None, None, None)
             listener.close.assert_called_once()
+
+    async def test_redirect_environment_validation(self):
+        for uri in ("", "file:///callback", "http:///callback", "http://relay.example:0/callback",
+                    "http://relay.example:99999/callback", "http://relay.example/callback?code=x",
+                    "https://relay.example/callback#fragment", "http://user@relay.example/callback",
+                    "http://relay.example/other", "http://relay.example/\ncallback",
+                    "http://relay.example/callback?", "http://relay.example/callback#",
+                    "http://relay.example:/callback", "http://relay.example\\other/callback"):
+            with self.subTest(uri=uri), patch.dict(os.environ, {"RELAY_ROBINHOOD_REDIRECT_URI": uri}):
+                with self.assertRaisesRegex(BrokerError, "RELAY_ROBINHOOD_REDIRECT_URI"):
+                    RobinhoodMCP({})
+
+    @unittest.skipUnless(importlib.util.find_spec("mcp"), "Optional Robinhood SDK is not installed")
+    async def test_remote_redirect_uses_saved_credentials_and_pkce(self):
+        from mcp.client.auth import OAuthClientProvider
+        from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+        remote = "http://192.168.1.20:8787/callback"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oauth.json"
+            storage = _OAuthStorage(path)
+            await storage.set_client_info(OAuthClientInformationFull(
+                client_id="synthetic-existing-client", redirect_uris=["http://127.0.0.1:8766/callback"],
+                token_endpoint_auth_method="none"))
+            await storage.set_tokens(OAuthToken(access_token="synthetic-existing-token", token_type="Bearer"))
+            original = path.read_bytes()
+            providers = []
+            def capture_provider(**kwargs):
+                providers.append(OAuthClientProvider(**kwargs))
+                return providers[-1]
+            with patch.dict(os.environ, {"RELAY_ROBINHOOD_REDIRECT_URI": remote}), \
+                    patch("mcp.client.auth.OAuthClientProvider", side_effect=capture_provider), \
+                    patch("httpx.AsyncClient", side_effect=RuntimeError("offline transport stop")):
+                broker = RobinhoodMCP({"token_store": str(path)})
+                with self.assertRaisesRegex(RuntimeError, "offline transport stop"):
+                    await broker.__aenter__()
+            provider = providers[0]
+            await provider._initialize()
+            shown = AsyncMock()
+            provider.context.redirect_handler = shown
+            async def callback():
+                query = parse_qs(urlsplit(shown.call_args.args[0]).query)
+                self.assertEqual(query["redirect_uri"], [remote])
+                self.assertEqual(query["client_id"], ["synthetic-existing-client"])
+                self.assertEqual(query["code_challenge_method"], ["S256"])
+                return "synthetic-code", query["state"][0]
+            provider.context.callback_handler = callback
+            request = await provider._perform_authorization()
+            body = parse_qs(request.content.decode())
+            self.assertEqual(body["redirect_uri"], [remote])
+            self.assertTrue(body["code_verifier"][0])
+            self.assertEqual(provider.context.current_tokens.access_token, "synthetic-existing-token")
+            self.assertEqual(path.read_bytes(), original)
 
     @unittest.skipUnless(importlib.util.find_spec("mcp") and importlib.util.find_spec("jsonschema"),
                          "Optional Robinhood SDK is not installed")

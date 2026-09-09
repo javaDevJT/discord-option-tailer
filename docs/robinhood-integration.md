@@ -4,7 +4,7 @@ The relay uses Robinhood's Agentic MCP endpoint, `https://agent.robinhood.com/mc
 
 ## Authorization
 
-Start Robinhood sign-in from **Setup**. Complete authorization in your normal browser; the callback returns to `http://127.0.0.1:8766/callback`. Codex and Robinhood do not use the internal Discord browser. On a remote server, establish the loopback tunnel described in the [TrueNAS guide](truenas.md) before signing in.
+Start Robinhood sign-in from **Setup** and complete authorization in your normal browser. Set `RELAY_ROBINHOOD_REDIRECT_URI` to the dashboard address ending in `/callback` when the relay runs remotely, for example `http://192.168.1.20:8787/callback`. The local default remains `http://127.0.0.1:8766/callback`. Codex and Robinhood do not use the internal Discord browser. See the [TrueNAS guide](truenas.md) for remote setup.
 
 OAuth uses PKCE. Registration and tokens are stored atomically with owner-only permissions in the persistent data directory. The MCP SDK handles refresh. If renewed authorization is required, the background worker reports assistance rather than opening an unattended login flow. The optional Discord output webhook reports detected credential and connection failures.
 

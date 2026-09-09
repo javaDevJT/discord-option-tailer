@@ -52,7 +52,7 @@ Select **Start Codex sign-in**, open the displayed device verification link in y
 
 ### Robinhood connection
 
-Select **Start Robinhood sign-in**, open the displayed authorization link in your normal browser, and approve the OAuth request. The callback uses host loopback port `8766`; a remote Docker host requires a matching private port forward for the callback. After authorization, Setup performs account inspection and saves the selected account binding. Choose an explicit account only when more than one eligible account requires a choice.
+Select **Start Robinhood sign-in**, open the displayed authorization link in your normal browser, and approve the OAuth request. For a remote Docker host, set `RELAY_ROBINHOOD_REDIRECT_URI` to its dashboard address ending in `/callback` and redeploy; the callback then uses the dashboard port without a tunnel. The default remains local loopback port `8766`. After authorization, Setup performs account inspection and saves the selected account binding. Choose an explicit account only when more than one eligible account requires a choice.
 
 Authentication, account inspection, and order execution are separate stages. Setup does not review, place, cancel, or claim a fill for an order. Keep the relay in Shadow while verifying the connection.
 

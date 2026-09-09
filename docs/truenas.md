@@ -11,6 +11,7 @@ RELAY_IMAGE=ghcr.io/javadevjt/discord-option-tailer:latest
 RELAY_DATA_DIR=/mnt/tank/apps/discord-option-tailer
 HTTP_BIND=192.168.1.20
 HTTP_PORT=8787
+RELAY_ROBINHOOD_REDIRECT_URI=http://192.168.1.20:8787/callback
 DASHBOARD_USER=relay
 DASHBOARD_PASSWORD=
 ```
@@ -28,17 +29,13 @@ docker compose --env-file .env -f compose.truenas.yaml up -d
 docker compose --env-file .env -f compose.truenas.yaml ps
 ```
 
-Open `http://192.168.1.20:8787` from a trusted LAN client. Set `HTTP_BIND` to the NAS's private LAN IP, keep the NAS firewall restricted to the intended subnet, and do not use `0.0.0.0`, a WAN address, or port forwarding to the public Internet. The dashboard and noVNC desktop require Basic Auth; the Robinhood callback is a separate loopback-only listener with OAuth state validation, and port 8766 is never a LAN service.
+Open `http://192.168.1.20:8787` from a trusted LAN client. Set `HTTP_BIND` to the NAS's private LAN IP, keep the NAS firewall restricted to the intended subnet, and do not use `0.0.0.0`, a WAN address, or port forwarding to the public Internet. The dashboard and noVNC desktop require Basic Auth. The exact `/callback` route forwards to the internal OAuth listener without Basic Auth; OAuth state and PKCE protect the authorization exchange. Callback query strings are excluded from proxy logs. Port 8766 stays host-loopback-only.
 
 ## Robinhood authorization from a remote browser
 
-Robinhood has a fixed redirect URI, `http://127.0.0.1:8766/callback`. The compose file binds that port to NAS host loopback. Docker forwards the host-loopback port into the container interface, so the internal callback listener uses `0.0.0.0` while the NAS itself keeps port 8766 unreachable from the LAN. If the normal browser is on your workstation while the relay runs on the NAS, create a local SSH forward before starting Robinhood sign-in and leave it running:
+Set the app environment variable `RELAY_ROBINHOOD_REDIRECT_URI` to the address your browser uses for the dashboard, with the exact path `/callback`. For the example above, use `http://192.168.1.20:8787/callback`; an HTTPS reverse proxy can use `https://relay.example.com/callback`. Queries, fragments and embedded credentials are rejected. Use HTTP only on a trusted LAN; use HTTPS when available. If using another reverse proxy, disable access and error request logging for `/callback` there too so OAuth codes do not enter its logs.
 
-```sh
-ssh -N -T -o ExitOnForwardFailure=yes -L 8766:127.0.0.1:8766 <nas-user>@<nas-host>
-```
-
-Then open the LAN dashboard in that same workstation browser, choose **Setup → Start Robinhood sign-in**, and complete the authorization. The browser's request to its own `127.0.0.1:8766` travels through the tunnel to the NAS callback. Close the tunnel after Setup reports completion or failure. A browser running directly on the NAS does not need the tunnel. Never change the callback mapping to `0.0.0.0` or publish 8766 on the LAN.
+Redeploy after changing the environment, open **Setup → Start Robinhood sign-in**, and complete authorization in your normal browser. No SSH tunnel is needed. The dashboard proxy forwards the callback to port 8766 inside the container. A link created before redeployment must be replaced by starting sign-in again. Changing this setting does not clear saved tokens, client registration, dashboard credentials or account bindings. Keep the existing `/data` storage and environment when upgrading.
 
 ## First run and maintenance
 
