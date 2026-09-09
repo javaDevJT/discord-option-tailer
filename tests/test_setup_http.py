@@ -47,6 +47,13 @@ class SetupHTTPTests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_schema_diagnostics_are_a_fixed_read_only_route(self):
+        self.manager.robinhood_schemas.return_value = {"tools": []}
+        self.assertEqual(self.request("/api/setup/robinhood/schemas", method="GET"), (200, {"tools": []}))
+        self.manager.robinhood_schemas.assert_called_once_with()
+        self.assertEqual(self.request("/api/setup/robinhood/schemas?path=private", method="GET")[0], 400)
+        self.assertEqual(self.request("/api/setup/robinhood/schemas")[0], 405)
+
     def test_fixed_actions_and_public_csrf(self):
         status, result = self.request("/api/setup", method="GET")
         self.assertEqual(status, 200)

@@ -534,7 +534,10 @@ class SetupManagerTests(unittest.TestCase):
             except Exception as error:
                 raise ExceptionGroup("private provider response", [error])
 
-        with patch("relay.setup.broker_login", AsyncMock()), patch("relay.setup.inspect_broker", fake_inspect):
+        catalog = [{"name": "get_accounts", "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"},
+                    "private_provider_field": "private provider response"},
+                   {"name": "unsupported_tool", "inputSchema": {"type": "object"}}]
+        with patch("relay.setup.broker_login", AsyncMock(return_value=catalog)), patch("relay.setup.inspect_broker", fake_inspect):
             self.manager.start_auth("robinhood")
             self.wait_for(lambda: self.manager.status()["robinhood"]["state"] == "failed")
         result = self.manager.status()["robinhood"]
@@ -547,6 +550,11 @@ class SetupManagerTests(unittest.TestCase):
         self.assertNotIn("123456789", json.dumps(result))
         self.assertNotIn("private provider response", json.dumps(result))
         self.assertEqual(self.path.read_bytes(), original)
+        schemas = self.manager.robinhood_schemas()
+        self.assertEqual([tool["name"] for tool in schemas["tools"]], ["get_accounts"])
+        self.assertNotIn("private", json.dumps(schemas))
+        schemas["tools"].clear()
+        self.assertEqual(len(self.manager.robinhood_schemas()["tools"]), 1)
 
     def test_robinhood_failure_diagnostics_omit_exception_secrets(self):
         error = RuntimeError("token=private-token code=private-code /private/path")

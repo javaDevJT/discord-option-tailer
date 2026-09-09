@@ -29,7 +29,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
-from .broker import _OAuthStorage, login as broker_login
+from .broker import SCHEMA_PINS, _OAuthStorage, login as broker_login
 from .cli import inspect_broker
 from .core import Hold, Store, instant, load_config
 from .interpreter import CodexInterpreter
@@ -66,6 +66,7 @@ class _AuthJob:
     thread: threading.Thread | None = None
     process: subprocess.Popen[str] | None = None
     expects_device_code: bool = False
+    schema_catalog: list = field(default_factory=list)
 
 
 class SetupManager:
@@ -161,6 +162,12 @@ class SetupManager:
             runtime_path = self._configured_path(raw, "runtime_status_file", self.config_path.parent / "state/runtime-status.json")
             request_discovery(runtime_path, payload)
             return self._action_response_locked("discovery_requested")
+
+    def robinhood_schemas(self) -> dict:
+        """Read cached tool contracts from setup's authenticated discovery; no account values."""
+        with self._lock:
+            job = self._jobs.get("robinhood")
+            return {"tools": copy.deepcopy(job.schema_catalog) if job else []}
 
     def complete_robinhood_callback(self, payload: dict) -> dict:
         """Forward a user-pasted callback to the active, state-bound local listener."""
@@ -1216,13 +1223,16 @@ class SetupManager:
                     "authorization_url": url,
                 }
 
-        await self._await_with_cancel(
+        catalog = await self._await_with_cancel(
             lambda: self._invoke_fixed(broker_login, config, authorization_handler=show_authorization),
             job.cancelled,
         )
         with self._lock:
             if job.cancelled.is_set():
                 raise _AuthCancelled
+            job.schema_catalog = [{key: copy.deepcopy(tool.get(key)) for key in ("name", "inputSchema", "outputSchema")}
+                                  for tool in (catalog if isinstance(catalog, list) else [])
+                                  if isinstance(tool, dict) and tool.get("name") in SCHEMA_PINS]
             job.phase = "account_inspection"
             self._auth_state["robinhood"] = {"state": "waiting", "detail": "Authorization complete. Inspecting your Robinhood account."}
         args = SimpleNamespace(bind=None, output=str(report))
@@ -1263,7 +1273,7 @@ class SetupManager:
             detail = "Robinhood sign-in expired before its callback arrived. Start a new attempt and finish within five minutes."
         elif kind == "OAuthTokenError":
             failure["phase"] = "token_exchange"
-            detail = "Robinhood rejected the token exchange. Start a new sign-in attempt; the returned URL can only be used once."
+            detail = "Robinhood token exchange failed. Saved credentials were kept; a new sign-in may be required."
         elif status in (401, 403):
             detail = f"Robinhood rejected account access during {label} (HTTP {status})."
         return {"detail": detail, "failure": failure}

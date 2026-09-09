@@ -942,6 +942,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise QueryError("setup does not accept query parameters")
                 self._json(200, self.app.setup_status(), api=True, head=head)
                 return
+            if path == "/api/setup/robinhood/schemas" and self.app.setup is not None:
+                if parsed.query:
+                    raise QueryError("schema diagnostics do not accept query parameters")
+                self._json(200, self.app.setup.robinhood_schemas(), api=True, head=head)
+                return
             if path == "/api/messages":
                 self._json(200, self.app.messages(parsed.query), api=True, head=head)
                 return
