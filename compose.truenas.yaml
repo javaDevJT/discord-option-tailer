@@ -1,0 +1,33 @@
+services:
+  relay:
+    image: "${RELAY_IMAGE:-ghcr.io/javadevjt/discord-option-tailer:latest}"
+    pull_policy: always
+    init: true
+    restart: unless-stopped
+    shm_size: 1gb
+    ports:
+      # Bind the dashboard to the NAS LAN address, never a WAN/public address.
+      - "${HTTP_BIND:?Set HTTP_BIND to the NAS LAN address}:${HTTP_PORT:-8787}:8080"
+      # Robinhood's fixed localhost callback stays host-loopback-only.
+      - "127.0.0.1:8766:8766"
+    environment:
+      HOME: /home/relay
+      CODEX_HOME: /data/codex
+      DISPLAY: ":99"
+      BROWSER: /usr/local/bin/relay-browser
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      RELAY_DATA_DIR: /data
+      RELAY_CONFIG: /data/config.json
+      # Docker forwards the host-loopback port to the container interface.
+      RELAY_OAUTH_CALLBACK_HOST: "0.0.0.0"
+      DASHBOARD_USER: "${DASHBOARD_USER:-relay}"
+      # Leave empty to let bootstrap.py create /data/dashboard.password once.
+      DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"
+    volumes:
+      - "${RELAY_DATA_DIR:?Set RELAY_DATA_DIR to an existing TrueNAS dataset}:/data"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

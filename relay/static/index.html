@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#101417">
+    <title>Relay Monitor</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to monitoring console</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Relay navigation">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span>R</span><i></i></div>
+          <div>
+          <p class="brand-kicker">DISCORD / OPTIONS</p>
+            <p class="brand-name">Relay Monitor</p>
+          </div>
+        </div>
+
+        <div class="sidebar-rule" aria-hidden="true"></div>
+
+        <nav class="side-nav" aria-label="Sections">
+          <a class="side-nav-link is-active" href="#overview"><span class="nav-index">01</span><span>Overview</span></a>
+          <a class="side-nav-link" href="#setup"><span class="nav-index">02</span><span>Setup</span></a>
+          <a class="side-nav-link" href="#messages"><span class="nav-index">03</span><span>Messages</span></a>
+          <a class="side-nav-link" href="#orders"><span class="nav-index">04</span><span>Recorded orders</span></a>
+          <a class="side-nav-link" href="#positions"><span class="nav-index">05</span><span>Relay positions</span></a>
+          <a class="side-nav-link" href="#events"><span class="nav-index">06</span><span>Decision trail</span></a>
+        </nav>
+
+        <div class="sidebar-spacer"></div>
+
+        <section class="sidebar-status" aria-labelledby="posture-title">
+          <div class="section-label" id="posture-title">Current posture</div>
+          <div class="posture-line">
+            <span class="status-dot is-unknown" id="sidebar-status-dot" aria-hidden="true"></span>
+            <span id="sidebar-status-label">Connecting</span>
+          </div>
+          <p id="sidebar-status-detail">Waiting for the relay runtime.</p>
+          <a class="browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify">
+            <span class="browser-link-icon" aria-hidden="true">↗</span>
+            <span>Browser login</span>
+          </a>
+        </section>
+
+ <p class="sidebar-footnote">Monitoring + guarded controls<br>Internal desktop route</p>
+      </aside>
+
+      <main id="main-content" class="main-content" tabindex="-1">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">MONITORING CONSOLE <span aria-hidden="true">/</span> SHARED LEDGER</p>
+            <h1>Message → decision trail</h1>
+            <p class="lede">See what the relay received, how it interpreted the context, and what it recorded.</p>
+          </div>
+          <div class="topbar-actions">
+            <label class="refresh-toggle">
+              <input id="auto-refresh" type="checkbox" checked>
+              <span class="toggle-track" aria-hidden="true"><span></span></span>
+              <span>Auto-refresh</span>
+            </label>
+            <button class="button button-quiet" id="refresh-button" type="button">
+              <span class="button-glyph" aria-hidden="true">↻</span>
+              <span>Refresh</span>
+            </button>
+            <span class="last-sync" id="last-sync" aria-live="polite">No sync yet</span>
+          </div>
+        </header>
+
+        <div class="connection-banner banner banner-loading" id="connection-banner" role="status" aria-live="polite">
+          <span class="banner-mark" aria-hidden="true">···</span>
+          <span id="connection-message">Connecting to the dashboard API…</span>
+          <span class="banner-meta" id="connection-meta">Initial load</span>
+        </div>
+
+        <section class="overview-section" id="overview" aria-labelledby="overview-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">01 / OVERVIEW</p>
+              <h2 id="overview-title">Operational snapshot</h2>
+            </div>
+        <span class="section-stamp">MONITORING</span>
+          </div>
+
+          <div class="metric-grid" aria-label="Ledger counts">
+            <article class="metric-card metric-card-primary">
+              <p>Messages observed</p>
+              <strong data-metric="messages">—</strong>
+              <span>All recorded revisions</span>
+            </article>
+            <article class="metric-card">
+              <p>Decision events</p>
+              <strong data-metric="events">—</strong>
+              <span>Interpretations and holds</span>
+            </article>
+            <article class="metric-card metric-card-amber">
+              <p>Held for review</p>
+              <strong data-metric="held">—</strong>
+              <span>Needs no automatic action</span>
+            </article>
+            <article class="metric-card">
+              <p>Recorded orders</p>
+              <strong data-metric="orders">—</strong>
+              <span>Intent and paper records</span>
+            </article>
+            <article class="metric-card metric-card-green">
+              <p>Relay positions</p>
+              <strong data-metric="positions">—</strong>
+              <span>Owned records in this ledger</span>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel-section setup-section" id="setup" aria-labelledby="setup-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">02 / SETUP</p>
+              <h2 id="setup-title">Connections and channels</h2>
+              <p class="section-lede">Connect the existing browser sessions and choose which Discord channels the relay observes.</p>
+            </div>
+            <span class="section-stamp" id="setup-state-stamp">LOADING</span>
+          </div>
+
+          <div class="setup-notice" id="setup-notice" role="status" aria-live="polite">
+            <span class="setup-notice-mark" aria-hidden="true">···</span>
+            <span id="setup-notice-text">Loading setup status…</span>
+          </div>
+
+          <div class="setup-grid">
+            <article class="setup-card setup-card-channels" aria-labelledby="channels-title">
+              <div class="setup-card-heading">
+                <div>
+                  <p class="eyebrow">OBSERVATION</p>
+                  <h3 id="channels-title">Discord channels</h3>
+                </div>
+                <span class="muted-label" id="channel-save-state">Not loaded</span>
+              </div>
+              <p class="setup-help">Pick a Discord server, then a channel. Author restrictions are optional: leave them off to accept every author in the channel.</p>
+              <form id="channel-setup-form" novalidate>
+                <div class="channel-editor" data-channel-index="0">
+                  <div class="channel-editor-heading"><span>Channel 1</span><span class="channel-editor-state" data-channel-state="0"></span></div>
+                  <div class="channel-picker-grid">
+                    <label class="field"><span class="field-label">Server</span><select data-channel-field="guild_id" aria-describedby="discovery-help"><option value="">Select a server…</option></select></label>
+                    <label class="field"><span class="field-label">Channel</span><select data-channel-field="channel_id" aria-describedby="discovery-help" disabled><option value="">Select a server first</option></select></label>
+                    <button class="button button-quiet discovery-refresh-channel" data-discovery-action="channel" type="button" disabled>Refresh channels</button>
+                  </div>
+                  <div class="setup-field-grid channel-details-grid">
+                    <label class="field"><span class="field-label">Name</span><input data-channel-field="name" type="text" autocomplete="off" placeholder="Options room"></label>
+                    <label class="field"><span class="field-label">Role</span><select data-channel-field="role"><option value="signals">Signals</option><option value="context">Context</option></select></label>
+                  </div>
+                  <div class="author-scope">
+                    <label class="check-row"><input data-channel-field="restrict_authors" type="checkbox"><span>Restrict to selected authors</span></label>
+                    <span class="muted-label">Off accepts all authors</span>
+                  </div>
+                  <div class="author-picker-panel" data-author-panel hidden>
+                    <label class="field"><span class="field-label">Observed authors <span class="muted-label">optional</span></span><select data-channel-field="author_choices" multiple size="3" aria-describedby="author-help"></select></label>
+                    <label class="field"><span class="field-label">Manual author IDs <span class="muted-label">fallback</span></span><input data-channel-field="authors" type="text" autocomplete="off" placeholder="123456789, 987654321" aria-describedby="author-help"></label>
+                    <p class="setup-help setup-help-small" data-author-note>Author discovery is partial. Add a manual Discord ID when the observed list does not include everyone you trust.</p>
+                  </div>
+                  <details class="advanced-channel">
+                    <summary>Advanced channel binding</summary>
+                    <label class="field"><span class="field-label">Discord channel URL <span class="muted-label">fallback</span></span><input data-channel-field="url" type="url" inputmode="url" autocomplete="off" placeholder="https://discord.com/channels/…" aria-describedby="channel-help"></label>
+                    <p class="setup-help setup-help-small">Use this only when the saved channel is not in the current server directory.</p>
+                  </details>
+                </div>
+                <div class="channel-editor" data-channel-index="1">
+                  <div class="channel-editor-heading"><span>Channel 2</span><span class="channel-editor-state" data-channel-state="1"></span></div>
+                  <div class="channel-picker-grid">
+                    <label class="field"><span class="field-label">Server</span><select data-channel-field="guild_id" aria-describedby="discovery-help"><option value="">Select a server…</option></select></label>
+                    <label class="field"><span class="field-label">Channel</span><select data-channel-field="channel_id" aria-describedby="discovery-help" disabled><option value="">Select a server first</option></select></label>
+                    <button class="button button-quiet discovery-refresh-channel" data-discovery-action="channel" type="button" disabled>Refresh channels</button>
+                  </div>
+                  <div class="setup-field-grid channel-details-grid">
+                    <label class="field"><span class="field-label">Name</span><input data-channel-field="name" type="text" autocomplete="off" placeholder="Alerts room"></label>
+                    <label class="field"><span class="field-label">Role</span><select data-channel-field="role"><option value="signals">Signals</option><option value="context">Context</option></select></label>
+                  </div>
+                  <div class="author-scope">
+                    <label class="check-row"><input data-channel-field="restrict_authors" type="checkbox"><span>Restrict to selected authors</span></label>
+                    <span class="muted-label">Off accepts all authors</span>
+                  </div>
+                  <div class="author-picker-panel" data-author-panel hidden>
+                    <label class="field"><span class="field-label">Observed authors <span class="muted-label">optional</span></span><select data-channel-field="author_choices" multiple size="3" aria-describedby="author-help"></select></label>
+                    <label class="field"><span class="field-label">Manual author IDs <span class="muted-label">fallback</span></span><input data-channel-field="authors" type="text" autocomplete="off" placeholder="123456789, 987654321" aria-describedby="author-help"></label>
+                    <p class="setup-help setup-help-small" data-author-note>Author discovery is partial. Add a manual Discord ID when the observed list does not include everyone you trust.</p>
+                  </div>
+                  <details class="advanced-channel">
+                    <summary>Advanced channel binding</summary>
+                    <label class="field"><span class="field-label">Discord channel URL <span class="muted-label">fallback</span></span><input data-channel-field="url" type="url" inputmode="url" autocomplete="off" placeholder="https://discord.com/channels/…"></label>
+                    <p class="setup-help setup-help-small">Use this only when the saved channel is not in the current server directory.</p>
+                  </details>
+                </div>
+                <div class="discovery-toolbar" aria-live="polite" aria-busy="false">
+                  <div>
+                    <div class="discovery-toolbar-heading"><span class="status-pill is-context" id="discord-discovery-state">Idle</span><span class="muted-label" id="discord-discovery-count"></span></div>
+                    <p class="setup-help setup-help-small" id="discord-discovery-detail">Sign in to Discord, then refresh servers to load the directory.</p>
+                    <p class="form-feedback" id="discord-discovery-feedback" role="status" aria-live="polite"></p>
+                  </div>
+                  <button class="button button-filter" id="discover-discord" data-discovery-action="guild" type="button">Refresh servers</button>
+                </div>
+                <p class="setup-help setup-help-small" id="discovery-help">Server and channel names come from the signed-in browser session. A saved binding remains available under Advanced when it is not listed.</p>
+                <p class="setup-help setup-help-small" id="channel-help">The selected channel is converted to its fixed Discord URL when saved.</p>
+                <p class="setup-help setup-help-small" id="author-help">Hold Command or Control to select more than one author. Empty or unchecked means all authors.</p>
+                <div class="setup-form-row">
+                  <label class="field field-poll"><span class="field-label">Poll interval</span><span class="input-with-suffix"><input id="poll-seconds" type="number" min="2" max="60" step="1" inputmode="numeric"><span>seconds</span></span></label>
+                  <button class="button button-filter" id="save-channels" type="submit">Save channels</button>
+                </div>
+                <p class="form-feedback" id="channel-form-feedback" role="status" aria-live="polite"></p>
+              </form>
+            </article>
+
+            <div class="setup-stack">
+              <article class="setup-card" aria-labelledby="discord-auth-title">
+                <div class="setup-card-heading">
+                  <div><p class="eyebrow">BROWSER</p><h3 id="discord-auth-title">Discord login</h3></div>
+                  <span class="status-pill is-context" id="discord-setup-status">Not connected</span>
+                </div>
+                <p class="setup-help">Use the internal browser to sign in. The relay keeps the browser session; it never asks for a Discord token.</p>
+                <a class="button button-quiet setup-browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify">Open Browser login <span aria-hidden="true">↗</span></a>
+                <p class="setup-card-detail" id="discord-setup-detail">Waiting for setup status.</p>
+              </article>
+
+              <article class="setup-card" aria-labelledby="codex-auth-title">
+                <div class="setup-card-heading">
+                  <div><p class="eyebrow">SUBSCRIPTION</p><h3 id="codex-auth-title">Codex sign-in</h3></div>
+                  <span class="status-pill is-context" id="codex-setup-status">Not connected</span>
+                </div>
+                <p class="setup-help">Start the device sign-in, then finish it in your own browser. The displayed code expires with the active login attempt.</p>
+                <div class="auth-actions">
+                  <button class="button button-filter" id="codex-start" type="button">Start Codex sign-in</button>
+                  <button class="button button-quiet" id="codex-cancel" type="button" disabled>Cancel</button>
+                </div>
+                <div class="auth-progress" id="codex-progress" hidden>
+                  <p class="auth-progress-label" id="codex-progress-label">Waiting for device sign-in.</p>
+                  <div class="auth-code-grid">
+                    <div><span class="field-label">Device code</span><code id="codex-device-code">—</code></div>
+                    <div><span class="field-label">Verification</span><a id="codex-device-url" href="#" target="_blank" rel="noopener noreferrer" hidden>Open auth.openai.com</a><span id="codex-device-url-empty">Waiting for URL</span></div>
+                  </div>
+                </div>
+                <p class="setup-card-detail" id="codex-setup-detail">Waiting for setup status.</p>
+              </article>
+
+              <article class="setup-card" aria-labelledby="robinhood-auth-title">
+                <div class="setup-card-heading">
+                  <div><p class="eyebrow">BROKER</p><h3 id="robinhood-auth-title">Robinhood connection</h3></div>
+                  <span class="status-pill is-context" id="robinhood-setup-status">Not connected</span>
+                </div>
+                <p class="setup-help">Start the sign-in, then continue in your own browser with the authorization link. Supply the full account number only if multiple eligible accounts require a choice.</p>
+                <label class="field"><span class="field-label">Account number <span class="muted-label">optional</span></span><input id="robinhood-account-number" type="text" inputmode="numeric" autocomplete="off" placeholder="Full account number"></label>
+                <div class="auth-actions">
+                  <button class="button button-filter" id="robinhood-start" type="button">Start Robinhood sign-in</button>
+                  <button class="button button-quiet" id="robinhood-cancel" type="button" disabled>Cancel</button>
+                </div>
+                <div class="auth-progress" id="robinhood-progress" hidden>
+                  <p class="auth-progress-label">Continue Robinhood sign-in in your browser.</p>
+                  <a id="robinhood-authorization-url" href="#" target="_blank" rel="noopener noreferrer" hidden>Open robinhood.com</a><span id="robinhood-authorization-url-empty">Waiting for authorization URL</span>
+                </div>
+                <p class="setup-card-detail" id="robinhood-setup-detail">Waiting for setup status.</p>
+                <div class="account-summary" id="robinhood-account-summary" hidden>
+                  <span class="field-label">Configured account</span>
+                  <strong id="robinhood-account-label">—</strong>
+                  <span id="robinhood-account-detail"></span>
+                </div>
+              </article>
+
+              <article class="setup-card" aria-labelledby="notifications-title">
+                <div class="setup-card-heading">
+                  <div><p class="eyebrow">OUTPUT</p><h3 id="notifications-title">Discord output webhook</h3></div>
+                  <span class="status-pill is-context" id="notifications-status">Not configured</span>
+                </div>
+                <p class="setup-help" id="notifications-help">Optional Discord output for authentication assistance and relay actions. The webhook URL stays hidden locally; no test post is sent.</p>
+                <form id="notifications-form" novalidate>
+                  <label class="check-row"><input id="notifications-enabled" type="checkbox"><span>Enable output notifications</span></label>
+                  <label class="field notifications-url-field"><span class="field-label">Webhook URL <span class="muted-label">optional</span></span><input id="notifications-webhook" type="password" inputmode="url" autocomplete="new-password" spellcheck="false" placeholder="Paste a new webhook URL to update" aria-describedby="notifications-help notifications-url-help"></label>
+                  <p class="setup-help setup-help-small" id="notifications-url-help">Leave blank to keep the saved URL. Use Remove saved webhook to clear it.</p>
+                  <div class="auth-actions">
+                    <button class="button button-filter" id="save-notifications" type="submit">Save output settings</button>
+                    <button class="button button-quiet" id="clear-notifications" type="button">Remove saved webhook</button>
+                  </div>
+                  <p class="setup-card-detail" id="notifications-detail">Waiting for setup status.</p>
+                  <p class="setup-help setup-help-small" id="notifications-mode">Relay mode: waiting for status.</p>
+                  <p class="form-feedback" id="notifications-feedback" role="status" aria-live="polite"></p>
+                </form>
+              </article>
+            </div>
+          </div>
+
+            <dialog class="browser-login-dialog" id="browser-login-dialog" aria-labelledby="browser-login-title" aria-describedby="browser-login-detail">
+              <div class="browser-login-shell">
+                <div class="browser-login-heading">
+                  <div>
+                    <p class="eyebrow">DISCORD BROWSER</p>
+                    <h2 id="browser-login-title">Discord login</h2>
+                  </div>
+                  <button class="button button-quiet browser-login-close" id="browser-login-close" type="button">Back to setup</button>
+                </div>
+                <div class="browser-login-status" id="browser-login-status" role="status" aria-live="polite">
+                  <span class="status-pill is-context" id="browser-login-status-label">Waiting</span>
+                  <p id="browser-login-detail">Waiting for setup status.</p>
+                </div>
+                <iframe id="browser-login-frame" title="Discord login browser" src="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify" loading="lazy"></iframe>
+              </div>
+            </dialog>
+
+            <div class="trading-mode-panel" aria-labelledby="trading-mode-title">
+              <div class="trading-mode-copy">
+                <p class="eyebrow">TRADING MODE</p>
+                <h3 id="trading-mode-title">Shadow or Live</h3>
+                <p class="setup-help">Step 1: pause the relay, then choose a mode. Step 2: wait for the worker to reload, then Resume relay. Shadow records proposed orders and never sends them; Live can send real Robinhood orders.</p>
+              </div>
+              <div class="trading-mode-controls">
+                <div class="trading-mode-status" role="status" aria-live="polite">
+                  <span class="status-pill is-context" id="trading-mode-status">Waiting</span>
+                  <p id="trading-mode-detail">Waiting for trading mode status.</p>
+                </div>
+                <div class="setup-control-actions trading-mode-actions">
+                  <button class="button button-quiet" id="set-shadow-mode" type="button" disabled>Use Shadow</button>
+                  <button class="button button-filter" id="set-live-mode" type="button" disabled>Enable Live</button>
+                </div>
+                <p class="setup-help setup-help-small" id="trading-mode-availability">Pause the relay before changing mode.</p>
+                <p class="form-feedback" id="trading-mode-feedback" role="status" aria-live="polite"></p>
+              </div>
+            </div>
+
+            <dialog class="browser-login-dialog live-mode-dialog" id="live-mode-dialog" aria-labelledby="live-mode-dialog-title" aria-describedby="live-mode-dialog-detail">
+              <div class="browser-login-shell">
+                <div class="browser-login-heading">
+                  <div>
+                    <p class="eyebrow">REAL TRADING</p>
+                    <h2 id="live-mode-dialog-title">Enable Live mode?</h2>
+                  </div>
+                  <button class="button button-quiet" id="live-mode-cancel" type="button">Cancel</button>
+                </div>
+                <div class="browser-login-status" id="live-mode-dialog-detail" role="status">
+                  <span class="status-pill is-error">Real orders</span>
+                  <p>Live mode can send real Robinhood orders. The relay stays paused after this change; wait for the worker to report Live, then use Resume relay.</p>
+                </div>
+                <form class="auth-actions live-mode-dialog-actions" id="live-mode-form" method="dialog">
+                  <button class="button button-quiet" type="button" id="live-mode-cancel-secondary">Keep current mode</button>
+                  <button class="button button-filter" type="submit" value="confirm">Enable Live</button>
+                </form>
+              </div>
+            </dialog>
+
+          <div class="setup-controls" aria-labelledby="relay-controls-title">
+            <div>
+              <p class="eyebrow">RELAY CONTROL</p>
+              <h3 id="relay-controls-title">Worker controls</h3>
+              <p class="setup-help">Pause prevents new execution through the existing STOP file. It does not cancel broker orders or close positions.</p>
+            </div>
+            <div class="setup-control-actions">
+              <button class="button button-quiet" id="pause-relay" type="button">Pause relay</button>
+              <button class="button button-quiet" id="reconnect-relay" type="button">Reconnect</button>
+            </div>
+            <p class="form-feedback" id="control-feedback" role="status" aria-live="polite"></p>
+          </div>
+
+          <div class="risk-context" id="risk-context" aria-label="Risk defaults" hidden>
+            <div><p class="eyebrow">RISK DEFAULTS</p><h3>Current guardrails</h3></div>
+            <p id="risk-context-text">Risk values are display-only and remain controlled by the relay configuration.</p>
+          </div>
+        </section>
+
+        <section class="posture-section" aria-labelledby="runtime-title">
+          <div class="section-heading section-heading-compact">
+            <div>
+              <p class="eyebrow">RUNTIME</p>
+              <h2 id="runtime-title">Pipeline posture</h2>
+            </div>
+            <span class="muted-label" id="runtime-updated">Runtime timestamp unavailable</span>
+          </div>
+
+          <div class="runtime-grid">
+            <article class="runtime-card runtime-card-mode">
+              <div class="runtime-card-head"><span class="runtime-icon" aria-hidden="true">M</span><span>Mode</span></div>
+              <strong id="runtime-mode">—</strong>
+              <p id="runtime-mode-detail">Waiting for status.</p>
+            </article>
+            <article class="runtime-card">
+              <div class="runtime-card-head"><span class="runtime-icon" aria-hidden="true">D</span><span>Discord reader</span></div>
+              <strong id="runtime-discord">—</strong>
+              <p id="runtime-discord-detail">No channel state yet.</p>
+            </article>
+            <article class="runtime-card">
+              <div class="runtime-card-head"><span class="runtime-icon" aria-hidden="true">C</span><span>Codex interpreter</span></div>
+              <strong id="runtime-codex">—</strong>
+              <p id="runtime-codex-detail">No interpreter state yet.</p>
+            </article>
+            <article class="runtime-card">
+              <div class="runtime-card-head"><span class="runtime-icon" aria-hidden="true">B</span><span>Broker boundary</span></div>
+              <strong id="runtime-broker">—</strong>
+              <p id="runtime-broker-detail">No broker state yet.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel-section" id="messages" aria-labelledby="messages-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">02 / INBOUND</p>
+              <h2 id="messages-title">Messages and interpretations</h2>
+            </div>
+            <span class="muted-label" id="messages-range">—</span>
+          </div>
+
+          <form class="filter-bar" id="message-filters">
+            <label class="field field-search">
+              <span class="field-label">Search message text</span>
+              <span class="search-wrap">
+                <span aria-hidden="true">⌕</span>
+                <input id="message-search" type="search" name="q" placeholder="Search content, author, source…" autocomplete="off">
+              </span>
+            </label>
+            <label class="field">
+              <span class="field-label">Channel</span>
+              <select id="message-channel" name="channel_id">
+                <option value="">All channels</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Decision state</span>
+              <select id="message-state" name="state">
+                <option value="">All states</option>
+                <option value="observed">Observed</option>
+                <option value="context">Context</option>
+                <option value="ignore">Ignore</option>
+                <option value="wait">Wait</option>
+                <option value="open">Open</option>
+                <option value="reduce">Reduce</option>
+                <option value="close">Close</option>
+                <option value="update_stop">Update stop</option>
+                <option value="shadow_order">Shadow order</option>
+                <option value="paper_order">Paper order</option>
+                <option value="broker_order">Broker order</option>
+                <option value="held">Held</option>
+                <option value="unknown">Unknown</option>
+                <option value="error">Error</option>
+                <option value="duplicate">Duplicate</option>
+                <option value="invalid">Invalid</option>
+                <option value="untrusted">Untrusted</option>
+              </select>
+            </label>
+            <button class="button button-filter" type="submit">Apply filters</button>
+            <button class="button button-text" id="clear-filters" type="button">Clear</button>
+          </form>
+
+          <div class="list-shell" id="messages-shell" aria-live="polite">
+            <div class="loading-state" data-loading="messages">
+              <span class="loading-line loading-line-wide"></span>
+              <span class="loading-line"></span>
+              <span class="loading-line loading-line-short"></span>
+              <span class="loading-line"></span>
+            </div>
+            <div class="error-state" data-error="messages" hidden>
+              <span class="state-symbol" aria-hidden="true">!</span>
+              <div><strong>Messages unavailable</strong><p data-error-message="messages">The dashboard could not read message records.</p></div>
+              <button class="button button-quiet" data-retry="messages" type="button">Retry</button>
+            </div>
+            <div class="empty-state" data-empty="messages" hidden>
+              <span class="state-symbol" aria-hidden="true">∅</span>
+              <div><strong>No messages match this view</strong><p>Try a broader search or clear one of the filters.</p></div>
+            </div>
+            <div class="message-list" id="message-list" role="list"></div>
+          </div>
+          <div class="pagination" id="messages-pagination" hidden>
+            <span class="pagination-label" id="messages-page-label">Page 1</span>
+            <div class="pagination-actions">
+              <button class="button button-quiet" data-page="messages-prev" type="button">Previous</button>
+              <button class="button button-quiet" data-page="messages-next" type="button">Next</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="split-section" aria-label="Recorded activity">
+          <section class="panel-section compact-panel" id="orders" aria-labelledby="orders-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">03 / RECORDS</p>
+                <h2 id="orders-title">Recorded orders</h2>
+              </div>
+              <span class="muted-label" id="orders-range">—</span>
+            </div>
+            <div class="inline-filter">
+              <label class="field field-inline">
+                <span class="field-label">Status</span>
+                <select id="order-status" name="status">
+                  <option value="">All statuses</option>
+                  <option value="pending">Pending</option>
+                  <option value="submitting">Submitting</option>
+                  <option value="submitted">Submitted</option>
+                  <option value="open">Open</option>
+                  <option value="partially_filled">Partially filled</option>
+                  <option value="filled">Filled</option>
+                  <option value="canceled">Canceled</option>
+                  <option value="expired">Expired</option>
+                  <option value="rejected">Rejected</option>
+                  <option value="unknown">Unknown</option>
+                </select>
+              </label>
+              <button class="button button-filter" id="apply-order-filter" type="button">Filter</button>
+            </div>
+            <div class="list-shell compact-list-shell" id="orders-shell" aria-live="polite">
+              <div class="loading-state" data-loading="orders">
+                <span class="loading-line loading-line-wide"></span>
+                <span class="loading-line"></span>
+                <span class="loading-line loading-line-short"></span>
+              </div>
+              <div class="error-state" data-error="orders" hidden>
+                <span class="state-symbol" aria-hidden="true">!</span>
+                <div><strong>Orders unavailable</strong><p data-error-message="orders">The dashboard could not read recorded orders.</p></div>
+                <button class="button button-quiet" data-retry="orders" type="button">Retry</button>
+              </div>
+              <div class="empty-state" data-empty="orders" hidden>
+                <span class="state-symbol" aria-hidden="true">∅</span>
+                <div><strong>No recorded orders</strong><p>Order intent and fill records will appear here when present.</p></div>
+              </div>
+              <div class="record-list" id="order-list" role="list"></div>
+            </div>
+            <div class="pagination" id="orders-pagination" hidden>
+              <span class="pagination-label" id="orders-page-label">Page 1</span>
+              <div class="pagination-actions">
+                <button class="button button-quiet" data-page="orders-prev" type="button">Previous</button>
+                <button class="button button-quiet" data-page="orders-next" type="button">Next</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel-section compact-panel" id="positions" aria-labelledby="positions-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">04 / LEDGER</p>
+                <h2 id="positions-title">Relay-owned positions</h2>
+              </div>
+              <span class="section-stamp section-stamp-green">RECORDED</span>
+            </div>
+            <div class="list-shell compact-list-shell" id="positions-shell" aria-live="polite">
+              <div class="loading-state" data-loading="positions">
+                <span class="loading-line loading-line-wide"></span>
+                <span class="loading-line"></span>
+                <span class="loading-line loading-line-short"></span>
+              </div>
+              <div class="error-state" data-error="positions" hidden>
+                <span class="state-symbol" aria-hidden="true">!</span>
+                <div><strong>Positions unavailable</strong><p data-error-message="positions">The dashboard could not read relay-owned positions.</p></div>
+                <button class="button button-quiet" data-retry="positions" type="button">Retry</button>
+              </div>
+              <div class="empty-state" data-empty="positions" hidden>
+                <span class="state-symbol" aria-hidden="true">∅</span>
+                <div><strong>No relay-owned positions</strong><p>This ledger has no recorded open position rows.</p></div>
+              </div>
+              <div class="record-list" id="position-list" role="list"></div>
+            </div>
+            <p class="panel-note">These are relay-owned recorded positions, not a claim about total broker holdings.</p>
+          </section>
+        </section>
+
+        <section class="panel-section" id="events" aria-labelledby="events-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">05 / AUDIT TRAIL</p>
+              <h2 id="events-title">Decision trail</h2>
+            </div>
+            <span class="muted-label" id="events-range">—</span>
+          </div>
+          <div class="list-shell" id="events-shell" aria-live="polite">
+            <div class="loading-state" data-loading="events">
+              <span class="loading-line loading-line-wide"></span>
+              <span class="loading-line"></span>
+              <span class="loading-line loading-line-short"></span>
+            </div>
+            <div class="error-state" data-error="events" hidden>
+              <span class="state-symbol" aria-hidden="true">!</span>
+              <div><strong>Decision events unavailable</strong><p data-error-message="events">The dashboard could not read decision events.</p></div>
+              <button class="button button-quiet" data-retry="events" type="button">Retry</button>
+            </div>
+            <div class="empty-state" data-empty="events" hidden>
+              <span class="state-symbol" aria-hidden="true">∅</span>
+              <div><strong>No decision events</strong><p>Interpretation records will appear here when the relay has processed messages.</p></div>
+            </div>
+            <div class="event-list" id="event-list" role="list"></div>
+          </div>
+          <div class="pagination" id="events-pagination" hidden>
+            <span class="pagination-label" id="events-page-label">Page 1</span>
+            <div class="pagination-actions">
+              <button class="button button-quiet" data-page="events-prev" type="button">Previous</button>
+              <button class="button button-quiet" data-page="events-next" type="button">Next</button>
+            </div>
+          </div>
+        </section>
+
+        <footer class="app-footer">
+ <span><span class="footer-pulse" aria-hidden="true"></span> Relay monitor / guarded controls</span>
+          <span>Recorded state may be stale when the runtime is disconnected.</span>
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>

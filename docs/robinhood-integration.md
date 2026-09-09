@@ -1,0 +1,52 @@
+# Robinhood Agentic integration
+
+The relay uses Robinhood's Agentic MCP endpoint, `https://agent.robinhood.com/mcp/trading`, through the Python MCP SDK. It binds the account returned by authenticated discovery. No account, credential, balance, or captured brokerage response ships with the project.
+
+## Authorization
+
+Start Robinhood sign-in from **Setup**. Complete authorization in your normal browser; the callback returns to `http://127.0.0.1:8766/callback`. Codex and Robinhood do not use the internal Discord browser. On a remote server, establish the loopback tunnel described in the [TrueNAS guide](truenas.md) before signing in.
+
+OAuth uses PKCE. Registration and tokens are stored atomically with owner-only permissions in the persistent data directory. The MCP SDK handles refresh. If renewed authorization is required, the background worker reports assistance rather than opening an unattended login flow. The optional Discord output webhook reports detected credential and connection failures.
+
+Account selection requires authenticated eligibility fields and an unambiguous eligible account. A display name alone does not establish eligibility. Keep the account binding and its mode-specific ledger together when migrating an existing installation.
+
+## Reads and order lifecycle
+
+The normalized adapter exposes `snapshot()`, `quote(contract)`, `review(order)`, `submit(order, before_submit=None)` and `order_status(broker_uuid)`.
+
+1. Revalidate the bound account and fetch equity, spendable funds, positions and pending orders.
+2. Resolve the exact underlying, expiry, strike and call/put instrument. Check quote identity, bid/ask, broker timestamp, tick size, currency, multiplier and tradability.
+3. Apply source ownership, whole-contract sizing and exposure controls, then verify the originating Discord row again.
+4. In Shadow mode, save a proposal. In Live mode, persist order intent and obtain a broker-native review matching the intended account, contract, quantity and price.
+5. Recheck the pause switch, source revision, newer messages, quotes, available funds and inventory immediately before submission.
+6. Persist the returned broker order identity and reconcile cumulative fills. An uncertain dispatch is not automatically submitted again.
+
+The adapter pins the schemas of its qualified broker tools. A changed schema blocks the affected operation until its compatibility is reviewed. A discovered tool or successful login does not prove that an order will be accepted or filled. Existing account holdings do not automatically become relay-owned positions.
+
+Account equity uses the portfolio total, not only the stock/ETF component. Spendable funds are constrained by reported and unleveraged buying power. Account snapshot age starts at the beginning of its fetch; option quotes use the provider's timestamp. Session gating uses the installed exchange calendar and conservatively stops at 16:00 New York time.
+
+## Modes and allocation
+
+- **Paper:** explicit local quote fixtures and simulated fills.
+- **Shadow:** authenticated account/quote reads and saved proposals, without order submission.
+- **Live:** real orders only when both the configured mode and live-order gate are enabled.
+
+Each mode has a separate ledger. Fresh Docker installations begin in Shadow with no account binding and live orders disabled. Use the frontend's pause and mode controls to change an existing installation.
+
+The default allocation ceiling increases from 5% of equity at 0.80 interpretation confidence to 10% at 1.00 confidence. Existing exposure, available funds and estimated costs can reduce that budget. The default same-underlying cap is 10%, total option exposure cap is 20%, and local cash reserve is zero. These are maximum allocations, not minimum account balances or required spending.
+
+Quantity is a whole-contract floor that includes the configured per-contract fee reserve. Optional calibrated quarter-Kelly sizing can impose a lower cap. Interpretation confidence is not a measured probability of profitable trading. There is no fixed contract-count or daily entry-count limit.
+
+Missed-signal recovery produces timestamped assessments only. It does not bypass the fresh-message execution gate or submit historical orders. See [container operation](container.md) for recovery and monitoring behavior.
+
+## Optional command-line inspection
+
+The frontend performs normal setup. For local diagnostics against a deliberately configured private account:
+
+```sh
+python -m relay broker-login
+python -m relay broker-discover
+python -m relay broker-inspect
+```
+
+`broker-inspect --bind` writes a private Shadow configuration for an unambiguously selected eligible account. It refuses to bind an account into `config.example.json`. These commands may create sensitive local reports; keep them outside Git. The public regression suite uses synthetic responses and sends no brokerage orders.

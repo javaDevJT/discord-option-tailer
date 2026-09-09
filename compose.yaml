@@ -1,0 +1,37 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CODEX_VERSION: "${CODEX_VERSION:-0.153.4}"
+        PLAYWRIGHT_VERSION: "${PLAYWRIGHT_VERSION:-1.62.0}"
+    image: discord-options-relay:local
+    init: true
+    restart: unless-stopped
+    shm_size: 1gb
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8787}:8080"
+      - "127.0.0.1:8766:8766"
+    environment:
+      HOME: /home/relay
+      CODEX_HOME: /data/codex
+      DISPLAY: ":99"
+      BROWSER: /usr/local/bin/relay-browser
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      RELAY_DATA_DIR: /data
+      RELAY_CONFIG: /data/config.json
+      RELAY_OAUTH_CALLBACK_HOST: "0.0.0.0"
+      DASHBOARD_USER: "${DASHBOARD_USER:-relay}"
+      DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"
+    volumes:
+      - relay-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  relay-data:

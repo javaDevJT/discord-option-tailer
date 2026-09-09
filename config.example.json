@@ -1,0 +1,63 @@
+{
+  "mode": "paper",
+  "database": "state/relay.sqlite3",
+  "kill_switch": "state/STOP",
+  "channels": [
+    {
+      "id": "1000000000000000001",
+      "guild_id": "REPLACE_WITH_SERVER_ID",
+      "role": "signals",
+      "authors": ["2000000000000000001", "2000000000000000002"],
+      "source_group": "source-a"
+    },
+    {
+      "id": "1000000000000000002",
+      "guild_id": "REPLACE_WITH_SERVER_ID",
+      "role": "signals",
+      "authors": ["2000000000000000003"],
+      "source_group": "source-b"
+    }
+  ],
+  "browser": {
+    "profile_dir": "state/discord-browser",
+    "poll_seconds": 3
+  },
+  "llm": {
+    "provider": "codex",
+    "executable": null,
+    "model": null,
+    "timeout_seconds": 90,
+    "context_messages": 60
+  },
+  "risk": {
+    "max_signal_age_seconds": 90,
+    "min_confidence": 0.80,
+    "entry_risk_min_fraction": "0.05",
+    "entry_risk_max_fraction": "0.10",
+    "fractional_kelly": "0.25",
+    "max_position_fraction": "0.10",
+    "max_total_exposure_fraction": "0.20",
+    "buying_power_reserve_fraction": "0",
+    "strategy_stats": {},
+    "max_spread_fraction": "0.15",
+    "max_quote_age_seconds": 15,
+    "max_chase_fraction": "0.05",
+    "fee_reserve_per_contract": "1.00",
+    "allow_same_day_expiry": false,
+    "duplicate_window_seconds": 180,
+    "max_pending_messages": 200
+  },
+  "paper": {
+    "buying_power": "1000.00",
+    "market_open": false,
+    "quotes_file": null
+  },
+  "robinhood": {
+    "auth": "oauth",
+    "account_number": null,
+    "enable_live_orders": false,
+    "access_token_env": "ROBINHOOD_ACCESS_TOKEN",
+    "timeout_seconds": 30,
+    "token_store": "state/robinhood-oauth.json"
+  }
+}

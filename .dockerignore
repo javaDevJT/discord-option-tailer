@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!README.md
+!config.example.json
+!pyproject.toml
+!relay/
+!relay/**
+!docker/
+!docker/**
+relay/**/__pycache__/
+relay/**/*.py[cod]
+docker/**/__pycache__/
+docker/**/*.py[cod]

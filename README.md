@@ -1,0 +1,122 @@
+# Discord Option Tailer
+
+Discord Option Tailer watches exactly two configured Discord channels in a personal, manually signed-in browser session. It sends bounded message context to Codex through an existing ChatGPT subscription, applies deterministic option and risk checks, and records the decision trail in a mode-bound SQLite ledger.
+
+Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker data and save proposed orders, but it never submits them. **Live** is an explicit, paused setup action that can submit real Robinhood orders. Historical and missed-message recovery is review-only and never submits a recovered trade.
+
+## Project index
+
+- [Container setup and dashboard](docs/container.md): start the service and complete Discord, Codex, Robinhood, notification, and trading-mode setup in the frontend.
+- [TrueNAS deployment](docs/truenas.md): deploy the published image with persistent private storage.
+- [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.
+- [Broker integration](docs/robinhood-integration.md): authorization, account inspection, and execution checks.
+- [Configuration template](config.example.json): CLI and offline-rehearsal defaults.
+- [Container environment](.env.example): dashboard binding and password settings.
+- [Relay source](relay/): browser reader, interpreter, ledger, broker adapter, dashboard, and worker.
+- [Synthetic checks](tests/): offline unit and fixture tests.
+
+Private account exports, browser profiles, OAuth state, databases, and local credentials are runtime data and are intentionally absent from the public source tree. The public documentation contains no account state or real message samples.
+
+## How it works
+
+1. The embedded Chromium desktop reads the rendered DOM of two channels from the user's signed-in Discord session. It does not use a Discord bot token or post to the input channels.
+2. The relay stores normalized messages and passes a bounded chronological context window to Codex. Codex runs through the user's ChatGPT subscription; no OpenAI API key is required.
+3. Deterministic checks require a clear standard option contract, an allowed source, fresh inputs, current quotes, account-relative sizing, and a mode-specific ledger.
+4. The dashboard shows messages, interpretations, holds, recorded orders, relay-owned positions, and recovery assessments. An optional Discord webhook reports selected setup assistance and relay actions.
+5. Robinhood access uses its normal browser OAuth flow and a local callback. Passwords and MFA stay with Robinhood; setup performs account inspection before any execution mode can be selected.
+
+## Fresh messages and recovery
+
+The first history visible after login, reconnect, or restart is a context baseline. It is recorded for interpretation context and is never replayed as a new entry. A fresh eligible alert must still pass the normal freshness and source checks before it can reach the mode-specific order path.
+
+When the reader returns to the newest messages, eligible baseline alerts and alerts held because they became stale can receive a separate recovery assessment. The evaluator compares the original alert with later same-source messages and current account and quote facts. It reports a review result such as **Potentially viable**, **Invalidated**, **Uncertain**, or **Not actionable**; every result remains review-only. Recovery is bounded by messages observed by the browser and durable per-revision deduplication. It does not fetch a complete Discord history, turn an old message into a fresh trigger, or place an order.
+
+Edited alerts, manual backscroll, imported history, future timestamps, context-only rows, and unauthorized authors stay out of execution. Visible embed text and metadata are available to the interpreter; image-only instructions are held.
+
+## Supported actions and limits
+
+The trading path supports single-leg, long, standard USD equity or ETF options: buy to open, reduce, and sell to close. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, shorts, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop.
+
+The default risk settings are guardrails on the maximum amount allocated to an entry:
+
+| Guardrail | Default |
+| --- | --- |
+| Minimum parse confidence | `0.80` |
+| Confidence-based entry ceiling | `5%` at the threshold, rising to `10%` at confidence `1.00` (`7.5%` at `0.90`) |
+| Same-underlying exposure ceiling | `10%` of equity |
+| Total option exposure ceiling | `20%` of equity |
+| Buying-power reserve | `0%` local reserve; broker restrictions still apply |
+| Signal age | At most `90` seconds for a fresh action |
+| Quote age | At most `15` seconds |
+| Maximum spread | `15%` |
+| Maximum chase above cited premium | `5%` |
+| Same-day expiry entries | Disabled by default |
+| Fee reserve | `$1.00` per contract in the default configuration |
+
+The 5%–10% range is a confidence-based **maximum**, never a minimum spend or minimum account balance. Actual buying power, existing and pending exposure, the fee reserve, and whole-contract sizing can reduce it to zero. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can impose an additional lower cap; they cannot raise the 5%–10% ceiling.
+
+## Trading modes
+
+| Mode | Data | Result |
+| --- | --- | --- |
+| `paper` | Synthetic account and quote fixtures | Simulated fills in an offline ledger; no broker calls |
+| `shadow` | Authenticated account and current quotes | Proposed orders are recorded; no submissions or simulated fills |
+| `live` | Authenticated account and current quotes | Real submissions are possible only after every execution check and explicit confirmation |
+
+Each mode uses its own ledger. The frontend changes between Shadow and Live only while the relay is paused, requires a worker acknowledgement, and keeps Live disabled until the user confirms it. Pausing stops new execution; it does not cancel an existing broker order or close a position. A recorded proposal, broker review, accepted order, or simulated fill is not by itself proof of a real fill.
+
+## Quick start with Docker
+
+Install Docker with Compose, choose a dashboard password, and start from the repository directory:
+
+```sh
+test -f .env || cp .env.example .env
+# Edit .env and set DASHBOARD_PASSWORD.
+docker compose config
+docker compose up -d --build
+docker compose ps
+curl --fail http://127.0.0.1:8787/healthz
+```
+
+Open `http://localhost:8787` and sign in with the dashboard credentials from `.env`. The default bind is loopback. A new volume bootstraps the frontend with **Setup required**, **Shadow** mode, no bound Robinhood account, and live submissions disabled. Existing volume state is preserved on restart.
+
+Use the dashboard's **Setup** section to complete the four integrations:
+
+1. **Discord:** open **Browser login**, sign in to the personal account, refresh the server list, choose one channel for each of the two rows, and save. Choose `Signals` for actionable channels and `Context` for context-only channels. Author restrictions are optional; an unchecked restriction accepts all authors in that channel. The browser profile remains in the volume.
+2. **Codex:** start device sign-in, open the displayed verification link in the user's own browser, and enter the displayed code. The container keeps the subscription login in its persistent data volume and does not ask for an API key.
+3. **Robinhood:** start sign-in and open the displayed authorization link in the user's normal browser. The local callback uses port `8766`; account inspection and binding finish in Setup. Choose an explicit account only when the eligible-account choice is not unique. Setup does not place an order.
+4. **Notifications:** optionally save a Discord output webhook. It is a separate output destination from the personal Discord reader, remains hidden after saving, and reports only supported setup assistance and relay actions.
+
+Leave the relay in Shadow while validating channels, provider connections, and fresh-message behavior. To use Live later, follow the paused **Enable Live** confirmation flow in the dashboard and wait for the worker to acknowledge the mode before resuming.
+
+## Source installation and validation
+
+For offline work without Docker, use Python 3.11 or newer:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[browser,robinhood]'
+python -m playwright install chromium
+python -m relay doctor
+python -m relay demo
+python -m unittest discover -s tests -v
+```
+
+The demo and fixture tests use synthetic messages, quotes, accounts, and browser state. They exercise the local safety paths without signing in to a provider or sending a live order. If you supply local export files, use the `relay replay` subcommand with a separate database; it performs import or historical analysis only and never submits historical orders.
+
+## Container images and deployment notes
+
+GitHub Actions runs the synthetic tests and scans Git history for secrets before publishing `ghcr.io/javadevjt/discord-option-tailer:latest` for Linux `amd64`. Main builds also receive a full commit `sha-...` tag. Use [the TrueNAS guide](docs/truenas.md) and [image-based Compose file](compose.truenas.yaml) to deploy it. For local source builds, use `docker compose up -d --build` with `compose.yaml`.
+
+The container stores configuration, ledgers, the Chromium profile, Codex subscription state, and Robinhood OAuth state in one private Docker volume. The dashboard and browser gateway are password-protected; keep the published ports on a trusted loopback or private network. Runtime recovery can reconnect the browser, but a sleeping host, revoked login, MFA challenge, network outage, or rapidly changing DOM can interrupt observation. No unattended-uptime, execution-quality, or profitability claim is made.
+
+For routine operation:
+
+```sh
+docker compose logs --tail=100 relay
+docker compose stop
+docker compose start
+```
+
+See [Container setup and dashboard](docs/container.md) for the frontend workflow, recovery semantics, mode controls, notifications, persistence, and troubleshooting.
