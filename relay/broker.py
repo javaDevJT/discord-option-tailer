@@ -456,16 +456,19 @@ async def login(config, *, authorization_handler=None):
 
 # Authenticated official schemas observed 2026-09-06; changes require renewed qualification.
 SCHEMA_PINS = {
-    "search": "577c2e161dec698d9efdb2d203a42d99798057035a277cbbb349c26477e7b28e",
-    "get_accounts": "3df90562b040c920c73ba68b1685508a9db806266b0e98903bef0b9b04c83042",
-    "get_portfolio": "b1d5f51ec0e84c8a62181dee3daa7a5d2ab93c7ece8d0c8373d482715455a2f5",
-    "get_option_chains": "661824e1e339fdc16e61a5192a37ebb664de935fc493887f9825e16fbcc119ba",
-    "get_option_instruments": "e27cf1cb98aeecf5940b23c6ff02dada0f07f5e90866d77e63a843b983f8d503",
-    "get_option_quotes": "ac069476d02f1b401fc9f2f1a65d402a5d7cb352df2f4b06cff87307fb846508",
-    "get_option_positions": "f9ee54d7cee627f491189d66330d1662954d6ef7b9ae889e90a27e8dea11cabd",
-    "get_option_orders": "3d1a33c36ac93d9e3dd202f10b7597bf74fb91d491aa00c0b41ed460d7d51277",
-    "review_option_order": "a3e359eb4e73e46d77f8fc9a3ab90ba4d88f0d36b96d58225fe8fbdde69b4dc0",
-    "place_option_order": "2b6e3ecd2997e8a58d36b5b77c8a4883b551255d05d39511995a4245d7f37cb3",
+    "search": {"577c2e161dec698d9efdb2d203a42d99798057035a277cbbb349c26477e7b28e"},
+    # Reviewed 2026-09-09: only guide.description changed in these two outputs.
+    "get_accounts": {"3df90562b040c920c73ba68b1685508a9db806266b0e98903bef0b9b04c83042",
+                     "4ae8734970c9dd300d627ea117b185fb5744e1af16970d6f79267e55acf97603"},
+    "get_portfolio": {"b1d5f51ec0e84c8a62181dee3daa7a5d2ab93c7ece8d0c8373d482715455a2f5",
+                      "a0b873691e9b5e7f8843f94f02073e56b9958f59b540fd4efac5cc3347af960a"},
+    "get_option_chains": {"661824e1e339fdc16e61a5192a37ebb664de935fc493887f9825e16fbcc119ba"},
+    "get_option_instruments": {"e27cf1cb98aeecf5940b23c6ff02dada0f07f5e90866d77e63a843b983f8d503"},
+    "get_option_quotes": {"ac069476d02f1b401fc9f2f1a65d402a5d7cb352df2f4b06cff87307fb846508"},
+    "get_option_positions": {"f9ee54d7cee627f491189d66330d1662954d6ef7b9ae889e90a27e8dea11cabd"},
+    "get_option_orders": {"3d1a33c36ac93d9e3dd202f10b7597bf74fb91d491aa00c0b41ed460d7d51277"},
+    "review_option_order": {"a3e359eb4e73e46d77f8fc9a3ab90ba4d88f0d36b96d58225fe8fbdde69b4dc0"},
+    "place_option_order": {"2b6e3ecd2997e8a58d36b5b77c8a4883b551255d05d39511995a4245d7f37cb3"},
 }
 
 
@@ -508,7 +511,7 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Required broker tool is missing from the qualified catalog")
         schemas = {key: tool.get(key) for key in ("inputSchema", "outputSchema")}
         digest = hashlib.sha256(json.dumps(schemas, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        if digest != SCHEMA_PINS[name]:
+        if digest not in SCHEMA_PINS[name]:
             raise BrokerError("Robinhood schema changed; qualify the new schema before continuing")
         return tool
 

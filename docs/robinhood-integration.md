@@ -4,7 +4,7 @@ The relay uses Robinhood's Agentic MCP endpoint, `https://agent.robinhood.com/mc
 
 ## Authorization
 
-Start Robinhood sign-in from **Setup** and complete authorization in your normal browser. Set `RELAY_ROBINHOOD_REDIRECT_URI` to the dashboard address ending in `/callback` when the relay runs remotely, for example `http://192.168.1.20:8787/callback`. The local default remains `http://127.0.0.1:8766/callback`. Codex and Robinhood do not use the internal Discord browser. See the [TrueNAS guide](truenas.md) for remote setup.
+Start Robinhood sign-in from **Setup** and complete authorization in your normal browser. The default redirect is `http://127.0.0.1:8766/callback`. On a remote deployment, your browser may show an unreachable localhost page after authorization: copy that complete returned URL into **Returned callback URL** in Setup and select **Finish Robinhood sign-in**. The relay validates the active attempt and completes its internal callback. `RELAY_ROBINHOOD_REDIRECT_URI` can override the redirect when the provider permits your deployment URL. Codex and Robinhood do not use the internal Discord browser. See the [TrueNAS guide](truenas.md) for remote setup.
 
 OAuth uses PKCE. Registration and tokens are stored atomically with owner-only permissions in the persistent data directory. The MCP SDK handles refresh. If renewed authorization is required, the background worker reports assistance rather than opening an unattended login flow. The optional Discord output webhook reports detected credential and connection failures.
 
@@ -22,6 +22,8 @@ The normalized adapter exposes `snapshot()`, `quote(contract)`, `review(order)`,
 6. Persist the returned broker order identity and reconcile cumulative fills. An uncertain dispatch is not automatically submitted again.
 
 The adapter pins the schemas of its qualified broker tools. A changed schema blocks the affected operation until its compatibility is reviewed. A discovered tool or successful login does not prove that an order will be accepted or filled. Existing account holdings do not automatically become relay-owned positions.
+
+The account and portfolio schemas observed on September 9, 2026 changed only their display guidance about limited-margin features. Both original and reviewed hashes are accepted; input fields, output structure, order schemas and response validation are unchanged. Unreviewed changes still stop the affected operation. The offline regression fixtures contain schema metadata only, without account responses or credentials.
 
 Account equity uses the portfolio total, not only the stock/ETF component. Spendable funds are constrained by reported and unleveraged buying power. Account snapshot age starts at the beginning of its fetch; option quotes use the provider's timestamp. Session gating uses the installed exchange calendar and conservatively stops at 16:00 New York time.
 
