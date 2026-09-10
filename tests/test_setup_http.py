@@ -19,7 +19,7 @@ class SetupHTTPTests(unittest.TestCase):
         self.app = DashboardApp(self.config)
         self.manager = Mock()
         self.manager.status.return_value = {"configured": False}
-        for name in ("save_channels", "save_notifications", "start_auth", "cancel_auth", "complete_robinhood_callback", "set_paused", "set_mode", "reconnect", "discover_discord"):
+        for name in ("save_channels", "save_notifications", "start_auth", "cancel_auth", "complete_robinhood_callback", "set_paused", "set_mode", "set_expiry_policy", "reconnect", "discover_discord"):
             getattr(self.manager, name).return_value = {"accepted": True}
         self.app.setup = self.manager
         self.server = DashboardHTTPServer(("127.0.0.1", 0), self.app)
@@ -63,6 +63,7 @@ class SetupHTTPTests(unittest.TestCase):
             ("notifications", {"enabled": False}, "save_notifications", ({"enabled": False},)),
             ("discord/discover", {"guild_id": "111111111111111111"}, "discover_discord", ({"guild_id": "111111111111111111"},)),
             ("pause", {"paused": True}, "set_paused", (True,)),
+            ("expiry-policy", {"allow_same_day_expiry": True}, "set_expiry_policy", ({"allow_same_day_expiry": True},)),
             ("mode", {"mode": "live", "confirm_live": True}, "set_mode", ({"mode": "live", "confirm_live": True},)),
             ("reconnect", {}, "reconnect", ()),
             ("auth/codex/start", {}, "start_auth", ("codex", {})),
@@ -102,6 +103,9 @@ class SetupHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/setup/mode", {"mode": "live", "confirm_live": True},
                                       headers={"X-Relay-CSRF": None})[0], 403)
         self.manager.set_mode.assert_not_called()
+        self.assertEqual(self.request("/api/setup/expiry-policy", {"allow_same_day_expiry": True},
+                                      headers={"X-Relay-CSRF": None})[0], 403)
+        self.manager.set_expiry_policy.assert_not_called()
 
     def test_unsupported_routes_and_errors(self):
         for method, path in [("PUT", "/api/setup/pause"), ("DELETE", "/api/setup/channels"),

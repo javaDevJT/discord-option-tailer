@@ -108,7 +108,7 @@ The default configuration keeps the confidence-based entry allocation ceiling be
 | Quote freshness | `15` seconds |
 | Maximum spread | `15%` |
 | Maximum chase | `5%` above the cited premium |
-| Same-day expiry opens | Disabled by default |
+| Same-day expiry opens | Disabled by default; editable in Setup while paused |
 | Fee reserve | `$1.00` per contract |
 
 These are maximum allocations, never a required spend or minimum account balance. Current buying power, existing and pending exposure, whole-contract quantity, and fees can reduce an entry to zero. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can only reduce the ceiling.

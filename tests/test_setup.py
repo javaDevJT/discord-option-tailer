@@ -22,6 +22,28 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SetupManagerTests(unittest.TestCase):
+    def test_same_day_permission_requires_pause_and_worker_reload_preserving_other_settings(self):
+        original = self.path.read_bytes()
+        for payload in ({}, {"allow_same_day_expiry": 1}, {"allow_same_day_expiry": True, "mode": "live"}):
+            with self.assertRaises(ValueError):
+                self.manager.set_expiry_policy(payload)
+        with self.assertRaisesRegex(RuntimeError, "Pause"):
+            self.manager.set_expiry_policy({"allow_same_day_expiry": True})
+        self.assertEqual(self.path.read_bytes(), original)
+        self.manager.set_paused(True)
+        result = self.manager.set_expiry_policy({"allow_same_day_expiry": True})
+        self.assertTrue(result["risk"]["allow_same_day_expiry"])
+        self.assertTrue(result["paused"])
+        self.assertTrue(result["trading"]["pending"])
+        saved = json.loads(self.path.read_text())
+        self.assertTrue(saved.pop("mode_change_id"))
+        saved["risk"]["allow_same_day_expiry"] = False
+        self.assertEqual(saved, json.loads(original))
+        with self.assertRaisesRegex(RuntimeError, "previous settings"):
+            self.manager.set_expiry_policy({"allow_same_day_expiry": False})
+        with self.assertRaisesRegex(RuntimeError, "worker"):
+            self.manager.set_paused(False)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)

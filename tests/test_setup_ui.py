@@ -103,6 +103,7 @@ class SetupUITests(unittest.TestCase):
                 "entry_risk_min_fraction": "0.05",
                 "entry_risk_max_fraction": "0.10",
                 "min_confidence": 0.8,
+                "allow_same_day_expiry": False,
             },
         }
         status.update(overrides)
@@ -228,6 +229,13 @@ class SetupUITests(unittest.TestCase):
                             worker_mode=state.get("mode_worker_mode", mode),
                             pending=state.get("mode_pending", False),
                         )
+                elif path == "/api/setup/expiry-policy":
+                    state.setdefault("expiry_policy_requests", []).append(body)
+                    if state.get("expiry_policy_error"):
+                        error = state["expiry_policy_error"]
+                        fulfill(route, {"detail": error["detail"]}, error["status"])
+                        return
+                    state["status"].setdefault("risk", {})["allow_same_day_expiry"] = body.get("allow_same_day_expiry")
                 elif path == "/api/setup/pause":
                     state["status"]["paused"] = bool(body.get("paused"))
                 elif path == "/api/setup/reconnect":
@@ -663,6 +671,43 @@ class SetupUITests(unittest.TestCase):
                 state["discovery_error"] = "Discord browser is not signed in"
                 page.get_by_role("button", name="Refresh servers").click()
                 expect(page.locator("#discord-discovery-feedback")).to_contain_text("Discord browser is not signed in", timeout=3000)
+            finally:
+                browser.close()
+
+    def test_same_day_expiry_policy_is_paused_only_and_rolls_back_on_error(self):
+        state = {
+            "status": self.status_payload(
+                configured=True,
+                paused=False,
+                discord={"state": "connected", "detail": "Discord is signed in."},
+                trading={"mode": "live", "live_enabled": True, "worker_mode": "live", "pending": False},
+            ),
+            "headers": [],
+            "requests": [],
+            "discovery_requests": [],
+            "expiry_policy_requests": [],
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                expiry = page.get_by_role("checkbox", name="Allow same-day (0DTE) entries")
+                expect(expiry).to_be_disabled()
+                expect(expiry).not_to_be_checked()
+
+                with page.expect_response(lambda response: response.url.endswith("/api/setup/pause")):
+                    page.get_by_role("button", name="Pause relay").click()
+                expect(expiry).to_be_enabled()
+
+                with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")):
+                    expiry.check()
+                self.assertEqual(state["expiry_policy_requests"], [{"allow_same_day_expiry": True}])
+                expect(expiry).to_be_checked()
+
+                state["expiry_policy_error"] = {"status": 409, "detail": "policy refused"}
+                with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")):
+                    expiry.uncheck()
+                expect(expiry).to_be_checked()
+                expect(page.locator("#expiry-policy-feedback")).to_contain_text("Could not update setup")
             finally:
                 browser.close()
 

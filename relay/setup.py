@@ -332,6 +332,27 @@ class SetupManager:
                 stop_path.unlink(missing_ok=True)
             return self._action_response_locked("paused" if paused else "resumed")
 
+    def set_expiry_policy(self, payload: dict) -> dict:
+        """Change the single same-day entry permission while execution is paused."""
+        if not isinstance(payload, dict) or set(payload) != {"allow_same_day_expiry"} or type(payload["allow_same_day_expiry"]) is not bool:
+            raise ValueError("allow_same_day_expiry must be a boolean")
+        with self._lock:
+            self._ensure_open_locked()
+            latest = self._read_raw_locked()
+            if not self._is_paused(latest):
+                raise RuntimeError("Pause the relay before changing same-day entry permission.")
+            if self._public_trading(latest)["pending"]:
+                raise RuntimeError("Wait for the worker to load the previous settings change.")
+            enabled = payload["allow_same_day_expiry"]
+            if latest.get("risk", {}).get("allow_same_day_expiry") is enabled:
+                return self._action_response_locked("expiry_policy_unchanged")
+            candidate = copy.deepcopy(latest)
+            candidate.setdefault("risk", {})["allow_same_day_expiry"] = enabled
+            candidate["mode_change_id"] = uuid.uuid4().hex
+            self._validate_candidate(candidate)
+            self._atomic_write_config_locked(candidate)
+            return self._action_response_locked("expiry_policy_saved")
+
     def set_mode(self, payload: dict) -> dict:
         """Select a mode and its own ledger; activation remains a separate Resume."""
         if (not isinstance(payload, dict) or set(payload) - {"mode", "confirm_live"}

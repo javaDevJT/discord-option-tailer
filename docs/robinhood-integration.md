@@ -29,6 +29,8 @@ Account equity uses the portfolio total, not only the stock/ETF component. Spend
 
 ## Modes and allocation
 
+To permit 0DTE entries, pause the relay in Setup and enable **Allow same-day (0DTE) entries**. The change saves automatically. Wait for the worker to load the setting before selecting **Resume**. The setting changes only that permission and leaves the selected mode, credentials and other risk rules intact.
+
 When an actionable new entry omits expiry, the interpreter requests the nearest listed expiration. The broker selects 0DTE when the exact standard contract is listed, otherwise the first later expiration at the same symbol, strike and call/put. An explicit text, embed or pictured date is preserved even if unavailable; it never silently rolls to another date. Exits inherit the owned position's expiry. Defaults use the original message's New York date, and earlier-day implicit entries cannot be revived with a newly listed contract. The existing same-day permission gate remains authoritative.
 
 Current-message and directly replied-to Discord attachment pictures are passed to Codex through native image input using the existing subscription. Supported PNG/JPEG/WebP images are fetched only from approved Discord CDN attachment paths, bounded in count and size, and kept in private temporary files. Signed URLs never enter model text. Unreadable or unsupported pictures stop interpretation; filenames cannot supply an expiration. Image-only alerts without an accompanying textual action remain held.
