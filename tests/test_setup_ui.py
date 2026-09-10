@@ -707,8 +707,9 @@ class SetupUITests(unittest.TestCase):
                 expect(expiry).to_be_checked()
 
                 state["expiry_policy_error"] = {"status": 409, "detail": "policy refused"}
+                # Rejection can restore the check before uncheck() asserts its intermediate state.
                 with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")):
-                    expiry.uncheck()
+                    expiry.click()
                 expect(expiry).to_be_checked()
                 expect(page.locator("#expiry-policy-feedback")).to_contain_text("Could not update setup")
             finally:
