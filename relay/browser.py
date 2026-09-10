@@ -104,7 +104,10 @@ EXTRACT_MESSAGES_JS = r"""(expectedChannelId = null) => {
     }
     const embeds = own(row, 'article[class*="embed"], [class*="embedFull"]')
       .filter(el => !el.parentElement.closest('article[class*="embed"], [class*="embedFull"]'))
-      .map(el => ({description: el.innerText || ''}));
+      .map(el => {
+        const image = el.querySelector('[class*="embedImage"] img, [class*="embedThumbnail"] img');
+        return {description: el.innerText || '', ...(image ? {image: {url: image.currentSrc || image.src}} : {})};
+      });
     messages.push({id, channel_id: row.id.split('-')[2], author_id: authorId, author_name: username ? username.textContent : '',
       content: content ? content.innerText : '', timestamp: time.getAttribute('datetime'),
       reply_to: replyMatch ? replyMatch[1] : null, attachments, embeds, source: 'browser'});

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from relay.interpreter import _record
 
 from relay.interpreter import (
     DECISION_SCHEMA, RECOVERY_SCHEMA, CodexInterpreter, InterpretationError,
@@ -53,6 +54,17 @@ LATER = {
 
 
 class InterpreterChecks(unittest.TestCase):
+    def test_default_expiry_only_for_entries_and_dates_follow_source_timezone(self):
+        message = MESSAGE | {"content": "Buy TSLA 352.5 put at .87", "timestamp": "2026-09-05T00:30:00Z"}
+        default = DECISION | {"contract": DECISION["contract"] | {"expiry": "nearest"},
+            "evidence": [{"message_id": message["id"], "quote": message["content"]}]}
+        self.assertEqual(validate_decision(default, message, []), default)
+        self.assertEqual(_record(message)["market_date"], "2026-09-04")
+        self.assertEqual(_record(message | {"timestamp": "2026-01-06T04:30:00Z"})["market_date"], "2026-01-05")
+        for action in ("CLOSE", "REDUCE", "UPDATE_STOP", "WAIT"):
+            with self.subTest(action=action), self.assertRaises(InterpretationError):
+                validate_decision(default | {"action": action}, message, [])
+
     def test_status_sink_failure_preserves_codex_result_and_original_error(self):
         async def scenario():
             def failed_sink(_event):
@@ -189,6 +201,30 @@ class InterpreterChecks(unittest.TestCase):
                 _strict_json(content)
 
 class CodexInterpreterChecks(unittest.TestCase):
+    def test_pictured_expiry_reaches_codex_without_signed_url_and_is_preserved(self):
+        message = MESSAGE | {"content": "Buy TSLA 352.5 put at .87", "attachments": [{
+            "filename": "alert.png", "content_type": "image/png",
+            "url": "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/alert.png?ex=private-fixture",
+        }]}
+        decision = DECISION | {"contract": DECISION["contract"] | {"expiry": "2026-09-18"},
+            "evidence": [{"message_id": message["id"], "quote": message["content"]}]}
+        with tempfile.TemporaryDirectory() as directory:
+            instance = self.interpreter(directory)
+            def response(args, env, cwd, input_bytes=None):
+                if "exec" in args:
+                    self.assertIn("--image", args)
+                    payload = json.loads(input_bytes)
+                    self.assertEqual(payload["image_inputs"], [{"message_id": "new"}])
+                    self.assertNotIn("private-fixture", input_bytes.decode())
+                    self.assertNotIn("cdn.discordapp.com", input_bytes.decode())
+                return self.response(args, env, cwd, input_bytes, decision=decision)
+            with patch.object(instance, "_run_process", side_effect=response), patch("relay.interpreter.download_images", return_value=[Path(directory) / "image.png"]):
+                result = asyncio.run(instance.interpret(message, [], []))
+            self.assertEqual(result["contract"]["expiry"], "2026-09-18")
+            with patch.object(instance, "_run_process", side_effect=response), patch("relay.interpreter.download_images", side_effect=ValueError("unreadable")):
+                with self.assertRaisesRegex(InterpretationError, "no expiry was assumed"):
+                    asyncio.run(instance.interpret(message, [], []))
+
     def interpreter(self, directory, **llm):
         home = Path(directory) / "source-home"
         home.mkdir()
@@ -256,9 +292,10 @@ class CodexInterpreterChecks(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
 
     def test_subscription_payload_is_bounded_and_omits_private_metadata(self):
+        image_url = "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/chart.png?token=private-fixture"
         message = MESSAGE | {
-            "attachments": [{"filename": "chart.png", "content_type": "image/png", "url": "https://private/?token=secret"}],
-            "embeds": [{"title": "Entry", "image": {"url": "https://private/?token=secret"}}],
+            "attachments": [{"filename": "chart.png", "content_type": "image/png", "url": image_url}],
+            "embeds": [{"title": "Entry", "image": {"url": image_url}}],
         }
         context = [{"id": str(i), "content": "x" * 7000, "source_group": "approved"} for i in range(70)]
         positions = [{"contract": DECISION["contract"], "quantity": 1, "bot_owned": True, "account_number": "private", "source_group": "approved"}]
@@ -272,7 +309,7 @@ class CodexInterpreterChecks(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             interpreter = self.interpreter(directory)
-            with patch.object(interpreter, "_run_process", side_effect=execute):
+            with patch.object(interpreter, "_run_process", side_effect=execute), patch("relay.interpreter.download_images", return_value=[Path(directory) / "image.png"]):
                 result = asyncio.run(interpreter.interpret(message, context, positions))
         self.assertEqual(result, DECISION)
         self.assertEqual(len(payloads[0]["context"]), 60)

@@ -172,6 +172,29 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrokerError, "schema changed"):
             self.broker._qualified("get_accounts")
 
+    async def test_nearest_expiry_uses_listed_matching_standard_contracts(self):
+        dates = ["2026-09-18", "2026-09-08", "2026-09-11"]
+        chain = self.chain | {"expiration_dates": dates}
+        rows = [self.instrument | {"expiration_date": expiry, "state": "active", "tradability": "tradable"}
+                for expiry in dates]
+        async def pages(name, args, key):
+            if name == "get_option_chains":
+                return [chain]
+            self.assertEqual(args["strike_price"], "500")
+            self.assertEqual(args["type"], "call")
+            self.assertNotIn("expiration_dates", args)
+            return rows
+        self.broker._pages = AsyncMock(side_effect=pages)
+        request = self.contract | {"expiry": "2026-09-08"}
+        self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-08")
+        rows[1]["tradability"] = "untradable"
+        self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-11")
+        rows[2]["strike_price"] = "501"
+        self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-18")
+        rows[0]["type"] = "put"
+        with self.assertRaisesRegex(BrokerError, "No listed expiration"):
+            await self.broker.nearest_expiry(request)
+
 
 if __name__ == "__main__":
     unittest.main()

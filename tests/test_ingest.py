@@ -161,7 +161,7 @@ class IngestTests(unittest.TestCase):
           <h3 id="message-username-{first}">Demo Analyst</h3>
           <span id="message-timestamp-{first}"><time datetime="2026-09-04T15:00:00Z">today</time></span>
           <div id="message-content-{first}">Watching TSLA</div>
-          <article class="embedFull_test">ENTRY: TSLA calls</article>
+          <article class="embedFull_test">ENTRY: TSLA calls<span class="embedImage_test"><img src="https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png"></span></article>
           <a href="https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png">chart</a>
         </li>
         <li id="chat-messages-{CHANNEL}-{second}" aria-labelledby="message-username-{first}">
@@ -216,7 +216,8 @@ const fs = require('fs');
         self.assertEqual(len(rows), 3)
         self.assertEqual([row["author_id"] for row in rows], [AUTHOR, AUTHOR, ""])
         self.assertEqual(rows[0]["reply_to"], message(5)["id"])
-        self.assertEqual(rows[0]["embeds"], [{"description": "ENTRY: TSLA calls"}])
+        self.assertEqual(rows[0]["embeds"], [{"description": "ENTRY: TSLA calls", "image": {
+            "url": f"https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png"}}])
         self.assertEqual(len(rows[0]["attachments"]), 1)
         self.assertNotEqual(observed["initial"]["connection_epoch"], observed["reconnected"]["connection_epoch"])
         self.assertFalse(observed["foreign"]["ready"])

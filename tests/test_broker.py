@@ -12,6 +12,21 @@ from relay.broker import BrokerError, PaperBroker, RobinhoodMCP, _OAuthStorage
 
 
 class BrokerChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_paper_nearest_expiry_uses_only_standard_matching_fixture_contracts(self):
+        contract = {"symbol": "SPY", "expiry": "2026-09-10", "strike": "650", "option_type": "call"}
+        quote = {"contract": contract, "tradable": True, "multiplier": 100,
+                 "currency": "USD", "asset_type": "equity_option"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quotes.json"
+            rows = [quote | {"multiplier": 10},
+                    quote | {"contract": contract | {"expiry": "2026-09-18"}},
+                    quote | {"contract": contract | {"expiry": "2026-09-11"}}]
+            path.write_text(json.dumps({"quotes": rows}))
+            broker = PaperBroker({"paper": {"quotes_file": str(path)}})
+            self.assertEqual((await broker.nearest_expiry(contract))["expiry"], "2026-09-11")
+            path.write_text(json.dumps({"quotes": rows + [quote]}))
+            self.assertEqual(await broker.nearest_expiry(contract), contract)
+
     async def test_status_sink_failure_preserves_broker_result_and_original_error(self):
         def failed_sink(_event):
             raise OSError("private status path")

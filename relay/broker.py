@@ -118,6 +118,23 @@ class PaperBroker:
                 "account_id": "paper", "timestamp": timestamp.astimezone(timezone.utc).isoformat(),
                 "currency": "USD", "simulated": True}
 
+    async def nearest_expiry(self, contract):
+        """Resolve an omitted entry expiry using only explicit paper fixtures."""
+        target = _contract_key(contract)
+        path = self.config.get("quotes_file")
+        if not path:
+            raise BrokerError("paper.quotes_file must point to explicit quote fixtures")
+        data = json.loads(Path(path).read_text())
+        quotes = data["quotes"] if isinstance(data, dict) else data
+        expiries = []
+        for quote in quotes:
+            key = _contract_key(quote["contract"])
+            if key[0] == target[0] and key[2:] == target[2:] and key[1] >= target[1] and quote.get("tradable") is True and quote.get("multiplier") == 100 and quote.get("currency") == "USD" and quote.get("asset_type") == "equity_option":
+                expiries.append(key[1])
+        if not expiries:
+            raise BrokerError("No listed expiration for the requested option")
+        return dict(contract, expiry=min(expiries))
+
     async def quote(self, contract):
         path = self.config.get("quotes_file")
         if not path:
@@ -690,6 +707,28 @@ class RobinhoodBroker(RobinhoodMCP):
                 "agentic_allowed": account.get("agentic_allowed") is True, "option_level": account.get("option_level"),
                 "account_type": account["type"], "account_state": account["state"], "restrictions": restrictions,
                 "simulated": False, "sandbox_status": "not_reported", "source": "Robinhood Agentic MCP"}
+
+    async def nearest_expiry(self, contract):
+        """Choose the first listed standard contract at the requested strike/type."""
+        target = _contract_key(contract)
+        chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
+        expiries = []
+        for chain in chains:
+            if chain["symbol"] != target[0] or _decimal(chain["trade_value_multiplier"], "chain multiplier") != 100 or len(chain["underlying_instruments"] or []) != 1 or (chain["cash_component"] is not None and _decimal(chain["cash_component"], "cash component") != 0):
+                continue
+            rows = await self._pages("get_option_instruments", {
+                "chain_id": chain["id"], "strike_price": format(Decimal(target[2]), "f"),
+                "type": target[3], "state": "active", "tradability": "tradable",
+            }, "instruments")
+            for instrument in rows:
+                if instrument["chain_id"] != chain["id"] or instrument.get("state") != "active" or instrument.get("tradability") != "tradable" or instrument["underlying_type"] != "equity" or _decimal(instrument["trade_value_multiplier"], "multiplier") != 100:
+                    continue
+                key = _contract_key(self._instrument_contract(instrument))
+                if key[0] == target[0] and key[2:] == target[2:] and key[1] >= target[1] and key[1] in (chain["expiration_dates"] or []):
+                    expiries.append(key[1])
+        if not expiries:
+            raise BrokerError("No listed expiration for the requested option")
+        return dict(contract, expiry=min(expiries))
 
     async def quote(self, contract):
         target = _contract_key(contract)

@@ -113,6 +113,40 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
             self.assertIn(reason, result["reason"])
         return result
 
+    async def test_missing_expiry_resolves_once_and_preserves_explicit_dates(self):
+        from unittest.mock import AsyncMock
+        self.broker.nearest_expiry = AsyncMock(return_value=CONTRACT)
+        self.interpreter.decision["contract"] = CONTRACT | {"expiry": "nearest"}
+        result = await self.engine.handle(self.message(content="OPEN BAC 63 call @ .80"))
+        self.assertEqual(result["state"], "paper_order", result)
+        self.assertEqual(self.broker.submissions[0]["contract"], CONTRACT)
+        self.assertEqual(self.broker.nearest_expiry.call_args.args[0]["expiry"], NOW.date().isoformat())
+        self.broker.nearest_expiry.reset_mock()
+        decision = self.interpreter.decision | {"contract": CONTRACT}
+        self.assertIs(await self.engine.resolve_expiry({}, decision), decision)
+        self.broker.nearest_expiry.assert_not_awaited()
+
+    async def test_implicit_expiry_anchors_original_new_york_day_and_cannot_roll(self):
+        from unittest.mock import AsyncMock
+        self.broker.nearest_expiry = AsyncMock(return_value=CONTRACT)
+        message = self.message(timestamp="2026-09-09T00:30:00Z") | {"source_group": "source-a"}
+        decision = self.interpreter.decision | {"contract": CONTRACT | {"expiry": "nearest"},
+            "origin_message_id": message["id"], "evidence": [{"message_id": message["id"], "quote": message["content"]}]}
+        self.now = datetime(2026, 9, 9, 1, tzinfo=timezone.utc)
+        await self.engine.resolve_expiry(message, decision)
+        self.assertEqual(self.broker.nearest_expiry.call_args.args[0]["expiry"], "2026-09-08")
+        self.now = datetime(2026, 9, 9, 15, tzinfo=timezone.utc)
+        self.broker.nearest_expiry.reset_mock()
+        with self.assertRaisesRegex(Hold, "cannot roll"):
+            await self.engine.resolve_expiry(message, decision)
+        self.broker.nearest_expiry.assert_not_awaited()
+
+    async def test_default_zero_dte_keeps_same_day_permission_gate(self):
+        from unittest.mock import AsyncMock
+        self.broker.nearest_expiry = AsyncMock(return_value=CONTRACT | {"expiry": NOW.date().isoformat()})
+        self.interpreter.decision["contract"] = CONTRACT | {"expiry": "nearest"}
+        await self.held(self.message(content="OPEN BAC 63 call @ .80"), "same-day expiry entries are disabled")
+
     async def test_open_and_duplicate_ids_or_equivalent_signal(self):
         message = self.message()
         self.assertEqual((await self.engine.handle(message))["state"], "paper_order")

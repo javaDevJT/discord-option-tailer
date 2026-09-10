@@ -162,6 +162,7 @@ class RecoveryEvaluator:
             all_positions = self.store.positions()
             positions = [p for p in all_positions if p["source_group"] == message["source_group"]]
             decision = await engine.interpreter.interpret(message, older, positions)
+            decision = await engine.resolve_expiry(message, decision)
             now = engine.clock()
             if decision["action"] in {"IGNORE", "WAIT", "UPDATE_STOP"}:
                 assessment = dict(status="not_actionable" if decision["action"] == "IGNORE" else "uncertain",

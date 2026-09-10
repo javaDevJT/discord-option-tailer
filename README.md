@@ -35,7 +35,7 @@ Edited alerts, manual backscroll, imported history, future timestamps, context-o
 
 ## Supported actions and limits
 
-The trading path supports single-leg, long, standard USD equity or ETF options: buy to open, reduce, and sell to close. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, shorts, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop.
+The trading path supports single-leg, long, standard USD equity or ETF options: buy to open, reduce, and sell to close. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, shorts, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
 
 The default risk settings are guardrails on the maximum amount allocated to an entry:
 

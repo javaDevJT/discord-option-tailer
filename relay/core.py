@@ -463,6 +463,23 @@ class Engine:
                 raise Hold("current Discord message could not be verified before dispatch")
         current()
 
+    async def resolve_expiry(self, message, decision):
+        contract = decision.get("contract")
+        if not isinstance(contract, dict) or contract.get("expiry") != "nearest":
+            return decision
+        if decision.get("action") != "OPEN":
+            raise Hold("only a new entry can default its expiry")
+        origin = self.origin(message, decision)
+        source_day = instant(origin["timestamp"]).astimezone(EASTERN).date()
+        if source_day != self.clock().astimezone(EASTERN).date():
+            raise Hold("an older entry without an explicit expiry cannot roll into a new contract")
+        requested = canonical_contract(dict(contract, expiry=source_day.isoformat()))
+        resolved = canonical_contract(await self.broker.nearest_expiry(requested))
+        if any(resolved[key] != requested[key] for key in ("symbol", "strike", "option_type")) or resolved["expiry"] < requested["expiry"]:
+            raise Hold("broker expiry resolution changed the intended option")
+        return decision | {"contract": resolved, "reason": (decision["reason"][:3800] +
+            f" Default expiry: {resolved['expiry']}, nearest listed to the original {source_day} New York message date.")}
+
     async def handle(self, message, *, analyze_history=False, _observed=None):
         # ponytail: one serialized decision stream; per-account workers only if throughput requires them.
         async with self.lock:
@@ -500,6 +517,7 @@ class Engine:
                     raise Hold("kill switch is present")
                 context = self.store.context(message, self.config.get("llm", {}).get("context_messages", 60))
                 decision = await self.interpreter.interpret(message, context, self.store.positions())
+                decision = await self.resolve_expiry(message, decision)
                 # Interpreter validates the complete schema and evidence; controls remain deterministic below.
                 if decision["action"] in {"IGNORE", "WAIT"}:
                     return self.store.record(message, decision["action"].lower(), decision["reason"], decision)
