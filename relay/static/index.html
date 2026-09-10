@@ -375,10 +375,11 @@
             <div><p class="eyebrow">RISK DEFAULTS</p><h3>Current guardrails</h3></div>
             <p id="risk-context-text">Risk defaults shown above are read-only.</p>
             <label class="check-row">
-              <input id="allow-same-day-expiry" type="checkbox" aria-describedby="expiry-policy-help" disabled>
+              <input id="allow-same-day-expiry" type="checkbox" aria-describedby="expiry-policy-help">
               <span>Allow same-day (0DTE) entries</span>
             </label>
-            <p class="setup-help setup-help-small" id="expiry-policy-help">Omitted expiries use 0DTE or the nearest listed expiry; dates stated in text or pictures take precedence. Pause to change this permission, then Resume relay when ready.</p>
+            <p class="setup-help setup-help-small" id="expiry-policy-help">Omitted expiries use 0DTE or the nearest listed expiry; dates stated in text or pictures take precedence. Choose a setting, then save. Saving pauses a running relay; resume when ready.</p>
+            <button class="button button-quiet" id="save-expiry-policy" type="button" disabled>Save permission</button>
             <p class="form-feedback" id="expiry-policy-feedback" role="status" aria-live="polite"></p>
           </div>
         </section>

@@ -133,7 +133,6 @@ class SetupHTTPTests(unittest.TestCase):
         with patch("relay.setup.SetupManager._codex_ready", return_value=False):
             manager = SetupManager(self.config)
             self.app.setup = manager
-            manager.set_paused(True)
             try:
                 with sync_playwright() as playwright:
                     browser = playwright.chromium.launch(headless=True)
@@ -145,8 +144,10 @@ class SetupHTTPTests(unittest.TestCase):
                         page.goto("http://" + self.host + "/#setup")
                         expiry = page.get_by_role("checkbox", name="Allow same-day (0DTE) entries")
                         expect(expiry).to_be_enabled()
+                        expiry.check()
+                        self.assertFalse(json.loads(self.config.read_text())["risk"]["allow_same_day_expiry"])
                         with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")) as saved:
-                            expiry.check()
+                            page.get_by_role("button", name="Pause and save", exact=True).click()
                         self.assertEqual(saved.value.status, 200)
                         self.assertTrue(saved.value.json()["risk"]["allow_same_day_expiry"])
                         expected = json.loads(self.config.read_text())
@@ -158,7 +159,8 @@ class SetupHTTPTests(unittest.TestCase):
                                 self.app.setup = manager
                             page.reload()
                             expect(expiry).to_be_checked()
-                            expect(expiry).to_be_disabled()
+                            expect(expiry).to_be_enabled()
+                            expect(page.get_by_role("button", name="Save permission", exact=True)).to_be_disabled()
                             expect(page.get_by_role("button", name="Resume relay")).to_be_disabled()
                             self.assertEqual(json.loads(self.config.read_text()), expected)
                     finally:

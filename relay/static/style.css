@@ -1793,9 +1793,10 @@ h2 {
   font-size: 0.72rem;
 }
 
-.check-row input {
+.setup-section .check-row input {
   width: 1rem;
   height: 1rem;
+  flex: 0 0 1rem;
   accent-color: var(--amber);
 }
 

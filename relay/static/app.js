@@ -953,6 +953,7 @@
     notificationsDirty: false,
     notificationsSaveInFlight: false,
     expiryPolicyInFlight: false,
+    expiryPolicyDirty: false,
     modeChangeInFlight: false,
     modeReturnFocus: null,
     discoveryRequestInFlight: false,
@@ -1436,11 +1437,17 @@
     setupSetText("risk-context-text", `${pieces.join(" · ")}. Risk defaults shown above are read-only.`);
     const expiry = setupById("allow-same-day-expiry");
     if (expiry) {
-      if (!setupState.expiryPolicyInFlight && typeof risk.allow_same_day_expiry === "boolean") {
+      if (!setupState.expiryPolicyDirty && !setupState.expiryPolicyInFlight && typeof risk.allow_same_day_expiry === "boolean") {
         expiry.checked = risk.allow_same_day_expiry;
       }
       const trading = setupTradingStatus(setupState.status);
-      expiry.disabled = setupState.expiryPolicyInFlight || setupState.status?.paused !== true || trading.pending || typeof risk.allow_same_day_expiry !== "boolean";
+      expiry.disabled = setupState.expiryPolicyInFlight;
+      const save = setupById("save-expiry-policy");
+      if (save) {
+        save.textContent = setupState.expiryPolicyInFlight ? "Saving…" : setupState.status?.paused === false ? "Pause and save" : "Save permission";
+        save.disabled = setupState.expiryPolicyInFlight || !setupState.expiryPolicyDirty || trading.pending || !setupState.csrfToken || typeof risk.allow_same_day_expiry !== "boolean";
+        save.title = trading.pending ? "Waiting for the worker to load the previous change." : "";
+      }
     }
   };
   const setupRenderNotifications = (part, status) => {
@@ -1695,22 +1702,25 @@
       setupState.statusReadSequence += 1;
     }
   };
-  const setupSaveExpiryPolicy = async (input) => {
+  const setupSaveExpiryPolicy = async () => {
     const status = setupState.status || {};
     const trading = setupTradingStatus(status);
-    const previous = typeof status.risk?.allow_same_day_expiry === "boolean" ? status.risk.allow_same_day_expiry : !input.checked;
-    if (status.paused !== true || trading.pending || setupState.expiryPolicyInFlight) {
-      input.checked = previous;
-      return;
-    }
+    if (!setupState.expiryPolicyDirty || trading.pending || setupState.expiryPolicyInFlight || typeof status.risk?.allow_same_day_expiry !== "boolean") return;
+    const enabled = Boolean(setupById("allow-same-day-expiry")?.checked);
     setupState.expiryPolicyInFlight = true;
     setupSetFeedback("expiry-policy-feedback", "Saving…");
     setupRenderRisk(status.risk);
     setupRenderTradingMode(status);
     try {
-      const next = await setupPost("/api/setup/expiry-policy", { allow_same_day_expiry: Boolean(input.checked) }, "expiry-policy-feedback");
-      if (next) setupSetFeedback("expiry-policy-feedback", "Same-day entry permission saved.", "success");
-      else input.checked = previous;
+      if (status.paused !== true) {
+        const paused = await setupPost("/api/setup/pause", { paused: true }, "expiry-policy-feedback");
+        if (!paused || paused.paused !== true) return;
+      }
+      const next = await setupPost("/api/setup/expiry-policy", { allow_same_day_expiry: enabled }, "expiry-policy-feedback");
+      if (next) {
+        setupState.expiryPolicyDirty = false;
+        setupSetFeedback("expiry-policy-feedback", "Same-day entry permission saved.", "success");
+      }
     } finally {
       setupState.expiryPolicyInFlight = false;
       setupRenderRisk(setupState.status?.risk || status.risk);
@@ -2003,7 +2013,12 @@
       setupSaveNotifications(false);
     });
     setupById("clear-notifications")?.addEventListener("click", () => setupSaveNotifications(true));
-    setupById("allow-same-day-expiry")?.addEventListener("change", (event) => setupSaveExpiryPolicy(event.currentTarget));
+    setupById("allow-same-day-expiry")?.addEventListener("change", (event) => {
+      setupState.expiryPolicyDirty = event.currentTarget.checked !== setupState.status?.risk?.allow_same_day_expiry;
+      setupSetFeedback("expiry-policy-feedback", setupState.expiryPolicyDirty ? "Unsaved changes." : "");
+      setupRenderRisk(setupState.status?.risk);
+    });
+    setupById("save-expiry-policy")?.addEventListener("click", setupSaveExpiryPolicy);
     setupById("pause-relay")?.addEventListener("click", async () => {
       const paused = Boolean(setupState.status?.paused);
       const status = await setupPost("/api/setup/pause", { paused: !paused }, "control-feedback");
@@ -2017,7 +2032,7 @@
   const setupStart = () => {
     if (!setupById("setup")) return;
     window.addEventListener("beforeunload", (event) => {
-      if (!setupState.expiryPolicyInFlight) return;
+      if (!setupState.expiryPolicyDirty && !setupState.expiryPolicyInFlight) return;
       event.preventDefault();
       event.returnValue = "";
     });

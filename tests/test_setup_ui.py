@@ -677,7 +677,7 @@ class SetupUITests(unittest.TestCase):
             finally:
                 browser.close()
 
-    def test_same_day_expiry_policy_is_paused_only_and_rolls_back_on_error(self):
+    def test_same_day_expiry_policy_is_editable_until_saved_and_retries_on_error(self):
         state = {
             "status": self.status_payload(
                 configured=True,
@@ -694,24 +694,65 @@ class SetupUITests(unittest.TestCase):
             browser, page = self.new_page(playwright, state)
             try:
                 expiry = page.get_by_role("checkbox", name="Allow same-day (0DTE) entries")
-                expect(expiry).to_be_disabled()
-                expect(expiry).not_to_be_checked()
-
-                with page.expect_response(lambda response: response.url.endswith("/api/setup/pause")):
-                    page.get_by_role("button", name="Pause relay").click()
+                save = page.locator("#save-expiry-policy")
                 expect(expiry).to_be_enabled()
+                expect(expiry).not_to_be_checked()
+                expect(save).to_have_text("Pause and save")
+                expect(save).to_be_disabled()
 
-                with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")):
-                    expiry.check()
-                self.assertEqual(state["expiry_policy_requests"], [{"allow_same_day_expiry": True}])
+                expiry.check()
                 expect(expiry).to_be_checked()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Unsaved changes.")
+                expect(save).to_be_enabled()
+                self.assertEqual(state["expiry_policy_requests"], [])
+                self.assertTrue(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
+
+                state["hold_next_setup"] = True
+                page.get_by_role("link", name="Open Browser login").click()
+                page.wait_for_timeout(1900)
+                self.assertIn("held_setup", state)
+                stale = state["held_setup"][1]
+                self.assertFalse(stale["risk"]["allow_same_day_expiry"])
+                stale_route, stale = state.pop("held_setup")
+                stale_route.fulfill(status=200, content_type="application/json", body=json.dumps(stale))
+                page.wait_for_timeout(200)
+                expect(expiry).to_be_checked()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Unsaved changes.")
+                self.assertEqual(state["expiry_policy_requests"], [])
+                page.get_by_role("button", name="Back to setup").click()
 
                 state["expiry_policy_error"] = {"status": 409, "detail": "policy refused"}
-                # Rejection can restore the check before uncheck() asserts its intermediate state.
-                with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")):
-                    expiry.click()
-                expect(expiry).to_be_checked()
+                save.click()
                 expect(page.locator("#expiry-policy-feedback")).to_contain_text("Could not update setup")
+                expect(expiry).to_be_checked()
+                expect(save).to_have_text("Save permission")
+                expect(save).to_be_enabled()
+                self.assertEqual(
+                    [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/expiry-policy"}],
+                    [
+                        ("/api/setup/pause", {"paused": True}),
+                        ("/api/setup/expiry-policy", {"allow_same_day_expiry": True}),
+                    ],
+                )
+                self.assertTrue(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
+
+                state.pop("expiry_policy_error")
+                save.click()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Same-day entry permission saved.")
+                expect(save).to_be_disabled()
+                self.assertEqual(
+                    [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/expiry-policy"}],
+                    [
+                        ("/api/setup/pause", {"paused": True}),
+                        ("/api/setup/expiry-policy", {"allow_same_day_expiry": True}),
+                        ("/api/setup/expiry-policy", {"allow_same_day_expiry": True}),
+                    ],
+                )
+                self.assertFalse(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
+
+                page.reload(wait_until="domcontentloaded")
+                expect(page.locator("#allow-same-day-expiry")).to_be_checked()
+                expect(page.locator("#save-expiry-policy")).to_be_disabled()
             finally:
                 browser.close()
 
@@ -735,9 +776,16 @@ class SetupUITests(unittest.TestCase):
                 name = page.locator('[data-channel-index="0"] input[data-channel-field="name"]')
                 name.fill("Draft room")
                 expiry = page.get_by_role("checkbox", name="Allow same-day (0DTE) entries")
+                save = page.locator("#save-expiry-policy")
                 expect(expiry).to_be_enabled()
                 expiry.check()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Unsaved changes.")
+                expect(save).to_be_enabled()
+                self.assertEqual(state["expiry_policy_requests"], [])
+                save.click()
                 expect(page.locator("#expiry-policy-feedback")).to_have_text("Saving…")
+                expect(expiry).to_be_disabled()
+                expect(save).to_be_disabled()
                 expect(page.get_by_role("button", name="Resume relay")).to_be_disabled()
                 expect(page.get_by_role("button", name="Use Shadow")).to_be_disabled()
                 self.assertTrue(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
@@ -755,6 +803,7 @@ class SetupUITests(unittest.TestCase):
                 expiry_route.fulfill(status=200, content_type="application/json", body=json.dumps(state["status"]))
                 expect(expiry).to_be_checked()
                 expect(page.locator("#expiry-policy-feedback")).to_have_text("Same-day entry permission saved.")
+                expect(save).to_be_disabled()
                 expect(page.get_by_role("button", name="Resume relay")).to_be_enabled()
                 self.assertFalse(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
                 expect(name).to_have_value("Draft room")
@@ -763,6 +812,7 @@ class SetupUITests(unittest.TestCase):
                 stale_route.fulfill(status=200, content_type="application/json", body=json.dumps(stale))
                 page.wait_for_timeout(200)
                 expect(expiry).to_be_checked()
+                expect(save).to_be_disabled()
                 expect(name).to_have_value("Draft room")
             finally:
                 browser.close()

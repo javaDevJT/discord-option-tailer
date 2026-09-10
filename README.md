@@ -50,7 +50,7 @@ The default risk settings are guardrails on the maximum amount allocated to an e
 | Quote age | At most `15` seconds |
 | Maximum spread | `15%` |
 | Maximum chase above cited premium | `5%` |
-| Same-day expiry entries | Disabled by default; editable in Setup while paused |
+| Same-day expiry entries | Disabled by default; configurable in Setup |
 | Fee reserve | `$1.00` per contract in the default configuration |
 
 The 5%–10% range is a confidence-based **maximum**, never a minimum spend or minimum account balance. Actual buying power, existing and pending exposure, the fee reserve, and whole-contract sizing can reduce it to zero. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can impose an additional lower cap; they cannot raise the 5%–10% ceiling.
