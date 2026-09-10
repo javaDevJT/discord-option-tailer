@@ -698,13 +698,28 @@ class SetupUITests(unittest.TestCase):
                 expect(expiry).to_be_enabled()
                 expect(expiry).not_to_be_checked()
                 expect(save).to_have_text("Pause and save")
-                expect(save).to_be_disabled()
+                expect(save).to_be_enabled()
+
+                save.click()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Same-day entry permission saved.")
+                expect(save).to_be_enabled()
+                self.assertEqual(
+                    [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/expiry-policy"}],
+                    [
+                        ("/api/setup/pause", {"paused": True}),
+                        ("/api/setup/expiry-policy", {"allow_same_day_expiry": False}),
+                    ],
+                )
+                page.reload(wait_until="domcontentloaded")
+                expect(expiry).not_to_be_checked()
+                expect(save).to_have_text("Save permission")
+                expect(save).to_be_enabled()
 
                 expiry.check()
                 expect(expiry).to_be_checked()
                 expect(page.locator("#expiry-policy-feedback")).to_have_text("Unsaved changes.")
                 expect(save).to_be_enabled()
-                self.assertEqual(state["expiry_policy_requests"], [])
+                self.assertEqual(state["expiry_policy_requests"], [{"allow_same_day_expiry": False}])
                 self.assertTrue(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
 
                 state["hold_next_setup"] = True
@@ -718,7 +733,7 @@ class SetupUITests(unittest.TestCase):
                 page.wait_for_timeout(200)
                 expect(expiry).to_be_checked()
                 expect(page.locator("#expiry-policy-feedback")).to_have_text("Unsaved changes.")
-                self.assertEqual(state["expiry_policy_requests"], [])
+                self.assertEqual(state["expiry_policy_requests"], [{"allow_same_day_expiry": False}])
                 page.get_by_role("button", name="Back to setup").click()
 
                 state["expiry_policy_error"] = {"status": 409, "detail": "policy refused"}
@@ -731,6 +746,7 @@ class SetupUITests(unittest.TestCase):
                     [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/expiry-policy"}],
                     [
                         ("/api/setup/pause", {"paused": True}),
+                        ("/api/setup/expiry-policy", {"allow_same_day_expiry": False}),
                         ("/api/setup/expiry-policy", {"allow_same_day_expiry": True}),
                     ],
                 )
@@ -739,11 +755,12 @@ class SetupUITests(unittest.TestCase):
                 state.pop("expiry_policy_error")
                 save.click()
                 expect(page.locator("#expiry-policy-feedback")).to_have_text("Same-day entry permission saved.")
-                expect(save).to_be_disabled()
+                expect(save).to_be_enabled()
                 self.assertEqual(
                     [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/expiry-policy"}],
                     [
                         ("/api/setup/pause", {"paused": True}),
+                        ("/api/setup/expiry-policy", {"allow_same_day_expiry": False}),
                         ("/api/setup/expiry-policy", {"allow_same_day_expiry": True}),
                         ("/api/setup/expiry-policy", {"allow_same_day_expiry": True}),
                     ],
@@ -752,7 +769,7 @@ class SetupUITests(unittest.TestCase):
 
                 page.reload(wait_until="domcontentloaded")
                 expect(page.locator("#allow-same-day-expiry")).to_be_checked()
-                expect(page.locator("#save-expiry-policy")).to_be_disabled()
+                expect(page.locator("#save-expiry-policy")).to_be_enabled()
             finally:
                 browser.close()
 
@@ -803,7 +820,7 @@ class SetupUITests(unittest.TestCase):
                 expiry_route.fulfill(status=200, content_type="application/json", body=json.dumps(state["status"]))
                 expect(expiry).to_be_checked()
                 expect(page.locator("#expiry-policy-feedback")).to_have_text("Same-day entry permission saved.")
-                expect(save).to_be_disabled()
+                expect(save).to_be_enabled()
                 expect(page.get_by_role("button", name="Resume relay")).to_be_enabled()
                 self.assertFalse(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
                 expect(name).to_have_value("Draft room")
@@ -812,8 +829,39 @@ class SetupUITests(unittest.TestCase):
                 stale_route.fulfill(status=200, content_type="application/json", body=json.dumps(stale))
                 page.wait_for_timeout(200)
                 expect(expiry).to_be_checked()
-                expect(save).to_be_disabled()
+                expect(save).to_be_enabled()
                 expect(name).to_have_value("Draft room")
+            finally:
+                browser.close()
+
+    def test_same_day_expiry_policy_pending_reload_is_clickable_and_explains(self):
+        state = {
+            "status": self.status_payload(
+                configured=True,
+                paused=True,
+                discord={"state": "connected", "detail": "Discord is signed in."},
+                trading={"mode": "live", "live_enabled": True, "worker_mode": "live", "pending": True},
+            ),
+            "headers": [],
+            "requests": [],
+            "discovery_requests": [],
+            "expiry_policy_requests": [],
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                save = page.locator("#save-expiry-policy")
+                expect(save).to_have_text("Save permission")
+                expect(save).to_be_enabled()
+                save.click()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text(
+                    "Waiting for the worker to load the previous change. Try saving again shortly."
+                )
+                self.assertEqual(state["expiry_policy_requests"], [])
+                self.assertEqual(
+                    [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/expiry-policy"}],
+                    [],
+                )
             finally:
                 browser.close()
 

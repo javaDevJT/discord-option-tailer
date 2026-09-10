@@ -160,7 +160,10 @@ class SetupHTTPTests(unittest.TestCase):
                             page.reload()
                             expect(expiry).to_be_checked()
                             expect(expiry).to_be_enabled()
-                            expect(page.get_by_role("button", name="Save permission", exact=True)).to_be_disabled()
+                            save = page.get_by_role("button", name="Save permission", exact=True)
+                            expect(save).to_be_enabled()
+                            save.click()
+                            expect(page.locator("#expiry-policy-feedback")).to_contain_text("Waiting for the worker")
                             expect(page.get_by_role("button", name="Resume relay")).to_be_disabled()
                             self.assertEqual(json.loads(self.config.read_text()), expected)
                     finally:

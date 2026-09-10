@@ -1445,7 +1445,7 @@
       const save = setupById("save-expiry-policy");
       if (save) {
         save.textContent = setupState.expiryPolicyInFlight ? "Saving…" : setupState.status?.paused === false ? "Pause and save" : "Save permission";
-        save.disabled = setupState.expiryPolicyInFlight || !setupState.expiryPolicyDirty || trading.pending || !setupState.csrfToken || typeof risk.allow_same_day_expiry !== "boolean";
+        save.disabled = setupState.expiryPolicyInFlight;
         save.title = trading.pending ? "Waiting for the worker to load the previous change." : "";
       }
     }
@@ -1705,7 +1705,15 @@
   const setupSaveExpiryPolicy = async () => {
     const status = setupState.status || {};
     const trading = setupTradingStatus(status);
-    if (!setupState.expiryPolicyDirty || trading.pending || setupState.expiryPolicyInFlight || typeof status.risk?.allow_same_day_expiry !== "boolean") return;
+    if (setupState.expiryPolicyInFlight) return;
+    if (!setupState.csrfToken || typeof status.risk?.allow_same_day_expiry !== "boolean") {
+      setupSetFeedback("expiry-policy-feedback", "Setup status is not ready. Refresh the page and try saving again.", "error");
+      return;
+    }
+    if (trading.pending) {
+      setupSetFeedback("expiry-policy-feedback", "Waiting for the worker to load the previous change. Try saving again shortly.", "error");
+      return;
+    }
     const enabled = Boolean(setupById("allow-same-day-expiry")?.checked);
     setupState.expiryPolicyInFlight = true;
     setupSetFeedback("expiry-policy-feedback", "Saving…");
