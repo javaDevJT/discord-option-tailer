@@ -1582,7 +1582,7 @@
     const paused = Boolean(status?.paused);
     const configured = trading.mode !== "unknown";
     const rollbackShadow = trading.pending && trading.mode === "live";
-    const busy = setupState.modeChangeInFlight || (trading.pending && !rollbackShadow);
+    const busy = setupState.modeChangeInFlight || setupState.expiryPolicyInFlight || (trading.pending && !rollbackShadow);
     const statusLabel = trading.pending ? "pending_reload" : paused ? "paused" : "unpaused";
     setupSetStatus("trading-mode-status", statusLabel);
     setupSetText("trading-mode-detail", setupTradingDetail(status, trading));
@@ -1598,12 +1598,16 @@
     setupSetText("trading-mode-availability", availability);
     const shadow = setupById("set-shadow-mode");
     const live = setupById("set-live-mode");
-    if (shadow) shadow.disabled = setupState.modeChangeInFlight || !paused || trading.mode === "shadow" || (trading.pending && trading.mode !== "live");
+    if (shadow) shadow.disabled = setupState.modeChangeInFlight || setupState.expiryPolicyInFlight || !paused || trading.mode === "shadow" || (trading.pending && trading.mode !== "live");
     if (live) live.disabled = busy || !paused || trading.mode === "live" || !setupLiveReady(status);
     const pause = setupById("pause-relay");
     if (pause) {
-      pause.disabled = paused && (trading.pending || setupState.modeChangeInFlight);
-      pause.title = pause.disabled ? "Wait for the worker to load the selected mode before resuming." : "";
+      pause.disabled = (paused && setupState.expiryPolicyInFlight) || (paused && (trading.pending || setupState.modeChangeInFlight));
+      pause.title = paused && setupState.expiryPolicyInFlight
+        ? "Wait for the same-day entry permission to save."
+        : pause.disabled
+          ? "Wait for the worker to load the selected mode before resuming."
+          : "";
     }
     if (!configured && shadow) shadow.disabled = true;
   };
@@ -1677,6 +1681,7 @@
       setupSetText(feedbackId, "Setup security token is not ready; refresh status and try again.");
       return null;
     }
+    setupState.statusReadSequence += 1;
     try {
       const payload = await setupJson(path, { method: "POST", body });
       const status = setupUnwrap(payload);
@@ -1686,6 +1691,8 @@
     } catch (error) {
       setupSetFeedback(feedbackId, `Could not update setup: ${setupText(error?.message, "request failed")}`, "error");
       return null;
+    } finally {
+      setupState.statusReadSequence += 1;
     }
   };
   const setupSaveExpiryPolicy = async (input) => {
@@ -1697,7 +1704,9 @@
       return;
     }
     setupState.expiryPolicyInFlight = true;
+    setupSetFeedback("expiry-policy-feedback", "Saving…");
     setupRenderRisk(status.risk);
+    setupRenderTradingMode(status);
     try {
       const next = await setupPost("/api/setup/expiry-policy", { allow_same_day_expiry: Boolean(input.checked) }, "expiry-policy-feedback");
       if (next) setupSetFeedback("expiry-policy-feedback", "Same-day entry permission saved.", "success");
@@ -1705,6 +1714,7 @@
     } finally {
       setupState.expiryPolicyInFlight = false;
       setupRenderRisk(setupState.status?.risk || status.risk);
+      setupRenderTradingMode(setupState.status || status);
     }
   };
   const setupReadNotifications = () => {
@@ -2006,6 +2016,11 @@
   };
   const setupStart = () => {
     if (!setupById("setup")) return;
+    window.addEventListener("beforeunload", (event) => {
+      if (!setupState.expiryPolicyInFlight) return;
+      event.preventDefault();
+      event.returnValue = "";
+    });
     setupBind();
     setupLoadStatus(false);
   };

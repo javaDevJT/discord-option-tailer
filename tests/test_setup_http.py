@@ -122,6 +122,51 @@ class SetupHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/setup", method="GET")[0], 404)
         self.app.setup = self.manager
 
+    def test_expiry_checkbox_survives_refresh_and_manager_restart(self):
+        try:
+            from playwright.sync_api import expect, sync_playwright
+        except ImportError:
+            self.skipTest("Playwright is required for the real-backend refresh check")
+        template = Path(__file__).resolve().parents[1] / "config.example.json"
+        config = json.loads(template.read_text())
+        self.config.write_text(json.dumps(config))
+        with patch("relay.setup.SetupManager._codex_ready", return_value=False):
+            manager = SetupManager(self.config)
+            self.app.setup = manager
+            manager.set_paused(True)
+            try:
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    try:
+                        page = browser.new_page()
+                        page.route("**/api/setup/discord/discover", lambda route: route.fulfill(
+                            status=409, content_type="application/json",
+                            body=json.dumps({"detail": "Discovery is disabled in this synthetic test"})))
+                        page.goto("http://" + self.host + "/#setup")
+                        expiry = page.get_by_role("checkbox", name="Allow same-day (0DTE) entries")
+                        expect(expiry).to_be_enabled()
+                        with page.expect_response(lambda response: response.url.endswith("/api/setup/expiry-policy")) as saved:
+                            expiry.check()
+                        self.assertEqual(saved.value.status, 200)
+                        self.assertTrue(saved.value.json()["risk"]["allow_same_day_expiry"])
+                        expected = json.loads(self.config.read_text())
+                        self.assertTrue(expected["risk"]["allow_same_day_expiry"])
+                        for restart in (False, True):
+                            if restart:
+                                manager.close()
+                                manager = SetupManager(self.config)
+                                self.app.setup = manager
+                            page.reload()
+                            expect(expiry).to_be_checked()
+                            expect(expiry).to_be_disabled()
+                            expect(page.get_by_role("button", name="Resume relay")).to_be_disabled()
+                            self.assertEqual(json.loads(self.config.read_text()), expected)
+                    finally:
+                        browser.close()
+            finally:
+                manager.close()
+                self.app.setup = self.manager
+
     def test_real_channel_save_accepts_all_authors_and_reports_bad_filter(self):
         template = Path(__file__).resolve().parents[1] / "config.example.json"
         config = json.loads(template.read_text())

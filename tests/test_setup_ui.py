@@ -235,6 +235,9 @@ class SetupUITests(unittest.TestCase):
                         error = state["expiry_policy_error"]
                         fulfill(route, {"detail": error["detail"]}, error["status"])
                         return
+                    if state.get("hold_expiry_policy"):
+                        state["held_expiry_policy"] = route
+                        return
                     state["status"].setdefault("risk", {})["allow_same_day_expiry"] = body.get("allow_same_day_expiry")
                 elif path == "/api/setup/pause":
                     state["status"]["paused"] = bool(body.get("paused"))
@@ -708,6 +711,58 @@ class SetupUITests(unittest.TestCase):
                     expiry.uncheck()
                 expect(expiry).to_be_checked()
                 expect(page.locator("#expiry-policy-feedback")).to_contain_text("Could not update setup")
+            finally:
+                browser.close()
+
+    def test_same_day_expiry_save_blocks_resume_and_ignores_stale_poll(self):
+        state = {
+            "status": self.status_payload(
+                configured=True,
+                paused=True,
+                discord={"state": "connected", "detail": "Discord is signed in."},
+                trading={"mode": "live", "live_enabled": True, "worker_mode": "live", "pending": False},
+            ),
+            "headers": [],
+            "requests": [],
+            "discovery_requests": [],
+            "expiry_policy_requests": [],
+            "hold_expiry_policy": True,
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                name = page.locator('[data-channel-index="0"] input[data-channel-field="name"]')
+                name.fill("Draft room")
+                expiry = page.get_by_role("checkbox", name="Allow same-day (0DTE) entries")
+                expect(expiry).to_be_enabled()
+                expiry.check()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Saving…")
+                expect(page.get_by_role("button", name="Resume relay")).to_be_disabled()
+                expect(page.get_by_role("button", name="Use Shadow")).to_be_disabled()
+                self.assertTrue(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
+                self.assertEqual(state["expiry_policy_requests"], [{"allow_same_day_expiry": True}])
+
+                state["hold_next_setup"] = True
+                page.get_by_role("link", name="Open Browser login").click()
+                page.wait_for_timeout(1900)
+                self.assertIn("held_setup", state)
+                stale = state["held_setup"][1]
+                self.assertFalse(stale["risk"]["allow_same_day_expiry"])
+
+                expiry_route = state.pop("held_expiry_policy")
+                state["status"]["risk"]["allow_same_day_expiry"] = True
+                expiry_route.fulfill(status=200, content_type="application/json", body=json.dumps(state["status"]))
+                expect(expiry).to_be_checked()
+                expect(page.locator("#expiry-policy-feedback")).to_have_text("Same-day entry permission saved.")
+                expect(page.get_by_role("button", name="Resume relay")).to_be_enabled()
+                self.assertFalse(page.evaluate("() => { const event = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(event); return event.defaultPrevented; }"))
+                expect(name).to_have_value("Draft room")
+
+                stale_route, stale = state.pop("held_setup")
+                stale_route.fulfill(status=200, content_type="application/json", body=json.dumps(stale))
+                page.wait_for_timeout(200)
+                expect(expiry).to_be_checked()
+                expect(name).to_have_value("Draft room")
             finally:
                 browser.close()
 
