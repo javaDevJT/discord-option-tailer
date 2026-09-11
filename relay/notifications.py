@@ -18,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .status import AUTH_REQUIRED_STATES
+
 
 UTC = timezone.utc
 WEBHOOK_PATH = re.compile(r"^/api/(?:v10/)?webhooks/(\d+)/([A-Za-z0-9._-]+)$")
@@ -394,7 +396,9 @@ def _runtime_issues(path, now=None):
         if not isinstance(section, dict):
             continue
         state = str(section.get("state", "")).lower()
-        if state in {"auth_required", "login_required"}:
+        if (section.get("auth_required") is True
+                or section.get("reauth_required") is True
+                or state in AUTH_REQUIRED_STATES):
             issues[key] = "reauth"
         elif state in {"unavailable", "unknown"}:
             issues[key] = "unavailable"

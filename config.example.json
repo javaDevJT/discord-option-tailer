@@ -25,7 +25,9 @@
   "llm": {
     "provider": "codex",
     "executable": null,
-    "model": null,
+    "model": "gpt-6-astra",
+    "reasoning_effort": "medium",
+    "service_tier": "fast",
     "timeout_seconds": 90,
     "context_messages": 60
   },
@@ -41,7 +43,7 @@
     "strategy_stats": {},
     "max_spread_fraction": "0.15",
     "max_quote_age_seconds": 15,
-    "max_chase_fraction": "0.05",
+    "max_chase_fraction": "0.10",
     "fee_reserve_per_contract": "1.00",
     "allow_same_day_expiry": false,
     "duplicate_window_seconds": 180,

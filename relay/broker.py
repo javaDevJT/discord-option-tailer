@@ -36,6 +36,138 @@ class BrokerPreflightHold(BrokerError):
     """Final dispatch validation failed before any order transport began."""
 
 
+_AUTHENTICATION_MARKERS = (
+    "authorization required",
+    "authentication required",
+    "authentication needs attention",
+    "unauthorized",
+    "unauthenticated",
+    "invalid access token",
+    "invalid token",
+    "token expired",
+    "expired token",
+    "access token expired",
+    "invalid_grant",
+    "invalid_client",
+    "insufficient_scope",
+)
+_AUTHENTICATION_CODES = frozenset({
+    "invalid_token", "expired_token", "token_expired", "invalid_grant",
+    "invalid_client", "unauthorized", "unauthenticated", "authentication_required",
+    "authorization_required", "insufficient_scope",
+})
+
+
+def _status_code(value):
+    """Return an integer HTTP status without trusting arbitrary provider data."""
+
+    candidates = [getattr(value, "status_code", None), getattr(value, "status", None)]
+    if isinstance(value, dict):
+        candidates.extend(value.get(key) for key in ("status_code", "http_status", "status"))
+    for candidate in candidates:
+        if isinstance(candidate, bool):
+            continue
+        try:
+            candidate = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= candidate <= 599:
+            return candidate
+    return None
+
+
+def _auth_header(value):
+    headers = getattr(value, "headers", None)
+    if headers is None:
+        return ""
+    try:
+        value = headers.get("WWW-Authenticate", headers.get("www-authenticate", ""))
+    except (AttributeError, TypeError):
+        return ""
+    return value.lower()[:4096] if isinstance(value, str) else ""
+
+
+def _auth_text(value, *, depth=0, seen=None):
+    """Extract bounded auth indicators for classification only.
+
+    The returned text is never published.  Restricting traversal keeps a malformed
+    provider result from turning status handling into an unbounded recursive walk.
+    """
+
+    if value is None or depth > 4:
+        return ""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return ""
+    seen.add(identity)
+    if isinstance(value, str):
+        return value.lower()[:4096]
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace").lower()[:4096]
+    if isinstance(value, dict):
+        parts = []
+        for key, child in list(value.items())[:64]:
+            key_text = str(key).lower()[:256]
+            parts.append(key_text)
+            parts.append(_auth_text(child, depth=depth + 1, seen=seen))
+        return " ".join(parts)[:8192]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return " ".join(_auth_text(child, depth=depth + 1, seen=seen) for child in list(value)[:64])[:8192]
+    if hasattr(value, "model_dump"):
+        try:
+            return _auth_text(value.model_dump(mode="json", exclude_none=True), depth=depth + 1, seen=seen)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return str(value).lower()[:4096]
+
+
+def is_auth_required(error):
+    """Classify an upstream auth failure without exposing its response details.
+
+    HTTP 401 is an authentication failure.  HTTP 403 is classified only when the
+    provider supplies an authentication challenge or an explicit auth marker; a
+    plain forbidden, quota, network, schema, or runtime error stays unavailable.
+    """
+
+    seen = set()
+
+    def classify(value, depth=0):
+        if value is None or depth > 6 or id(value) in seen:
+            return False
+        seen.add(id(value))
+        if isinstance(value, BaseExceptionGroup):
+            return any(classify(child, depth + 1) for child in value.exceptions)
+
+        response = getattr(value, "response", None)
+        code = _status_code(value) or _status_code(response)
+        challenge = _auth_header(value) or _auth_header(response)
+        text = _auth_text(value)
+        if code == 401:
+            return True
+        if code in {408, 425, 429} or (code is not None and 500 <= code <= 599):
+            return False
+        text_markers = _AUTHENTICATION_MARKERS + tuple(_AUTHENTICATION_CODES)
+        if code == 403 and (
+            "bearer" in challenge and any(marker in challenge for marker in _AUTHENTICATION_CODES)
+            or any(marker in text for marker in text_markers)
+        ):
+            return True
+        if any(marker in text for marker in text_markers):
+            return True
+        if isinstance(value, dict):
+            code_value = value.get("code") or value.get("error") or value.get("error_code")
+            if isinstance(code_value, str) and code_value.lower() in _AUTHENTICATION_CODES:
+                return True
+        for child in (response, getattr(value, "__cause__", None), getattr(value, "__context__", None)):
+            if classify(child, depth + 1):
+                return True
+        return False
+
+    return classify(error)
+
+
 def _decimal(value, field):
     try:
         result = Decimal(str(value))
@@ -365,7 +497,9 @@ class RobinhoodMCP:
         if auth_mode == "token":
             token = os.environ.get(self.config.get("access_token_env", "ROBINHOOD_ACCESS_TOKEN"))
             if not token:
-                raise BrokerError("Robinhood access token environment variable is not set")
+                error = BrokerError("Robinhood access token environment variable is not set")
+                self._connection_failed(error)
+                raise error
             headers["Authorization"] = f"Bearer {token}"
         elif auth_mode == "oauth":
             from mcp.client.auth import OAuthClientProvider
@@ -382,7 +516,9 @@ class RobinhoodMCP:
                 redirect_handler=self._redirect, callback_handler=self._callback,
             )
         else:
-            raise BrokerError("robinhood.auth must be oauth or token")
+            error = BrokerError("robinhood.auth must be oauth or token")
+            self._connection_failed(error)
+            raise error
         try:
             http = await self.stack.enter_async_context(httpx.AsyncClient(
                 auth=auth, headers=headers, follow_redirects=True,
@@ -453,22 +589,59 @@ class RobinhoodMCP:
         except Exception as exc:
             self._connection_failed(exc)
             raise
-        publish_status(self.on_status, "broker", "unavailable" if result.isError else "connected")
+        if result.isError:
+            state = "auth_required" if is_auth_required(result) else "unavailable"
+        else:
+            state = "connected"
+        publish_status(self.on_status, "broker", state)
         return result
 
     def _connection_failed(self, exc):
-        def auth_required(error):
-            if isinstance(error, BaseExceptionGroup):
-                return any(auth_required(child) for child in error.exceptions)
-            return (getattr(getattr(error, "response", None), "status_code", None) == 401
-                    or isinstance(error, BrokerError) and "authorization required" in str(error))
-        publish_status(self.on_status, "broker", "auth_required" if auth_required(exc) else "unavailable")
+        publish_status(self.on_status, "broker", "auth_required" if is_auth_required(exc) else "unavailable")
 
 
 async def login(config, *, authorization_handler=None):
     """Interactive OAuth followed only by authenticated schema discovery."""
     async with RobinhoodMCP(config, interactive=True, authorization_handler=authorization_handler) as broker:
         return await broker.discover()
+
+
+def broker_credentials_state(config):
+    """Return a local, credential-free Robinhood readiness state.
+
+    This is deliberately only a local preflight.  It cannot prove that an access
+    token is still accepted by Robinhood; a real broker connection must publish
+    ``auth_required`` when the provider rejects an expired or revoked token.
+    """
+
+    root = config if isinstance(config, dict) else {}
+    section = root.get("robinhood", root)
+    if not isinstance(section, dict):
+        return "unavailable"
+    if root.get("mode") == "paper":
+        return "paper"
+    account = section.get("account_number")
+    if (not isinstance(account, str) or not account.isascii() or not account.isdigit()
+            or not 5 <= len(account) <= 20):
+        return "auth_required"
+    auth_mode = section.get("auth", "oauth")
+    if auth_mode == "token":
+        env_name = section.get("access_token_env", "ROBINHOOD_ACCESS_TOKEN")
+        return "configured" if isinstance(env_name, str) and bool(os.environ.get(env_name)) else "auth_required"
+    if auth_mode != "oauth":
+        return "unavailable"
+    try:
+        path = Path(section.get("token_store", "state/robinhood-oauth.json")).expanduser()
+        if not path.is_file() or path.is_symlink():
+            return "auth_required"
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            return "unavailable"
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return "unavailable"
+    tokens = value.get("tokens") if isinstance(value, dict) else None
+    access_token = tokens.get("access_token") if isinstance(tokens, dict) else None
+    return "configured" if isinstance(access_token, str) and bool(access_token.strip()) else "auth_required"
 
 
 # Authenticated official schemas observed 2026-09-06; changes require renewed qualification.

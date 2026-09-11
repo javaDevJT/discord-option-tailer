@@ -802,7 +802,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         routes = {
-            "/api/setup/channels", "/api/setup/pause", "/api/setup/reconnect", "/api/setup/mode", "/api/setup/notifications", "/api/setup/expiry-policy",
+            "/api/setup/channels", "/api/setup/pause", "/api/setup/reconnect", "/api/setup/mode", "/api/setup/notifications", "/api/setup/expiry-policy", "/api/setup/evaluation",
             "/api/setup/discord/discover",
             "/api/setup/auth/codex/start", "/api/setup/auth/codex/cancel",
             "/api/setup/auth/robinhood/start", "/api/setup/auth/robinhood/cancel",
@@ -843,6 +843,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = manager.set_mode(payload)
             elif path == "/api/setup/expiry-policy":
                 result = manager.set_expiry_policy(payload)
+            elif path == "/api/setup/evaluation":
+                result = manager.save_evaluation(payload)
             elif path == "/api/setup/pause":
                 if set(payload) != {"paused"} or not isinstance(payload["paused"], bool):
                     raise ValueError("paused must be a boolean")

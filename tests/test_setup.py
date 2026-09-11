@@ -22,6 +22,57 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SetupManagerTests(unittest.TestCase):
+    def test_runtime_reauth_overrides_saved_credential_presence(self):
+        self.config["robinhood"]["account_number"] = "12345678"
+        self.path.write_text(json.dumps(self.config))
+        runtime_path = self.base / "state/runtime-status.json"
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(json.dumps({"codex": {"state": "auth_required"}, "broker": {"state": "login_required"}}))
+        with patch.object(self.manager, "_codex_ready", return_value=True), patch.object(self.manager, "_token_store_ready", return_value=True):
+            status = self.manager.status()
+            self.assertEqual(status["codex"]["state"], "auth_required")
+            self.assertEqual(status["robinhood"]["state"], "auth_required")
+            self.assertTrue(status["robinhood"]["token_present"])
+            runtime_path.write_text(json.dumps({"codex": {"state": "unauthenticated"}, "broker": {"state": "reauth_required"}}))
+            status = self.manager.status()
+            self.assertEqual(status["codex"]["state"], "auth_required")
+            self.assertEqual(status["robinhood"]["state"], "auth_required")
+            runtime_path.write_text(json.dumps({"codex": {"state": "ready"}, "broker": {"state": "connected"}}))
+            status = self.manager.status()
+            self.assertEqual(status["codex"]["state"], "connected")
+            self.assertEqual(status["robinhood"]["state"], "connected")
+
+    def test_evaluation_preferences_require_pause_and_preserve_other_settings(self):
+        payload = {"model": "gpt-6-astra", "reasoning_effort": "medium", "service_tier": "fast", "max_chase_fraction": "0.10"}
+        for invalid in ({}, payload | {"mode": "live"}, payload | {"model": "bad\nmodel"},
+                        payload | {"reasoning_effort": "invalid"}, payload | {"service_tier": "invalid"},
+                        payload | {"max_chase_fraction": "1.01"}, payload | {"max_chase_fraction": "NaN"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.manager.save_evaluation(invalid)
+        with self.assertRaisesRegex(RuntimeError, "Pause"):
+            self.manager.save_evaluation(payload)
+        # Start with old preferences so this also proves an actual update.
+        old = json.loads(self.path.read_text())
+        old["llm"].update(model=None, reasoning_effort="low", service_tier="standard")
+        old["risk"]["max_chase_fraction"] = "0.05"
+        self.path.write_text(json.dumps(old))
+        self.manager.set_paused(True)
+        result = self.manager.save_evaluation(payload)
+        self.assertEqual(result["evaluation"], payload)
+        self.assertTrue(result["paused"])
+        self.assertTrue(result["trading"]["pending"])
+        saved = json.loads(self.path.read_text())
+        self.assertTrue(saved.pop("mode_change_id"))
+        saved["llm"] = old["llm"]
+        saved["risk"]["max_chase_fraction"] = old["risk"]["max_chase_fraction"]
+        self.assertEqual(saved, old)
+        with self.assertRaisesRegex(RuntimeError, "previous settings"):
+            self.manager.save_evaluation(payload)
+        self.manager.close()
+        self.manager = SetupManager(self.path)
+        self.assertEqual(self.manager.status()["evaluation"], payload)
+        self.assertTrue(self.manager.status()["paused"])
+
     def test_same_day_permission_requires_pause_and_worker_reload_preserving_other_settings(self):
         original = self.path.read_bytes()
         for payload in ({}, {"allow_same_day_expiry": 1}, {"allow_same_day_expiry": True, "mode": "live"}):

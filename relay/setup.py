@@ -31,8 +31,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from .broker import SCHEMA_PINS, _OAuthStorage, login as broker_login
 from .cli import inspect_broker
-from .core import Hold, Store, instant, load_config
+from .core import Hold, Store, instant, load_config, money
 from .interpreter import CodexInterpreter
+from .status import is_auth_required_state
 
 
 SNOWFLAKE = re.compile(r"\d{15,22}\Z")
@@ -353,6 +354,39 @@ class SetupManager:
             self._atomic_write_config_locked(candidate)
             return self._action_response_locked("expiry_policy_saved")
 
+    def save_evaluation(self, payload: dict) -> dict:
+        """Save bounded interpreter preferences and chase tolerance while paused."""
+        fields = {"model", "reasoning_effort", "service_tier", "max_chase_fraction"}
+        if not isinstance(payload, dict) or set(payload) != fields:
+            raise ValueError("Provide model, reasoning_effort, service_tier, and max_chase_fraction")
+        model = payload["model"]
+        if model is not None and (not isinstance(model, str) or (model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model))):
+            raise ValueError("Model must be a model identifier or blank for the Codex default")
+        if payload["reasoning_effort"] not in ("minimal", "low", "medium", "high", "xhigh"):
+            raise ValueError("Unsupported reasoning effort")
+        if payload["service_tier"] not in ("standard", "fast"):
+            raise ValueError("Service tier must be standard or fast")
+        chase = money(payload["max_chase_fraction"])
+        if not 0 <= chase <= 1:
+            raise ValueError("Chase tolerance must be between 0% and 100%")
+        with self._lock:
+            self._ensure_open_locked()
+            latest = self._read_raw_locked()
+            if not self._is_paused(latest):
+                raise RuntimeError("Pause the relay before changing evaluation settings.")
+            if self._public_trading(latest)["pending"]:
+                raise RuntimeError("Wait for the worker to load the previous settings change.")
+            candidate = copy.deepcopy(latest)
+            candidate.setdefault("llm", {}).update(model=model or None,
+                reasoning_effort=payload["reasoning_effort"], service_tier=payload["service_tier"])
+            candidate.setdefault("risk", {})["max_chase_fraction"] = str(chase)
+            if candidate == latest:
+                return self._action_response_locked("evaluation_unchanged")
+            candidate["mode_change_id"] = uuid.uuid4().hex
+            self._validate_candidate(candidate)
+            self._atomic_write_config_locked(candidate)
+            return self._action_response_locked("evaluation_saved")
+
     def set_mode(self, payload: dict) -> dict:
         """Select a mode and its own ledger; activation remains a separate Resume."""
         if (not isinstance(payload, dict) or set(payload) - {"mode", "confirm_live"}
@@ -563,9 +597,28 @@ class SetupManager:
             "robinhood": robinhood,
             "discord": discord,
             "risk": risk,
+            "evaluation": self._public_evaluation(raw),
             "trading": self._public_trading(raw),
             "notifications": notification_status(self.config_path),
         }
+
+    @staticmethod
+    def _public_evaluation(raw: dict) -> dict:
+        llm = raw.get("llm", {})
+        if not isinstance(llm, dict):
+            llm = {}
+        model = llm.get("model")
+        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
+            model = None
+        effort = llm.get("reasoning_effort", "medium")
+        tier = llm.get("service_tier", "standard")
+        risk = raw.get("risk", {})
+        if not isinstance(risk, dict):
+            risk = {}
+        return {"model": model,
+                "reasoning_effort": effort if effort in ("minimal", "low", "medium", "high", "xhigh") else "medium",
+                "service_tier": tier if tier in ("standard", "fast") else "standard",
+                "max_chase_fraction": risk.get("max_chase_fraction", "0.10")}
 
     def _action_response_locked(self, action: str) -> dict:
         value = self._status_locked()
@@ -620,6 +673,9 @@ class SetupManager:
         state = copy.deepcopy(self._auth_state["codex"])
         if state["state"] in {"starting", "waiting", "failed", "cancelled"}:
             return self._safe_auth_projection(state)
+        runtime = self._read_runtime(self._read_raw_locked(allow_missing=True)).get("codex", {})
+        if isinstance(runtime, dict) and is_auth_required_state(runtime.get("state")):
+            return {"state": "auth_required", "detail": "Codex needs ChatGPT reauthentication. Use Codex sign-in below."}
         if self._codex_ready():
             state = {"state": "connected", "detail": "Codex ChatGPT login is available locally."}
         else:
@@ -675,6 +731,9 @@ class SetupManager:
             if state.get("state") == "connected":
                 state = {"state": "not_connected", "detail": "Robinhood login is not configured."}
 
+        runtime = self._read_runtime(raw).get("broker", {})
+        if state["state"] not in {"starting", "waiting"} and isinstance(runtime, dict) and is_auth_required_state(runtime.get("state")):
+            state = {"state": "auth_required", "detail": "Robinhood needs reauthentication. Use Robinhood sign-in below."}
         result = self._safe_auth_projection(state)
         result["token_present"] = token_ready
         if isinstance(state.get("failure"), dict):

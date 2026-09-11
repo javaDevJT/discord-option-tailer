@@ -8,7 +8,15 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
-from relay.broker import BrokerError, PaperBroker, RobinhoodMCP, _OAuthStorage
+from types import SimpleNamespace
+from relay.broker import (
+    BrokerError,
+    PaperBroker,
+    RobinhoodMCP,
+    _OAuthStorage,
+    broker_credentials_state,
+    is_auth_required,
+)
 
 
 class BrokerChecks(unittest.IsolatedAsyncioTestCase):
@@ -76,6 +84,39 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
             await broker._call_tool("get_accounts", {})
             self.assertEqual(events[-1], {"component": "broker", "state": state})
         self.assertTrue(all(set(event) == {"component", "state"} for event in events))
+
+    async def test_mcp_error_result_publishes_auth_failure_without_error_text(self):
+        events = []
+        broker = RobinhoodMCP({}, on_status=events.append)
+        broker.session = MagicMock()
+        broker.schemas["get_accounts"] = {}
+        broker.session.call_tool = AsyncMock(return_value=SimpleNamespace(
+            isError=True,
+            structuredContent={"error": {"code": "invalid_token", "detail": "private token"}},
+            content=[],
+        ))
+        with self.assertRaisesRegex(BrokerError, "tool error"):
+            await broker.call("get_accounts", {})
+        self.assertEqual(events[-1], {"component": "broker", "state": "auth_required"})
+
+    async def test_mcp_error_result_recovers_to_connected(self):
+        events = []
+        broker = RobinhoodMCP({}, on_status=events.append)
+        broker.session = MagicMock()
+        broker.schemas["get_accounts"] = {}
+        recovered = MagicMock(isError=False, structuredContent={"ok": True}, content=[])
+        recovered.model_dump.return_value = {"structuredContent": {"ok": True}, "isError": False}
+        broker.session.call_tool = AsyncMock(side_effect=[
+            SimpleNamespace(isError=True, structuredContent={"error": "expired token"}, content=[]),
+            recovered,
+        ])
+        with self.assertRaises(BrokerError):
+            await broker.call("get_accounts", {})
+        await broker.call("get_accounts", {})
+        self.assertEqual(events[-2:], [
+            {"component": "broker", "state": "auth_required"},
+            {"component": "broker", "state": "connected"},
+        ])
 
     async def test_explicit_quote_and_idempotent_paper_fill(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,6 +335,44 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(broker.session.call_tool.called)
         await broker.call("get_option_quotes", {"fixture": "local test"})
         broker.session.call_tool.assert_awaited_once()
+
+
+class BrokerAuthClassificationChecks(unittest.TestCase):
+    def test_auth_classifier_handles_http_challenges_and_groups_without_false_positives(self):
+        self.assertTrue(is_auth_required(SimpleNamespace(response=SimpleNamespace(status_code=401))))
+        self.assertTrue(is_auth_required(SimpleNamespace(
+            response=SimpleNamespace(status_code=403, headers={"WWW-Authenticate": "Bearer error=invalid_token"})
+        )))
+        self.assertTrue(is_auth_required({"status": 401, "message": "provider response"}))
+        self.assertTrue(is_auth_required(SimpleNamespace(
+            response=SimpleNamespace(status_code=403, headers={"www-authenticate": "Bearer error=invalid_token"})
+        )))
+        self.assertTrue(is_auth_required(ExceptionGroup("transport", [BrokerError("expired token")])) )
+        self.assertFalse(is_auth_required(SimpleNamespace(
+            response=SimpleNamespace(status_code=403, headers={}),
+            detail="account quota exceeded",
+        )))
+        self.assertFalse(is_auth_required(SimpleNamespace(status_code=429, detail="invalid token in quota response")))
+        self.assertFalse(is_auth_required(ConnectionError("network unavailable")))
+
+    def test_local_broker_credential_preflight_does_not_treat_any_file_as_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_store = Path(directory) / "oauth.json"
+            config = {
+                "mode": "shadow",
+                "robinhood": {"account_number": "12345678", "token_store": str(token_store)},
+            }
+            self.assertEqual(broker_credentials_state(config), "auth_required")
+            token_store.write_text(json.dumps({"tokens": {"access_token": "synthetic"}}), encoding="utf-8")
+            token_store.chmod(0o600)
+            self.assertEqual(broker_credentials_state(config), "configured")
+            token_store.write_text("{}", encoding="utf-8")
+            token_store.chmod(0o600)
+            self.assertEqual(broker_credentials_state(config), "auth_required")
+            token_store.write_text("not-json", encoding="utf-8")
+            token_store.chmod(0o600)
+            self.assertEqual(broker_credentials_state(config), "unavailable")
+            self.assertEqual(broker_credentials_state({"mode": "paper"}), "paper")
 
 
 if __name__ == "__main__":

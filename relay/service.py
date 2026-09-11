@@ -7,15 +7,16 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .browser import SNOWFLAKE, login, monitor
+from .broker import broker_credentials_state
 from .core import Store, channel_allows_author, load_config
 from .interpreter import CodexInterpreter, InterpretationError
+from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, previous_auth_state
 
 LOG = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ class RuntimeStatus:
         self.value = {"state": "starting", "detail": self.detail,
                       "discord": {"state": "starting", "channels": []},
                       "codex": {"state": "unknown"}, "broker": {"state": "unknown"}}
+        for component in ("codex", "broker"):
+            state = previous_auth_state(self.path, component)
+            if state is not None:
+                self.value[component] = {"state": state}
 
     def event(self, event):
         component = event.get("component")
@@ -51,6 +56,13 @@ class RuntimeStatus:
                               if candidate in states), "connected")
             self.value[component].update(state=aggregate, channels=list(rows.values()))
         else:
+            if (component in {"codex", "broker"}
+                    and str(self.value[component].get("state", "")).lower() in AUTH_REQUIRED_STATES
+                    and state not in HEALTHY_STATES):
+                # A credential file, saved login, or nonhealthy probe is only a
+                # setup signal. Preserve a provider failure until real health.
+                self.write(heartbeat=True)
+                return
             self.value[component].update(state=state, detail=event.get("detail", ""))
         self.write()
 
@@ -138,14 +150,19 @@ async def serve(config_path):
                                 live_enabled=config.get("robinhood", {}).get("enable_live_orders") is True)
             config["runtime_status_file"] = str(status.path)
             configured_channels = all(SNOWFLAKE.fullmatch(str(channel["guild_id"])) for channel in config["channels"])
-            broker_ready = config["mode"] == "paper" or (
-                bool(re.fullmatch(r"\d{5,20}", str(config["robinhood"].get("account_number", ""))))
-                and Path(config["robinhood"]["token_store"]).is_file())
-            status.event({"component": "broker", "state": "paper" if config["mode"] == "paper" else "configured" if broker_ready else "auth_required"})
+            broker_state = broker_credentials_state(config)
+            broker_ready = broker_state in {"paper", "configured"}
+            status.event({"component": "broker", "state": broker_state})
             try:
                 subscription = await CodexInterpreter(config).subscription_status()
                 codex_ready = subscription.get("authenticated") is True and subscription.get("isolated_execution_available") is True
-                status.event({"component": "codex", "state": "ready" if codex_ready else "auth_required"})
+                codex_state = "ready" if codex_ready else "auth_required"
+                if (codex_ready
+                        and str(status.value["codex"].get("state", "")).lower() in AUTH_REQUIRED_STATES):
+                    # A saved Codex login is not proof that a real evaluation can
+                    # authenticate; interpreter success publishes the clearing ready event.
+                    codex_state = "configured"
+                status.event({"component": "codex", "state": codex_state})
             except (InterpretationError, OSError):
                 codex_ready = False
                 status.event({"component": "codex", "state": "unavailable"})

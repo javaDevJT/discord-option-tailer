@@ -212,7 +212,123 @@ quote later messages when they support invalidation or continued uncertainty.
 
 
 class InterpretationError(ValueError):
-    """No trustworthy decision was returned; callers must hold the message."""
+    """No trustworthy decision was returned; callers must hold the message.
+
+    The provider can return very large or sensitive diagnostics.  Keep the
+    exception useful to the local retry loop, while exposing only a bounded
+    diagnostic code and attempt count to callers that persist an event.
+    """
+
+    def __init__(self, message="", *, code=None, retryable=None, attempts=1):
+        inferred = code if isinstance(code, str) and code in DIAGNOSTIC_DETAILS else _diagnostic_code(message)
+        self.code = inferred if inferred in DIAGNOSTIC_DETAILS else "internal_error"
+        self.retryable = _retryable_code(self.code) if retryable is None else bool(retryable)
+        self.attempts = attempts if type(attempts) is int and 1 <= attempts <= 2 else 1
+        self.detail = DIAGNOSTIC_DETAILS[self.code]
+        # Every message is canonicalized so raw provider text cannot leak.
+        super().__init__(self.detail)
+
+
+DIAGNOSTIC_DETAILS = {
+    "auth_required": "ChatGPT authentication needs attention",
+    "quota_exhausted": "subscription usage limit reached",
+    "network_unavailable": "network connection unavailable",
+    "timeout": "Codex timed out",
+    "runtime_unavailable": "Codex runtime unavailable",
+    "local_runtime": "local runtime permission restriction",
+    "config_invalid": "Codex configuration is invalid",
+    "credentials_missing": "file-backed ChatGPT login is required",
+    "image_unavailable": "Attached pictures could not be inspected; no expiry was assumed",
+    "unsafe_tool_action": "Codex attempted a tool action; no decision accepted",
+    "invalid_output": "Codex returned invalid structured output",
+    "invalid_evidence": "Decision evidence failed local validation",
+    "provider_failed": "Codex reported a failed interpretation",
+    "input_invalid": "Invalid message or position context",
+    "internal_error": "interpreter failed before producing a decision",
+}
+
+RETRYABLE_DIAGNOSTIC_CODES = frozenset({
+    "network_unavailable", "timeout", "invalid_output", "invalid_evidence", "provider_failed",
+})
+
+
+def _diagnostic_code(message):
+    """Map internal/provider text to a fixed, non-sensitive diagnostic code."""
+    text = str(message)[:4096].lower()
+    if any(term in text for term in (
+        "logged in using chatgpt", "log in using chatgpt", "chatgpt login", "chatgpt authentication",
+        "reauth", "re-auth", "session expired", "sign in to chatgpt", "authentication required",
+        "authentication failed", "authentication error", "not authenticated", "login required",
+        "please log in", "run codex login", "logged out", "credential expired", "unauthorized",
+        "reauth_required", "auth_required", "login_required", "authentication_required",
+    )):
+        return "auth_required"
+    if any(term in text for term in ("output exceeded", "size limit")):
+        return "invalid_output"
+    if any(term in text for term in (
+        "usage limit", "rate limit", "quota", "too many requests", "monthly limit", "plan limit",
+        "exceeded your",
+    )):
+        return "quota_exhausted"
+    if any(term in text for term in (
+        "failed to lookup", "dns", "network is unreachable", "network access is disabled",
+        "error sending request", "connection refused", "network connection unavailable",
+    )):
+        return "network_unavailable"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if any(term in text for term in (
+        "attempted a tool", "command_execution", "mcp_tool_call", "shell_tool", "browser_use",
+        "tool call", "tool use", "mcp",
+    )):
+        return "unsafe_tool_action"
+    if ("attached pictures could not be inspected" in text or "no expiry was assumed" in text
+            or ("picture" in text and "inspect" in text)):
+        return "image_unavailable"
+    if any(term in text for term in (
+        "install the codex", "could not start", "executable", "file-backed chatgpt login",
+    )):
+        return "runtime_unavailable" if "file-backed" not in text else "credentials_missing"
+    if any(term in text for term in ("operation not permitted", "readonly database")):
+        return "local_runtime"
+    if any(term in text for term in (
+        "invalid codex model", "codex timeout must", "configuration", "invalid config", "config file",
+        "unknown option", "unrecognized option", "failed to parse", "strict-config", "service_tier",
+        "reasoning_effort",
+    )):
+        return "config_invalid"
+    if any(term in text for term in ("invalid message", "position context", "message must be", "position must be")):
+        return "input_invalid"
+    if any(term in text for term in (
+        "evidence", "origin_message_id", "origin must", "trading evidence", "quote",
+    )):
+        return "invalid_evidence"
+    if any(term in text for term in (
+        "invalid json", "duplicate json", "non-finite json", "malformed codex event", "unsupported event", "did not finish",
+        "malformed decision", "unknown action", "contract has", "confidence", "ambiguous",
+        "quantity", "fraction", "expiry", "option type", "stop update", "non-ignore",
+        "unexpected fields", "missing or unexpected fields", "decision requires", "bounded", "unknown recovery",
+        "recovery assessment",
+    )):
+        return "invalid_output"
+    if any(term in text for term in ("failed interpretation", "turn.failed", "codex execution failed")):
+        return "provider_failed"
+    return "internal_error"
+
+
+def _retryable_code(code):
+    return code in RETRYABLE_DIAGNOSTIC_CODES
+
+
+def safe_interpretation_reason(error):
+    """Return the bounded reason persisted for a failed evaluation."""
+    code = getattr(error, "code", None)
+    if code not in DIAGNOSTIC_DETAILS:
+        code = "internal_error"
+    attempts = getattr(error, "attempts", 1)
+    if type(attempts) is not int or not 1 <= attempts <= 2:
+        attempts = 1
+    return f"evaluation failed: code={code}; attempts={attempts}; detail={DIAGNOSTIC_DETAILS[code]}; no order submitted"
 
 
 def _text(value, limit=6000):
@@ -717,6 +833,8 @@ class CodexInterpreter:
         self.config = config
         self.on_status = on_status
         llm = config.get("llm", {})
+        if not isinstance(llm, dict):
+            raise InterpretationError("Codex configuration is invalid", code="config_invalid", retryable=False)
         bundled = "/Applications/Codex.app/Contents/Resources/codex"
         self.executable = llm.get("executable") or (bundled if Path(bundled).is_file() else shutil.which("codex"))
         if not isinstance(self.executable, str) or not Path(self.executable).is_file():
@@ -724,6 +842,12 @@ class CodexInterpreter:
         self.model = llm.get("model")
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip() or len(self.model) > 128):
             raise InterpretationError("Invalid Codex model")
+        self.reasoning_effort = llm.get("reasoning_effort", "medium")
+        if self.reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+            raise InterpretationError("Invalid Codex reasoning_effort")
+        self.service_tier = llm.get("service_tier", "standard")
+        if self.service_tier not in {"standard", "fast"}:
+            raise InterpretationError("Invalid Codex service_tier")
         self.timeout = llm.get("timeout_seconds", 90)
         if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 0 < self.timeout <= 300:
             raise InterpretationError("Codex timeout must be between zero and 300 seconds")
@@ -732,6 +856,7 @@ class CodexInterpreter:
         self.last_model = None
         self.last_authentication = None
         self.last_notices = []
+        self.last_attempts = 0
 
     def _environment(self, runtime_home):
         env = os.environ.copy()
@@ -759,30 +884,33 @@ class CodexInterpreter:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
                 _output, error = process.communicate()
-                raise InterpretationError("Codex timed out: " + self._failure_reason(error)) from None
+                code = _diagnostic_code(error.decode("utf-8", errors="replace"))
+                if code not in {"auth_required", "quota_exhausted", "network_unavailable", "local_runtime"}:
+                    code = "timeout"
+                raise InterpretationError(DIAGNOSTIC_DETAILS[code], code=code) from None
             except BaseException:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
                 raise
         except OSError:
-            raise InterpretationError("Codex could not start in the isolated workspace") from None
+            raise InterpretationError("Codex could not start in the isolated workspace", code="runtime_unavailable", retryable=False) from None
         if len(output) > 2_000_000 or len(error) > 1_000_000:
             raise InterpretationError("Codex output exceeded its size limit")
         return subprocess.CompletedProcess(args, process.returncode, output, error)
 
     @staticmethod
     def _failure_reason(stderr):
-        detail = stderr.decode("utf-8", errors="replace").lower()
-        if any(term in detail for term in ("usage limit", "rate limit", "quota", "exceeded")):
-            return "subscription usage limit reached"
-        if any(term in detail for term in ("failed to lookup", "dns", "network is unreachable", "network access is disabled", "error sending request", "connection refused")):
-            return "network connection unavailable"
-        if any(term in detail for term in ("log in", "logged in", "unauthorized", "authentication")):
-            return "ChatGPT authentication needs attention"
-        if "operation not permitted" in detail or "readonly database" in detail:
-            return "local runtime permission restriction"
-        return "no completed decision; inspect CLI installation, network access, and subscription availability"
+        """Return only an allowlisted provider failure description."""
+        code = _diagnostic_code(stderr.decode("utf-8", errors="replace"))
+        return DIAGNOSTIC_DETAILS.get(code, DIAGNOSTIC_DETAILS["internal_error"])
+
+    @staticmethod
+    def _failure_from_text(text, *, fallback="provider_failed"):
+        code = _diagnostic_code(text)
+        if code == "internal_error":
+            code = fallback if fallback in DIAGNOSTIC_DETAILS else "internal_error"
+        raise InterpretationError(DIAGNOSTIC_DETAILS[code], code=code)
 
     async def subscription_status(self) -> dict:
         """Inspect official login status without invoking a model or reading tokens."""
@@ -797,6 +925,8 @@ class CodexInterpreter:
             "method": "chatgpt_subscription" if authenticated else "not_chatgpt_authenticated",
             "executable": self.executable,
             "model": self._default_model() or "codex_default",
+            "reasoning_effort": self.reasoning_effort,
+            "service_tier": self.service_tier,
             "isolated_execution_available": authenticated and (self.source_home / "auth.json").is_file(),
         }
 
@@ -827,14 +957,21 @@ class CodexInterpreter:
             data["image_inputs"] = [{"message_id": source["message_id"]} for source in image_sources]
         self.last_usage = self.last_authentication = self.last_model = None
         self.last_notices = []
-        decision = await self._request(data, image_sources=image_sources) if image_sources else await self._request(data)
-        if decision.get("action") == "OPEN" and (decision.get("contract") or {}).get("expiry") == "nearest":
-            origin_id = decision.get("origin_message_id")
-            origins = [record for record in [*context[-60:], message]
-                if record.get("id", record.get("message_id")) == origin_id]
-            if origins and collect_images(origins[-1:]) and origin_id not in {source["message_id"] for source in image_sources}:
-                raise InterpretationError("The original entry's pictures must be inspected before defaulting its expiry")
-        return validate_decision(decision, current, history)
+
+        def validate(result):
+            decision = validate_decision(result, current, history)
+            if decision.get("action") == "OPEN" and (decision.get("contract") or {}).get("expiry") == "nearest":
+                origin_id = decision.get("origin_message_id")
+                origins = [record for record in [*context[-60:], message]
+                    if record.get("id", record.get("message_id")) == origin_id]
+                if origins and collect_images(origins[-1:]) and origin_id not in {source["message_id"] for source in image_sources}:
+                    raise InterpretationError("The original entry's pictures must be inspected before defaulting its expiry")
+            return decision
+
+        options = {"validator": validate}
+        if image_sources:
+            options["image_sources"] = image_sources
+        return await self._request(data, **options)
 
     async def assess_recovery(self, message: dict, context: list[dict], positions: list[dict], decision: dict, facts: dict) -> dict:
         if not isinstance(positions, list) or len(positions) > 200:
@@ -868,12 +1005,9 @@ class CodexInterpreter:
             data["image_inputs"] = [{"message_id": source["message_id"]} for source in image_sources]
         assessment = await self._request(
             data, schema=RECOVERY_SCHEMA, system_prompt=RECOVERY_SYSTEM_PROMPT,
+            validator=lambda result: self._validate_recovery_result(result, current, history, decision),
             **({"image_sources": image_sources} if image_sources else {}),
         )
-        assessment = dict(validate_recovery(assessment, current, history))
-        evidence_ids = {entry["message_id"] for entry in assessment["evidence"]}
-        if decision["origin_message_id"] not in evidence_ids:
-            raise InterpretationError("Recovery evidence must quote the original trigger")
         if _recovery_expired(safe_facts, decision) or any("expired" in blocker.lower() for blocker in safe_facts["blockers"]):
             assessment["status"] = "invalidated"
         elif assessment["status"] == "viable" and _recovery_viability_blockers(safe_facts, current, decision, self.config):
@@ -882,25 +1016,45 @@ class CodexInterpreter:
             assessment["reason"] = (reason + " Broker facts do not support a viable recovery result.")[:4000]
         return assessment
 
+    @staticmethod
+    def _validate_recovery_result(result, current, history, decision):
+        assessment = dict(validate_recovery(result, current, history))
+        evidence_ids = {entry["message_id"] for entry in assessment["evidence"]}
+        if decision["origin_message_id"] not in evidence_ids:
+            raise InterpretationError("Recovery evidence must quote the original trigger")
+        return assessment
+
     async def _request(self, data, **options):
         # Publish on the event loop, including failures during background recovery.
-        try:
-            result = await asyncio.to_thread(self._interpret, data, **options)
-        except Exception as exc:
-            if self.on_status:
-                detail = str(exc).lower()
-                state = "auth_required" if any(term in detail for term in (
-                    "authentication", "chatgpt login", "logged in using chatgpt", "codex login",
-                )) else "unavailable"
-                publish_status(self.on_status, "codex", state)
-            raise
-        publish_status(self.on_status, "codex", "ready")
-        return result
+        validator = options.pop("validator", None)
+        self.last_attempts = 0
+        last_error = None
+        for attempt in (1, 2):
+            self.last_attempts = attempt
+            try:
+                result = await asyncio.to_thread(self._interpret, data, **options)
+                if validator is not None:
+                    result = validator(result)
+                publish_status(self.on_status, "codex", "ready")
+                return result
+            except Exception as exc:
+                if isinstance(exc, InterpretationError):
+                    error = exc
+                else:
+                    error = InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False)
+                error.attempts = attempt
+                last_error = error
+                if attempt >= 2 or not error.retryable:
+                    break
+        if self.on_status and last_error is not None:
+            state = "auth_required" if last_error.code == "auth_required" else "unavailable"
+            publish_status(self.on_status, "codex", state)
+        raise last_error
 
     def _interpret(self, data, *, schema=DECISION_SCHEMA, system_prompt=SYSTEM_PROMPT, image_sources=()):
         credential = self.source_home / "auth.json"
         if not credential.is_file():
-            raise InterpretationError("Isolated Codex requires a file-backed ChatGPT login; run codex login with ChatGPT first")
+            raise InterpretationError("Isolated Codex requires a file-backed ChatGPT login; run codex login with ChatGPT first", code="credentials_missing", retryable=False)
         with tempfile.TemporaryDirectory(prefix="discord-relay-codex-") as directory:
             root = Path(directory)
             runtime_home, workspace = root / "home", root / "workspace"
@@ -911,7 +1065,10 @@ class CodexInterpreter:
             login = self._run_process([self.executable, "login", "status"], env, workspace)
             status = (login.stdout + login.stderr).decode("utf-8", errors="replace")
             if login.returncode or "Logged in using ChatGPT" not in status:
-                raise InterpretationError("Codex must be logged in using ChatGPT; API-key authentication is not accepted")
+                code = _diagnostic_code(status)
+                if code == "internal_error":
+                    code = "auth_required"
+                raise InterpretationError(DIAGNOSTIC_DETAILS[code], code=code, retryable=False)
             self.last_authentication = "chatgpt_subscription"
             schema_path, instructions, output = root / "schema.json", root / "instructions.txt", root / "decision.json"
             schema_path.write_text(json.dumps(schema))
@@ -935,27 +1092,44 @@ class CodexInterpreter:
                 "model_provider": "openai", "forced_login_method": "chatgpt", "approval_policy": "never",
                 "web_search": "disabled", "project_doc_max_bytes": 0, "skills.include_instructions": False,
                 "skills.bundled.enabled": False, "features.skip_host_skill_discovery": True,
+                "model_reasoning_effort": self.reasoning_effort,
+                "features.fast_mode": self.service_tier == "fast",
                 "model_instructions_file": str(instructions), "history.persistence": "none",
                 "log_dir": str(root / "logs"), "tools.update_plan.enabled": False,
                 "tools.experimental_request_user_input.enabled": False, "mcp_servers": {},
                 "suppress_unstable_features_warning": True,
             }
+            if self.service_tier == "fast":
+                overrides["service_tier"] = "fast"
             overrides.update({"features." + name: False for name in self._DISABLED_FEATURES})
             for name, value in overrides.items():
                 args.extend(["-c", name + "=" + ("{}" if value == {} else json.dumps(value))])
             args.append("-")
             run = self._run_process(args, env, workspace, json.dumps(data, ensure_ascii=False, allow_nan=False).encode())
             if run.returncode:
-                raise InterpretationError("Codex execution failed: " + self._failure_reason(run.stderr))
+                code = _diagnostic_code((run.stdout + run.stderr).decode("utf-8", errors="replace"))
+                if code == "internal_error":
+                    code = "provider_failed"
+                raise InterpretationError(DIAGNOSTIC_DETAILS[code], code=code)
             completed = started = False
-            for line in run.stdout.decode("utf-8", errors="strict").splitlines():
+            try:
+                event_lines = run.stdout.decode("utf-8", errors="strict").splitlines()
+            except UnicodeDecodeError:
+                raise InterpretationError("Codex returned invalid structured output", code="invalid_output") from None
+            for line in event_lines:
                 event = _strict_json(line)
                 if not isinstance(event, dict):
-                    raise InterpretationError("Malformed Codex event")
+                    raise InterpretationError("Malformed Codex event", code="invalid_output")
                 if event.get("type") in {"error", "turn.failed"}:
-                    raise InterpretationError("Codex reported a failed interpretation")
+                    details = event.get("error") or event.get("message") or event.get("detail") or event.get("code") or ""
+                    if isinstance(details, dict):
+                        details = details.get("message") or details.get("detail") or details.get("code") or ""
+                    code = _diagnostic_code(details)
+                    if code == "internal_error":
+                        code = "provider_failed"
+                    raise InterpretationError(DIAGNOSTIC_DETAILS[code], code=code)
                 if event.get("type") not in {"thread.started", "turn.started", "item.started", "item.updated", "item.completed", "turn.completed"}:
-                    raise InterpretationError("Codex emitted an unsupported event; no decision accepted")
+                    raise InterpretationError("Codex emitted an unsupported event; no decision accepted", code="invalid_output")
                 if event.get("type") == "turn.started":
                     started = True
                 item = event.get("item")
@@ -965,16 +1139,24 @@ class CodexInterpreter:
                     if not started and item.get("message") == self._DISABLED_CODE_MODE_NOTICE:
                         self.last_notices.append("code_mode_disabled")
                         continue
-                    raise InterpretationError("Codex reported an unexpected runtime error")
+                    details = item.get("message") or item.get("error") or ""
+                    code = _diagnostic_code(details)
+                    if code == "internal_error":
+                        code = "provider_failed"
+                    raise InterpretationError(DIAGNOSTIC_DETAILS[code], code=code)
                 if isinstance(item, dict) and item.get("type") not in {"agent_message", "reasoning"}:
-                    raise InterpretationError("Codex attempted a tool action; no decision accepted")
+                    raise InterpretationError("Codex attempted a tool action; no decision accepted", code="unsafe_tool_action", retryable=False)
                 if event.get("type") == "turn.completed":
                     completed = True
                     usage = event.get("usage", {})
                     if not isinstance(usage, dict):
-                        raise InterpretationError("Codex returned malformed usage information")
+                        raise InterpretationError("Codex returned malformed usage information", code="invalid_output")
                     self.last_usage = {key: value for key, value in usage.items() if key in {"input_tokens", "cached_input_tokens", "output_tokens"} and type(value) is int and value >= 0}
             if not started or not completed or not output.is_file() or output.stat().st_size > 100_000:
-                raise InterpretationError("Codex did not finish with a bounded structured decision")
+                raise InterpretationError("Codex did not finish with a bounded structured decision", code="invalid_output")
             self.last_model = model or "codex_default"
-            return _strict_json(output.read_text())
+            try:
+                output_text = output.read_text()
+            except UnicodeDecodeError:
+                raise InterpretationError("Codex returned invalid structured output", code="invalid_output") from None
+            return _strict_json(output_text)

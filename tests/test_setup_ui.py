@@ -229,6 +229,13 @@ class SetupUITests(unittest.TestCase):
                             worker_mode=state.get("mode_worker_mode", mode),
                             pending=state.get("mode_pending", False),
                         )
+                elif path == "/api/setup/evaluation":
+                    state.setdefault("evaluation_requests", []).append(body)
+                    if state.get("evaluation_error"):
+                        fulfill(route, {"detail": "Synthetic save failure"}, 409)
+                        return
+                    state["status"]["evaluation"] = body
+                    state["status"]["risk"]["max_chase_fraction"] = body["max_chase_fraction"]
                 elif path == "/api/setup/expiry-policy":
                     state.setdefault("expiry_policy_requests", []).append(body)
                     if state.get("expiry_policy_error"):
@@ -674,6 +681,39 @@ class SetupUITests(unittest.TestCase):
                 state["discovery_error"] = "Discord browser is not signed in"
                 page.get_by_role("button", name="Refresh servers").click()
                 expect(page.locator("#discord-discovery-feedback")).to_contain_text("Discord browser is not signed in", timeout=3000)
+            finally:
+                browser.close()
+
+    def test_evaluation_settings_pause_save_retry_and_reload(self):
+        state = {"status": self.status_payload(configured=True, paused=False,
+            evaluation={"model": None, "reasoning_effort": "low", "service_tier": "standard", "max_chase_fraction": "0.05"}),
+            "headers": [], "requests": [], "discovery_requests": [], "evaluation_error": True}
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                page.locator("#evaluation-model").fill("gpt-6-astra")
+                page.locator("#evaluation-effort").select_option("medium")
+                page.locator("#evaluation-tier").select_option("fast")
+                page.locator("#evaluation-chase").fill("10")
+                save = page.locator("#save-evaluation")
+                expect(save).to_have_text("Pause and save evaluation settings")
+                save.click()
+                expect(page.locator("#evaluation-feedback")).to_contain_text("Synthetic save failure")
+                expect(page.locator("#evaluation-model")).to_have_value("gpt-6-astra")
+                expect(save).to_be_enabled()
+                self.assertTrue(state["status"]["paused"])
+                state.pop("evaluation_error")
+                save.click()
+                expect(page.locator("#evaluation-feedback")).to_contain_text("Evaluation settings saved")
+                payload = {"model": "gpt-6-astra", "reasoning_effort": "medium", "service_tier": "fast", "max_chase_fraction": "0.1"}
+                relevant = [request for request in state["requests"] if request[0] in {"/api/setup/pause", "/api/setup/evaluation"}]
+                self.assertEqual(relevant, [("/api/setup/pause", {"paused": True}), ("/api/setup/evaluation", payload), ("/api/setup/evaluation", payload)])
+                page.reload(wait_until="domcontentloaded")
+                expect(page.locator("#evaluation-model")).to_have_value("gpt-6-astra")
+                expect(page.locator("#evaluation-effort")).to_have_value("medium")
+                expect(page.locator("#evaluation-tier")).to_have_value("fast")
+                expect(page.locator("#evaluation-chase")).to_have_value("10")
+                expect(page.locator("#save-evaluation")).to_be_enabled()
             finally:
                 browser.close()
 

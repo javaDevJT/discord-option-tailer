@@ -13,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .broker import BrokerPreflightHold
+from .interpreter import InterpretationError, safe_interpretation_reason
 
 UTC = timezone.utc
 EASTERN = ZoneInfo("America/New_York")
@@ -550,9 +551,18 @@ class Engine:
                 return self.store.record(message, state, label + result["status"], decision | {"order_proposal": order})
             except Hold as exc:
                 return self.store.record(message, "held", str(exc), decision)
+            except InterpretationError as exc:
+                # The interpreter owns provider details and retry accounting.
+                # Persist only its allowlisted diagnostic contract; no broker
+                # call occurs until a validated decision reaches plan().
+                return self.store.record(message, "error", safe_interpretation_reason(exc), decision)
             except Exception as exc:
-                # Do not leak response bodies, tokens, or Discord message content to console logs.
-                return self.store.record(message, "error", type(exc).__name__ + ": interpretation or broker read failed; no retry submitted", decision)
+                # Do not leak response bodies, tokens, or Discord message content.
+                if decision is None:
+                    return self.store.record(message, "error", safe_interpretation_reason(
+                        InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False),
+                    ), decision)
+                return self.store.record(message, "error", "internal execution failure; no retry submitted", decision)
 
     async def plan(self, message, decision):
         risk = self.config["risk"]

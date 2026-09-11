@@ -353,6 +353,22 @@ class NotificationTests(unittest.TestCase):
         self.assertFalse(result["configured"])
         self.assertNotIn("secret=1", json.dumps(result))
 
+    def test_reauthentication_alert_dedupes_across_restart_and_reopens_after_recovery(self):
+        now = datetime(2026, 9, 11, tzinfo=UTC)
+        runtime = self.state / "runtime-status.json"
+        sent = []
+        worker = NotificationWorker(self.config_path, sender=sent.append, clock=lambda: now)
+        runtime.write_text(json.dumps({"state": "running", "broker": {"state": "reauth_required"}}), encoding="utf-8")
+        self.assertEqual(worker.poll()["sent"], 1)
+        runtime.write_text(json.dumps({"state": "running", "broker": {"state": "connected"}}), encoding="utf-8")
+        self.assertEqual(worker.poll()["sent"], 0)
+        runtime.write_text(json.dumps({"state": "running", "broker": {"auth_required": True}}), encoding="utf-8")
+        self.assertEqual(worker.poll()["sent"], 1)
+        restarted = NotificationWorker(self.config_path, sender=sent.append, clock=lambda: now)
+        self.assertEqual(restarted.poll()["sent"], 0)
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all("Robinhood reauthentication" in payload["content"] for payload in sent))
+
 
 if __name__ == "__main__":
     unittest.main()

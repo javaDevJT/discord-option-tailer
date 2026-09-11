@@ -39,6 +39,7 @@ def seed_dashboard(base, template):
             ("DEMO: missed signal queued for recovery", "OPEN", "recovery_pending", "Recovery assessment queued; no order submitted."),
             ("DEMO: missed signal is being evaluated", "OPEN", "recovery_evaluating", "Recovery assessment in progress; no order submitted."),
             ("DEMO: missed signal recovery failed", "OPEN", "recovery_error", "Recovery assessment failed; no order submitted."),
+            ("DEMO: evaluation failed before a decision", None, "error", "evaluation failed: code=invalid_output; attempts=2; no order submitted"),
         ]):
             channel = config["channels"][index % 2]
             timestamp = recovery_timestamp if state.startswith("recovery_") else now
@@ -83,7 +84,7 @@ def seed_dashboard(base, template):
                     "account_number": "999999999999999999",
                 }
             store.observe(message)
-            store.record(message, state, reason, decision)
+            store.record(message, state, reason, decision if action else None)
             if action == "OPEN" and not state.startswith("recovery_"):
                 body = dict(client_order_id="demo-order", contract=contract, side="buy", quantity=1,
                             limit_price="0.50", position_effect="open", mode="paper",
@@ -129,6 +130,10 @@ class DashboardUITests(unittest.TestCase):
                     self.assertIn("market / open", recovery_text)
                     self.assertIn("recovery pending", page.locator("#messages-shell").inner_text().lower())
                     self.assertIn("recovery evaluating", page.locator("#messages-shell").inner_text().lower())
+                    failed_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: evaluation failed before a decision")
+                    self.assertEqual(failed_card.locator(".decision-action").text_content(), "Evaluation failed")
+                    failed_event = page.locator("#events-shell .event-row").filter(has_text="code=invalid_output")
+                    self.assertEqual(failed_event.locator(".event-action").text_content(), "Evaluation failed")
                     self.assertIn("SPY", page.locator("#orders-shell").inner_text())
                     self.assertIn("filled", page.locator("#orders-shell").inner_text().lower())
                     self.assertIn("SPY", page.locator("#positions-shell").inner_text())

@@ -226,6 +226,11 @@
     return firstValue(event?.reason, decision.reason, decision.rationale, decision.summary);
   }
 
+  function decisionActionLabel(event) {
+    if (event?.state === "error" && !decisionAction(event)) return "Evaluation failed";
+    return humanize(decisionAction(event), "No action");
+  }
+
   function decisionEvidence(event) {
     const decision = readDecision(event);
     return firstValue(event?.evidence, decision.evidence, decision.supporting_evidence, decision.context);
@@ -587,7 +592,7 @@
         const stateValue = firstValue(event.state, readDecision(event).state, "context");
         const header = node("div", "decision-header");
         const recovery = recoveryAssessment(event);
-        append(header, decisionPill(stateValue), node("span", "decision-action", isRecoveryEvent(event) ? "Recovery assessment" : humanize(decisionAction(event), "No action")));
+        append(header, decisionPill(stateValue), node("span", "decision-action", isRecoveryEvent(event) ? "Recovery assessment" : decisionActionLabel(event)));
         append(decisionPanel, header);
         if (isRecoveryEvent(event)) {
           renderRecoveryAssessment(decisionPanel, event, recovery, stateValue);
@@ -681,7 +686,7 @@
       const reason = node("p", "event-reason", valueText(firstValue(recovery?.reason, event.reason, decisionReason(event), "No reason recorded.")));
       const action = node("div", "event-action", isRecoveryEvent(event)
         ? `Recovery assessment${recovery?.status ? ` · ${recoveryStatusLabel(recovery.status)}` : ""}`
-        : humanize(decisionAction(event), "No action"));
+        : decisionActionLabel(event));
       const created = node("time", "event-time", formatDate(firstValue(event.created_at, event.timestamp)));
       if (event.created_at) created.dateTime = event.created_at;
       append(row, stateNode, reason, action, created);
@@ -954,6 +959,8 @@
     notificationsSaveInFlight: false,
     expiryPolicyInFlight: false,
     expiryPolicyDirty: false,
+    evaluationDirty: false,
+    evaluationInFlight: false,
     modeChangeInFlight: false,
     modeReturnFocus: null,
     discoveryRequestInFlight: false,
@@ -1422,6 +1429,23 @@
       authors: restrict ? setupSelectedAuthorIds(row) : [],
     };
   });
+  const setupRenderEvaluation = (value) => {
+    const settings = value || {};
+    const saving = setupState.evaluationInFlight || setupState.expiryPolicyInFlight;
+    const values = { "evaluation-model": settings.model || "", "evaluation-effort": settings.reasoning_effort || "medium",
+      "evaluation-tier": settings.service_tier || "standard", "evaluation-chase": Number(settings.max_chase_fraction ?? 0.10) * 100 };
+    Object.entries(values).forEach(([id, current]) => {
+      const field = setupById(id);
+      if (!field) return;
+      if (!setupState.evaluationDirty && !saving) field.value = String(current);
+      field.disabled = saving;
+    });
+    const save = setupById("save-evaluation");
+    if (save) {
+      save.disabled = saving;
+      save.textContent = setupState.evaluationInFlight ? "Saving…" : setupState.status?.paused === false ? "Pause and save evaluation settings" : "Save evaluation settings";
+    }
+  };
   const setupRenderRisk = (risk) => {
     const container = setupById("risk-context");
     if (!container || !risk || typeof risk !== "object") return;
@@ -1441,11 +1465,11 @@
         expiry.checked = risk.allow_same_day_expiry;
       }
       const trading = setupTradingStatus(setupState.status);
-      expiry.disabled = setupState.expiryPolicyInFlight;
+      expiry.disabled = setupState.expiryPolicyInFlight || setupState.evaluationInFlight;
       const save = setupById("save-expiry-policy");
       if (save) {
         save.textContent = setupState.expiryPolicyInFlight ? "Saving…" : setupState.status?.paused === false ? "Pause and save" : "Save permission";
-        save.disabled = setupState.expiryPolicyInFlight;
+        save.disabled = setupState.expiryPolicyInFlight || setupState.evaluationInFlight;
         save.title = trading.pending ? "Waiting for the worker to load the previous change." : "";
       }
     }
@@ -1589,7 +1613,8 @@
     const paused = Boolean(status?.paused);
     const configured = trading.mode !== "unknown";
     const rollbackShadow = trading.pending && trading.mode === "live";
-    const busy = setupState.modeChangeInFlight || setupState.expiryPolicyInFlight || (trading.pending && !rollbackShadow);
+    const settingsInFlight = setupState.expiryPolicyInFlight || setupState.evaluationInFlight;
+    const busy = setupState.modeChangeInFlight || settingsInFlight || (trading.pending && !rollbackShadow);
     const statusLabel = trading.pending ? "pending_reload" : paused ? "paused" : "unpaused";
     setupSetStatus("trading-mode-status", statusLabel);
     setupSetText("trading-mode-detail", setupTradingDetail(status, trading));
@@ -1605,13 +1630,13 @@
     setupSetText("trading-mode-availability", availability);
     const shadow = setupById("set-shadow-mode");
     const live = setupById("set-live-mode");
-    if (shadow) shadow.disabled = setupState.modeChangeInFlight || setupState.expiryPolicyInFlight || !paused || trading.mode === "shadow" || (trading.pending && trading.mode !== "live");
+    if (shadow) shadow.disabled = setupState.modeChangeInFlight || settingsInFlight || !paused || trading.mode === "shadow" || (trading.pending && trading.mode !== "live");
     if (live) live.disabled = busy || !paused || trading.mode === "live" || !setupLiveReady(status);
     const pause = setupById("pause-relay");
     if (pause) {
-      pause.disabled = (paused && setupState.expiryPolicyInFlight) || (paused && (trading.pending || setupState.modeChangeInFlight));
-      pause.title = paused && setupState.expiryPolicyInFlight
-        ? "Wait for the same-day entry permission to save."
+      pause.disabled = (paused && settingsInFlight) || (paused && (trading.pending || setupState.modeChangeInFlight));
+      pause.title = paused && settingsInFlight
+        ? "Wait for settings to save."
         : pause.disabled
           ? "Wait for the worker to load the selected mode before resuming."
           : "";
@@ -1648,6 +1673,7 @@
     setupRenderTradingMode(status);
     setupRenderNotifications(setupPart(status, "notifications"), status);
     setupRenderRisk(status?.risk);
+    setupRenderEvaluation(status?.evaluation);
     setupRenderBrowserDialog();
     if (overall === "connected") setupSetNotice("healthy", "Channels and account connections are configured. Check the runtime indicators for current monitoring status.");
     else if (["failed", "error"].includes(overall)) setupSetNotice("error", setupDetail(status, "Setup needs attention."));
@@ -1705,7 +1731,7 @@
   const setupSaveExpiryPolicy = async () => {
     const status = setupState.status || {};
     const trading = setupTradingStatus(status);
-    if (setupState.expiryPolicyInFlight) return;
+    if (setupState.expiryPolicyInFlight || setupState.evaluationInFlight) return;
     if (!setupState.csrfToken || typeof status.risk?.allow_same_day_expiry !== "boolean") {
       setupSetFeedback("expiry-policy-feedback", "Setup status is not ready. Refresh the page and try saving again.", "error");
       return;
@@ -1719,6 +1745,7 @@
     setupSetFeedback("expiry-policy-feedback", "Saving…");
     setupRenderRisk(status.risk);
     setupRenderTradingMode(status);
+    setupRenderEvaluation(status.evaluation);
     try {
       if (status.paused !== true) {
         const paused = await setupPost("/api/setup/pause", { paused: true }, "expiry-policy-feedback");
@@ -1733,6 +1760,34 @@
       setupState.expiryPolicyInFlight = false;
       setupRenderRisk(setupState.status?.risk || status.risk);
       setupRenderTradingMode(setupState.status || status);
+      setupRenderEvaluation(setupState.status?.evaluation || status.evaluation);
+    }
+  };
+  const setupSaveEvaluation = async () => {
+    if (setupState.evaluationInFlight || setupState.expiryPolicyInFlight) return;
+    const status = setupState.status || {};
+    if (!setupState.csrfToken || setupTradingStatus(status).pending) {
+      setupSetFeedback("evaluation-feedback", "Wait for setup status and any previous settings change, then save again.", "error");
+      return;
+    }
+    const body = { model: setupById("evaluation-model").value.trim() || null,
+      reasoning_effort: setupById("evaluation-effort").value, service_tier: setupById("evaluation-tier").value,
+      max_chase_fraction: String(Number(setupById("evaluation-chase").value) / 100) };
+    setupState.evaluationInFlight = true;
+    setupSetFeedback("evaluation-feedback", "Saving…");
+    setupRenderStatus(status);
+    try {
+      if (status.paused !== true) {
+        const paused = await setupPost("/api/setup/pause", { paused: true }, "evaluation-feedback");
+        if (!paused || paused.paused !== true) return;
+      }
+      if (await setupPost("/api/setup/evaluation", body, "evaluation-feedback")) {
+        setupState.evaluationDirty = false;
+        setupSetFeedback("evaluation-feedback", "Evaluation settings saved. Resume after the worker reloads.", "success");
+      }
+    } finally {
+      setupState.evaluationInFlight = false;
+      setupRenderStatus(setupState.status || status);
     }
   };
   const setupReadNotifications = () => {
@@ -2027,6 +2082,14 @@
       setupRenderRisk(setupState.status?.risk);
     });
     setupById("save-expiry-policy")?.addEventListener("click", setupSaveExpiryPolicy);
+    setupById("evaluation-form")?.addEventListener("input", () => {
+      setupState.evaluationDirty = true;
+      setupSetFeedback("evaluation-feedback", "Unsaved changes.");
+    });
+    setupById("evaluation-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      setupSaveEvaluation();
+    });
     setupById("pause-relay")?.addEventListener("click", async () => {
       const paused = Boolean(setupState.status?.paused);
       const status = await setupPost("/api/setup/pause", { paused: !paused }, "control-feedback");
@@ -2040,7 +2103,7 @@
   const setupStart = () => {
     if (!setupById("setup")) return;
     window.addEventListener("beforeunload", (event) => {
-      if (!setupState.expiryPolicyDirty && !setupState.expiryPolicyInFlight) return;
+      if (!setupState.expiryPolicyDirty && !setupState.expiryPolicyInFlight && !setupState.evaluationDirty && !setupState.evaluationInFlight) return;
       event.preventDefault();
       event.returnValue = "";
     });

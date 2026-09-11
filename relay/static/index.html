@@ -382,6 +382,20 @@
             <button class="button button-quiet" id="save-expiry-policy" type="button" disabled>Save permission</button>
             <p class="form-feedback" id="expiry-policy-feedback" role="status" aria-live="polite"></p>
           </div>
+          <form class="setup-card" id="evaluation-form">
+            <p class="eyebrow">SIGNAL EVALUATION</p>
+            <h3>Model and entry price</h3>
+            <p class="setup-help">Failed evaluations get one retry when appropriate. Authentication and subscription-limit failures require attention. Saving pauses the relay; resume after the worker reloads.</p>
+            <div class="setup-field-grid">
+              <label class="field-wide" for="evaluation-model">Model <input id="evaluation-model" name="model" type="text" maxlength="128" placeholder="Codex default"></label>
+              <label for="evaluation-effort">Reasoning <select id="evaluation-effort" name="reasoning_effort"><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option></select></label>
+              <label for="evaluation-tier">Speed <select id="evaluation-tier" name="service_tier"><option value="standard">Standard</option><option value="fast">Fast</option></select></label>
+              <label for="evaluation-chase">Maximum chase (%) <input id="evaluation-chase" name="max_chase_percent" type="number" min="0" max="100" step="0.1" required></label>
+            </div>
+            <p class="setup-help setup-help-small">Chase is the maximum entry-price increase over the alert premium. It is separate from position sizing. Fast uses more subscription credits.</p>
+            <button class="button button-quiet" id="save-evaluation" type="submit">Save evaluation settings</button>
+            <p class="form-feedback" id="evaluation-feedback" role="status" aria-live="polite"></p>
+          </form>
         </section>
 
         <section class="posture-section" aria-labelledby="runtime-title">

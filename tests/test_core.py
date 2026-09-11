@@ -11,6 +11,7 @@ from pathlib import Path
 from relay.core import Engine, Hold, Store, canonical_contract, channel_allows_author, contract_key, entry_size, load_config
 from relay.broker import BrokerPreflightHold
 from relay.ingest import normalize
+from relay.interpreter import InterpretationError
 
 
 NOW = datetime(2026, 9, 8, 14, tzinfo=timezone.utc)
@@ -174,6 +175,21 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.config["channels"][0]["role"] = "context"
         self.assertEqual((await self.engine.handle(self.message()))["state"], "context")
         self.assertEqual(self.broker.submissions, [])
+
+    async def test_failed_evaluation_persists_safe_code_and_attempts_without_broker_call(self):
+        class FailedInterpreter:
+            async def interpret(self, message, context, positions):
+                raise InterpretationError("private provider response", code="invalid_evidence", attempts=2)
+
+        self.engine.interpreter = FailedInterpreter()
+        result = await self.engine.handle(self.message())
+        self.assertEqual(result["state"], "error")
+        self.assertIn("code=invalid_evidence", result["reason"])
+        self.assertIn("attempts=2", result["reason"])
+        self.assertNotIn("private provider response", result["reason"])
+        self.assertEqual(self.broker.submissions, [])
+        row = self.store.db.execute("SELECT state,reason,decision FROM events WHERE message_id=?", (result["message_id"],)).fetchone()
+        self.assertEqual((row["state"], row["decision"]), ("error", None))
 
     async def test_stale_future_invalid_and_late_model_response(self):
         for seconds in (-91, 6):

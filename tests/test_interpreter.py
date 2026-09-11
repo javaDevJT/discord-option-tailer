@@ -14,7 +14,7 @@ from relay.interpreter import _record
 
 from relay.interpreter import (
     DECISION_SCHEMA, RECOVERY_SCHEMA, CodexInterpreter, InterpretationError,
-    _strict_json, _recovery_context, validate_decision, validate_recovery,
+    _strict_json, _recovery_context, safe_interpretation_reason, validate_decision, validate_recovery,
 )
 
 
@@ -78,6 +78,82 @@ class InterpreterChecks(unittest.TestCase):
                     await interpreter.interpret(MESSAGE, [], [])
             self.assertIs(raised.exception, original)
         asyncio.run(scenario())
+
+    def test_retry_revalidates_structured_output_then_publishes_ready(self):
+        invalid = DECISION | {"evidence": [{"message_id": "invented", "quote": "not supplied"}]}
+        events = []
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}}, on_status=events.append)
+        with patch.object(interpreter, "_interpret", side_effect=[invalid, DECISION]) as run:
+            result = asyncio.run(interpreter.interpret(MESSAGE, [], []))
+        self.assertEqual(result, DECISION)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(interpreter.last_attempts, 2)
+        self.assertEqual(events, [{"component": "codex", "state": "ready"}])
+
+    def test_retry_exhaustion_has_safe_code_and_attempt_count(self):
+        invalid = DECISION | {"evidence": [{"message_id": "invented", "quote": "private-token"}]}
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        with patch.object(interpreter, "_interpret", side_effect=[invalid, invalid]) as run:
+            with self.assertRaises(InterpretationError) as raised:
+                asyncio.run(interpreter.interpret(MESSAGE, [], []))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual((raised.exception.code, raised.exception.attempts), ("invalid_evidence", 2))
+        reason = safe_interpretation_reason(raised.exception)
+        self.assertIn("code=invalid_evidence", reason)
+        self.assertIn("attempts=2", reason)
+        self.assertNotIn("private-token", reason)
+
+    def test_auth_and_quota_failures_do_not_retry(self):
+        for error, code in (
+            ("ChatGPT authentication needs attention", "auth_required"),
+            ("subscription usage limit reached", "quota_exhausted"),
+        ):
+            with self.subTest(code=code):
+                interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+                with patch.object(interpreter, "_interpret", side_effect=InterpretationError(error)) as run:
+                    with self.assertRaises(InterpretationError) as raised:
+                        asyncio.run(interpreter.interpret(MESSAGE, [], []))
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual((raised.exception.code, raised.exception.attempts), (code, 1))
+
+    def test_fast_and_standard_cli_preferences_are_explicit_and_bounded(self):
+        for tier, expected_service, expected_fast in (("fast", 'service_tier="fast"', 'features.fast_mode=true'),
+                                                       ("standard", None, 'features.fast_mode=false')):
+            with self.subTest(tier=tier), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory) / "source-home"
+                home.mkdir()
+                (home / "auth.json").write_text("test credential placeholder")
+                (home / "config.toml").write_text('model = "user-default-model"\nmodel_provider = "private-proxy"\n')
+                interpreter = CodexInterpreter({"llm": {"executable": sys.executable, "model": "fixture-model",
+                                                          "reasoning_effort": "medium", "service_tier": tier}})
+                interpreter.source_home = home
+                captured = []
+
+                def execute(*args, **kwargs):
+                    captured.append(args)
+                    command, env, cwd = args[:3]
+                    input_bytes = kwargs.get("input_bytes")
+                    if "login" in command:
+                        return subprocess.CompletedProcess(command, 0, b"Logged in using ChatGPT\n", b"")
+                    output = Path(command[command.index("--output-last-message") + 1])
+                    output.write_text(json.dumps(DECISION))
+                    events = [
+                        {"type": "thread.started", "thread_id": "ephemeral"},
+                        {"type": "turn.started"},
+                        {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(DECISION)}},
+                        {"type": "turn.completed", "usage": {}},
+                    ]
+                    return subprocess.CompletedProcess(command, 0, "\n".join(json.dumps(e) for e in events).encode(), b"")
+
+                with patch.object(interpreter, "_run_process", side_effect=execute):
+                    asyncio.run(interpreter.interpret(MESSAGE, [], []))
+                args = captured[1][0]
+                self.assertIn('model_reasoning_effort="medium"', args)
+                self.assertIn(expected_fast, args)
+                if expected_service:
+                    self.assertIn(expected_service, args)
+                else:
+                    self.assertNotIn('service_tier="standard"', args)
 
     def test_normal_and_recovery_requests_publish_provider_health(self):
         async def scenario():
@@ -349,6 +425,23 @@ class CodexInterpreterChecks(unittest.TestCase):
         self.assertNotIn("private-account", json.dumps(payload))
         self.assertNotIn("provider_metadata", json.dumps(payload))
 
+    def test_recovery_retries_output_and_evidence_validation_once(self):
+        assessment = {
+            "status": "uncertain", "confidence": .5, "reason": "Insufficient later evidence.",
+            "evidence": [
+                {"message_id": MESSAGE["id"], "quote": MESSAGE["content"]},
+                {"message_id": LATER["id"], "quote": LATER["content"]},
+            ],
+        }
+        invalid = assessment | {"evidence": [{"message_id": LATER["id"], "quote": LATER["content"]}]}
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory)
+            with patch.object(interpreter, "_interpret", side_effect=[invalid, assessment]) as run:
+                result = asyncio.run(interpreter.assess_recovery(MESSAGE, [LATER], [], DECISION, RECOVERY_FACTS))
+        self.assertEqual(result, assessment)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(interpreter.last_attempts, 2)
+
     def test_recovery_requires_original_and_current_same_source_evidence(self):
         invalid = {
             "status": "invalidated", "confidence": .9, "reason": "The source later cancelled the proposal.",
@@ -417,6 +510,28 @@ class CodexInterpreterChecks(unittest.TestCase):
                 interpreter = self.interpreter(directory)
                 with patch.object(interpreter, "_run_process", side_effect=lambda *args, **kwargs: self.response(*args, **kwargs, events=events)), self.assertRaises(InterpretationError):
                     asyncio.run(interpreter.interpret(MESSAGE, [], []))
+
+    def test_reauth_is_classified_from_cli_stderr_or_failed_json_without_retry(self):
+        for mode in ("stderr", "json"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                events = []
+                interpreter = self.interpreter(directory, service_tier="standard")
+                interpreter.on_status = events.append
+
+                def execute(args, env, cwd, input_bytes=None):
+                    if "login" in args:
+                        return self.response(args, env, cwd, input_bytes)
+                    if mode == "stderr":
+                        return subprocess.CompletedProcess(args, 1, b"", b"ChatGPT authentication failed; run codex login")
+                    failed = [{"type": "turn.started"}, {"type": "turn.failed", "error": {"message": "Please reauthenticate with ChatGPT"}}]
+                    return self.response(args, env, cwd, input_bytes, events=failed)
+
+                with patch.object(interpreter, "_run_process", side_effect=execute) as run:
+                    with self.assertRaises(InterpretationError) as raised:
+                        asyncio.run(interpreter.interpret(MESSAGE, [], []))
+                self.assertEqual(run.call_count, 2)  # login status plus one model request
+                self.assertEqual((raised.exception.code, raised.exception.attempts), ("auth_required", 1))
+                self.assertEqual(events[-1], {"component": "codex", "state": "auth_required"})
 
     def test_only_exact_disabled_code_mode_startup_notice_is_accepted(self):
         notice = {"type": "item.completed", "item": {"type": "error", "message": CodexInterpreter._DISABLED_CODE_MODE_NOTICE}}

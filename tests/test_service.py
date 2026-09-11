@@ -261,5 +261,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(context.closed)
 
 
+    def test_provider_auth_failure_survives_runtime_restart_until_real_health_event(self):
+        self.status.event({"component": "broker", "state": "auth_required"})
+        restarted = RuntimeStatus(self.status.path, self.config["channels"])
+        self.assertEqual(restarted.value["broker"]["state"], "auth_required")
+        restarted.event({"component": "broker", "state": "configured"})
+        self.assertEqual(restarted.value["broker"]["state"], "auth_required")
+        restarted.event({"component": "broker", "state": "unavailable"})
+        self.assertEqual(restarted.value["broker"]["state"], "auth_required")
+        restarted.event({"component": "broker", "state": "connected"})
+        self.assertEqual(restarted.value["broker"]["state"], "connected")
+
+
 if __name__ == "__main__":
     unittest.main()

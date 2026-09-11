@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from .core import EASTERN, Hold, canonical_contract, channel_allows_author, entry_size, instant, money
+from .interpreter import safe_interpretation_reason
 
 
 class RecoveryEvaluator:
@@ -203,7 +204,7 @@ class RecoveryEvaluator:
             self.store.record(message, "recovery_pending", "Recovery assessment interrupted; awaiting evaluation")
             raise
         except Exception as exc:
-            return self.store.record(message, "recovery_error", type(exc).__name__ + ": recovery assessment failed; no order submitted", decision)
+            return self.store.record(message, "recovery_error", safe_interpretation_reason(exc), decision)
 
     async def consume(self, fresh_queue, emit):
         while True:

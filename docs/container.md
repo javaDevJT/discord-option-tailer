@@ -107,13 +107,17 @@ The default configuration keeps the confidence-based entry allocation ceiling be
 | Signal freshness | `90` seconds |
 | Quote freshness | `15` seconds |
 | Maximum spread | `15%` |
-| Maximum chase | `5%` above the cited premium |
+| Maximum chase | `10%` above the cited premium |
 | Same-day expiry opens | Disabled by default; configurable in Setup |
 | Fee reserve | `$1.00` per contract |
 
 These are maximum allocations, never a required spend or minimum account balance. Current buying power, existing and pending exposure, whole-contract quantity, and fees can reduce an entry to zero. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can only reduce the ceiling.
 
 The execution path accepts single-leg long standard USD equity or ETF options for buy-to-open, reduce, and sell-to-close actions. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, short positions, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
+
+Model, reasoning, Fast/Standard service, and chase can be saved in **Setup → Signal evaluation**. Saving pauses the relay and waits for the worker to load the configuration. The example uses `gpt-6-astra`, medium reasoning, Fast, and 10% chase on the existing ChatGPT subscription.
+
+Evaluation retries once for transient failures and invalid structured output or evidence; auth, quota, and configuration failures are not retried. Broker submissions are never retried by this mechanism. Failed evaluations include sanitized diagnostics in Messages and Audit. Codex or Robinhood authentication rejection updates Setup and triggers the configured Discord webhook once per incident. Reauthentication failures remain visible across restarts until the affected provider succeeds.
 
 ## Monitor and operate
 
