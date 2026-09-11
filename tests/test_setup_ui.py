@@ -686,7 +686,8 @@ class SetupUITests(unittest.TestCase):
 
     def test_evaluation_settings_pause_save_retry_and_reload(self):
         state = {"status": self.status_payload(configured=True, paused=False,
-            evaluation={"model": None, "reasoning_effort": "low", "service_tier": "standard", "max_chase_fraction": "0.05"}),
+            evaluation={"model": None, "reasoning_effort": "low", "service_tier": "standard", "max_chase_fraction": "0.05"},
+            trading={"mode": "live", "live_enabled": True, "worker_mode": None, "pending": True}),
             "headers": [], "requests": [], "discovery_requests": [], "evaluation_error": True}
         with sync_playwright() as playwright:
             browser, page = self.new_page(playwright, state)

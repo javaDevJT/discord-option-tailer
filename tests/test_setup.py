@@ -66,8 +66,12 @@ class SetupManagerTests(unittest.TestCase):
         saved["llm"] = old["llm"]
         saved["risk"]["max_chase_fraction"] = old["risk"]["max_chase_fraction"]
         self.assertEqual(saved, old)
-        with self.assertRaisesRegex(RuntimeError, "previous settings"):
-            self.manager.save_evaluation(payload)
+        # A paused worker with failed authentication must still be configurable.
+        changed = payload | {"reasoning_effort": "low"}
+        self.assertEqual(self.manager.save_evaluation(changed)["evaluation"], changed)
+        self.assertEqual(self.manager.save_evaluation(payload)["evaluation"], payload)
+        with self.assertRaisesRegex(RuntimeError, "worker"):
+            self.manager.set_paused(False)
         self.manager.close()
         self.manager = SetupManager(self.path)
         self.assertEqual(self.manager.status()["evaluation"], payload)

@@ -1766,8 +1766,8 @@
   const setupSaveEvaluation = async () => {
     if (setupState.evaluationInFlight || setupState.expiryPolicyInFlight) return;
     const status = setupState.status || {};
-    if (!setupState.csrfToken || setupTradingStatus(status).pending) {
-      setupSetFeedback("evaluation-feedback", "Wait for setup status and any previous settings change, then save again.", "error");
+    if (!setupState.csrfToken) {
+      setupSetFeedback("evaluation-feedback", "Wait for setup status, then save again.", "error");
       return;
     }
     const body = { model: setupById("evaluation-model").value.trim() || null,

@@ -66,6 +66,32 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(events[-1], {"component": "broker", "state": state})
                 self.assertIsNone(broker.session)
 
+    async def test_cleanup_auth_group_publishes_and_propagates_cleanup_exception(self):
+        events = []
+        broker = RobinhoodMCP({}, on_status=events.append)
+        session = MagicMock(initialize=AsyncMock(side_effect=asyncio.CancelledError()))
+        broker.stack.enter_async_context = AsyncMock(side_effect=[MagicMock(), (None, None, None), session])
+        auth_failure = RuntimeError("private response detail")
+        auth_failure.response = SimpleNamespace(status_code=401)
+        cleanup = ExceptionGroup("cleanup", [auth_failure])
+        broker.__aexit__ = AsyncMock(side_effect=cleanup)
+        with patch("httpx.AsyncClient"), patch("mcp.ClientSession"), patch("mcp.client.streamable_http.streamable_http_client"):
+            with self.assertRaises(ExceptionGroup) as raised:
+                await broker.__aenter__()
+        self.assertIs(raised.exception, cleanup)
+        self.assertEqual(events[-1], {"component": "broker", "state": "auth_required"})
+
+    async def test_initialization_cancellation_without_cleanup_failure_stays_cancellation(self):
+        events = []
+        broker = RobinhoodMCP({}, on_status=events.append)
+        session = MagicMock(initialize=AsyncMock(side_effect=asyncio.CancelledError()))
+        broker.stack.enter_async_context = AsyncMock(side_effect=[MagicMock(), (None, None, None), session])
+        broker.__aexit__ = AsyncMock(return_value=None)
+        with patch("httpx.AsyncClient"), patch("mcp.ClientSession"), patch("mcp.client.streamable_http.streamable_http_client"):
+            with self.assertRaises(asyncio.CancelledError):
+                await broker.__aenter__()
+        self.assertEqual(events, [])
+
     async def test_tool_calls_publish_auth_failure_and_recovery_without_error_text(self):
         events = []
         broker = RobinhoodMCP({}, on_status=events.append)

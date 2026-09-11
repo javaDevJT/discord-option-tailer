@@ -374,8 +374,6 @@ class SetupManager:
             latest = self._read_raw_locked()
             if not self._is_paused(latest):
                 raise RuntimeError("Pause the relay before changing evaluation settings.")
-            if self._public_trading(latest)["pending"]:
-                raise RuntimeError("Wait for the worker to load the previous settings change.")
             candidate = copy.deepcopy(latest)
             candidate.setdefault("llm", {}).update(model=model or None,
                 reasoning_effort=payload["reasoning_effort"], service_tier=payload["service_tier"])

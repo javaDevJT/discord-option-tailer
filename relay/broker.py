@@ -536,7 +536,14 @@ class RobinhoodMCP:
         except BaseException as exc:
             if isinstance(exc, Exception):
                 self._connection_failed(exc)
-            await self.__aexit__(None, None, None)
+            try:
+                await self.__aexit__(None, None, None)
+            except BaseException as cleanup_error:
+                # MCP may surface the useful HTTP/auth cause only while its
+                # task group is unwinding.  Publish it, but preserve the
+                # cleanup failure so the worker can retain its safe leaf diagnostic.
+                self._connection_failed(cleanup_error)
+                raise
             raise
 
     async def __aexit__(self, exc_type, exc, tb):
