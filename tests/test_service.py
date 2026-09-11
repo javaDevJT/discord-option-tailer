@@ -122,6 +122,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await serve(path)
 
+    async def test_worker_failure_detail_omits_private_exception_text(self):
+        path = self.base / "config.json"
+        with patch("relay.service.load_config", side_effect=RuntimeError("SECRET provider payload")), \
+             patch("relay.service.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await serve(path)
+        snapshot = json.loads((self.base / "state/runtime-status.json").read_text())
+        self.assertEqual(snapshot["state"], "error")
+        self.assertIn("RuntimeError", snapshot["detail"])
+        self.assertNotIn("SECRET", json.dumps(snapshot))
+
     async def test_reload_waits_for_worker_cleanup_before_returning(self):
         started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         async def operation():

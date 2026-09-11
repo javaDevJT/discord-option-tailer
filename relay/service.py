@@ -191,7 +191,11 @@ async def serve(config_path):
             # Do not expose OAuth responses, tokens or browser exception URLs in the dashboard.
             LOG.warning("Worker needs attention (%s); retrying in %s seconds", type(exc).__name__, delay)
             status.ready = False
-            status.write(state="error", detail="Worker unavailable. Check configuration and login; connection recovery will retry automatically.")
+            failure_frame = exc.__traceback__
+            while failure_frame and failure_frame.tb_next:
+                failure_frame = failure_frame.tb_next
+            location = f" at {Path(failure_frame.tb_frame.f_code.co_filename).name}:{failure_frame.tb_lineno}" if failure_frame else ""
+            status.write(state="error", detail=f"Worker unavailable ({type(exc).__name__}{location}). Check configuration and login; connection recovery will retry automatically.")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
