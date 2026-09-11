@@ -124,7 +124,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_failure_detail_omits_private_exception_text(self):
         path = self.base / "config.json"
-        with patch("relay.service.load_config", side_effect=RuntimeError("SECRET provider payload")), \
+        with patch("relay.service.load_config", side_effect=ExceptionGroup("SECRET group", [RuntimeError("SECRET provider payload")])), \
              patch("relay.service.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
             with self.assertRaises(asyncio.CancelledError):
                 await serve(path)
