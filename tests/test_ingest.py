@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from relay.browser import EXTRACT_MESSAGES_JS, SnapshotTracker, snapshot_matches
 from relay.ingest import load_export, normalize
+from relay.core import Store
 
 
 CHANNEL = "1000000000000000001"
@@ -42,6 +43,36 @@ def message(number=10, **overrides):
 
 
 class IngestTests(unittest.TestCase):
+    def test_attachment_url_renewal_updates_metadata_without_reissuing_signal(self):
+        raw = message(attachments=[{"filename": "chart.png", "url":
+            "https://cdn.discordapp.com/attachments/123/456/chart.png?ex=old&hm=old"}])
+        renewed = copy.deepcopy(raw)
+        renewed["attachments"][0]["url"] = "https://cdn.discordapp.com/attachments/123/456/chart.png?ex=new&hm=new"
+        renewed["attachments"][0]["proxy_url"] = "https://media.discordapp.net/attachments/123/456/chart.png?ex=new"
+        self.assertEqual(normalize(raw)["revision"], normalize(renewed)["revision"])
+        tracker = SnapshotTracker(CHANNEL)
+        original = tracker.observe([raw])[0]
+        refreshed = tracker.observe([renewed])[0]
+        self.assertEqual(refreshed["ingestion"], "refresh")
+        self.assertEqual(tracker.observe([renewed]), [])
+        original["source_group"] = refreshed["source_group"] = "source-a"
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "images.sqlite3")
+            try:
+                self.assertEqual(store.observe(original), "new")
+                store.record(original, "held", "original decision")
+                self.assertEqual(store.observe(refreshed), "same")
+                body = json.loads(store.db.execute("SELECT body FROM messages").fetchone()[0])
+                self.assertEqual(body["attachments"], renewed["attachments"])
+                self.assertEqual(body["ingestion"], original["ingestion"])
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+                self.assertEqual(store.db.execute("SELECT reason FROM events").fetchone()[0], "original decision")
+            finally:
+                store.close()
+        changed = copy.deepcopy(renewed)
+        changed["attachments"][0]["url"] = changed["attachments"][0]["url"].replace("/456/", "/789/")
+        self.assertNotEqual(normalize(raw)["revision"], normalize(changed)["revision"])
+
     def test_normalization_revisions_and_timezone(self):
         raw = message(timestamp="2026-09-04T11:00:28.803-04:00",
                       attachments=[{"id": "123", "filename": "chart.png", "url": "https://example.com/chart.png"}],
@@ -162,7 +193,7 @@ class IngestTests(unittest.TestCase):
           <span id="message-timestamp-{first}"><time datetime="2026-09-04T15:00:00Z">today</time></span>
           <div id="message-content-{first}">Watching TSLA</div>
           <article class="embedFull_test">ENTRY: TSLA calls<span class="embedImage_test"><img src="https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png"></span></article>
-          <a href="https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png">chart</a>
+        <a href="https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png"><img src="https://media.discordapp.net/attachments/{CHANNEL}/111111111111111111/chart.png?ex=proxy-fixture">chart</a>
         </li>
         <li id="chat-messages-{CHANNEL}-{second}" aria-labelledby="message-username-{first}">
           <span id="message-timestamp-{second}"><time datetime="2026-09-04T15:01:00Z">today</time></span>
@@ -219,6 +250,8 @@ const fs = require('fs');
         self.assertEqual(rows[0]["embeds"], [{"description": "ENTRY: TSLA calls", "image": {
             "url": f"https://cdn.discordapp.com/attachments/{CHANNEL}/111111111111111111/chart.png"}}])
         self.assertEqual(len(rows[0]["attachments"]), 1)
+        self.assertIn("media.discordapp.net", rows[0]["attachments"][0]["proxy_url"])
+        self.assertEqual(normalize(rows[0])["attachments"][0]["proxy_url"], rows[0]["attachments"][0]["proxy_url"])
         self.assertNotEqual(observed["initial"]["connection_epoch"], observed["reconnected"]["connection_epoch"])
         self.assertFalse(observed["foreign"]["ready"])
         self.assertEqual(observed["foreign"]["foreign_rows"], 1)

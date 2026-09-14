@@ -11,9 +11,11 @@ import re
 import secrets
 import sqlite3
 import threading
+import tempfile
 from .account import AUTH_ERROR, CACHE_KEY, REFRESH_ERROR, REFRESH_SECONDS
+from .images import collect_images, download_images, ImageTransportError, MAX_IMAGES
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 
 UTC = timezone.utc
@@ -21,6 +23,7 @@ MAX_BODY = 4 * 1024 * 1024
 MAX_QUERY_TEXT = 200
 MAX_OFFSET = 100_000
 RUNTIME_STALE_SECONDS = 30
+IMAGE_PREVIEW_SLOTS = threading.BoundedSemaphore(2)
 MESSAGE_STATES = frozenset({
     "observed", "context", "ignore", "wait", "open", "reduce", "close", "update_stop",
     "shadow_order", "paper_order", "broker_order", "held", "unknown", "error", "duplicate",
@@ -357,8 +360,19 @@ def _project_message(row, event):
         "author": {"id": _safe_identifier(author_id), "name": _safe_text(author_name, 256)},
         "content": _safe_text(body.get("content", ""), 20000),
         "embeds": _project_embeds(body.get("embeds")),
+        "images": _project_message_images(row, body),
         "latest_event": latest_event,
     }
+
+
+def _project_message_images(row, body):
+    try:
+        sources = collect_images([dict(body, id=str(row["id"]))])
+    except ImageTransportError:
+        return []
+    return [{"index": index, "url": "/api/message-image?" + urlencode({
+        "message_id": row["id"], "revision": row["revision"], "index": index,
+    })} for index in range(len(sources))]
 
 
 def _project_event(row):
@@ -824,6 +838,40 @@ class DashboardApp:
             "positions": positions if available else [],
         }
 
+    def message_image(self, query):
+        values, _, _ = self._list_query(query, {"message_id", "revision", "index"}, "message image")
+        message_id, revision = values.get("message_id", ""), values.get("revision", "")
+        if not re.fullmatch(r"\d{15,22}", message_id) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", revision):
+            raise QueryError("valid message_id and revision are required")
+        try:
+            index = int(values.get("index", ""))
+        except ValueError:
+            raise QueryError("image index must be an integer") from None
+        if not 0 <= index < MAX_IMAGES:
+            raise QueryError("image index is outside the permitted range")
+
+        def read(connection, tables):
+            if "messages" not in tables:
+                return None
+            row = connection.execute("SELECT body FROM messages WHERE id=? AND revision=?", (message_id, revision)).fetchone()
+            return dict(_json_object(row[0]), id=message_id) if row else None
+
+        message, _ = self._ledger(self.snapshot(), read, None)
+        if message is None:
+            return None
+        sources = collect_images([message])
+        if index >= len(sources):
+            return None
+        if not IMAGE_PREVIEW_SLOTS.acquire(blocking=False):
+            raise ConfigUnavailable("Image previews are busy; try again shortly")
+        try:
+            with tempfile.TemporaryDirectory(prefix="discord-image-preview-") as directory:
+                path = download_images([sources[index]], directory)[0]
+                media_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}[path.suffix]
+                return path.read_bytes(), media_type
+        finally:
+            IMAGE_PREVIEW_SLOTS.release()
+
     def static_file(self, request_path):
         if request_path == "/":
             relative = "index.html"
@@ -1020,6 +1068,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages":
                 self._json(200, self.app.messages(parsed.query), api=True, head=head)
+                return
+            if path == "/api/message-image":
+                try:
+                    image = self.app.message_image(parsed.query)
+                except ImageTransportError as exc:
+                    self._json(502, {"error": str(exc), "code": getattr(exc, "code", "image_unavailable")}, api=True, head=head)
+                    return
+                if image is None:
+                    self._json(404, {"error": "Image or message revision is unavailable"}, api=True, head=head)
+                    return
+                body, media_type = image
+                self.send_response(200)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, max-age=300")
+                self._security_headers()
+                self.end_headers()
+                if not head:
+                    self.wfile.write(body)
                 return
             if path == "/api/orders":
                 self._json(200, self.app.orders(parsed.query), api=True, head=head)

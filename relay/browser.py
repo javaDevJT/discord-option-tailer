@@ -92,15 +92,27 @@ EXTRACT_MESSAGES_JS = r"""(expectedChannelId = null) => {
     const reply = row.querySelector('[class*="repliedMessage"] a[href*="/channels/"]');
     const replyMatch = reply && reply.href.match(/\/channels\/\d+\/\d+\/(\d{15,22})(?:$|[?#])/);
     const attachments = [];
-    const urls = new Set();
+    const urls = new Map();
     for (const element of own(row, 'a[href*="/attachments/"], img[src*="/attachments/"]')) {
       const url = element.href || element.currentSrc || element.src;
-      if (!url || urls.has(url)) continue;
-      urls.add(url);
+      if (!url) continue;
       const image = element.matches('img') ? element : element.querySelector('img');
       let filename = '';
-      try { filename = decodeURIComponent(new URL(url).pathname.split('/').pop()); } catch (_) {}
-      attachments.push({url, filename, description: (image && image.alt) || element.textContent || ''});
+      let identity = url;
+      try {
+        const parsed = new URL(url);
+        filename = decodeURIComponent(parsed.pathname.split('/').pop());
+        if (['cdn.discordapp.com', 'media.discordapp.net'].includes(parsed.hostname)) identity = parsed.pathname;
+      } catch (_) {}
+      const proxy = image && (image.currentSrc || image.src);
+      if (urls.has(identity)) {
+        if (proxy && proxy !== urls.get(identity).url) urls.get(identity).proxy_url = proxy;
+        continue;
+      }
+      const attachment = {url, filename, description: (image && image.alt) || element.textContent || ''};
+      if (proxy && proxy !== url) attachment.proxy_url = proxy;
+      attachments.push(attachment);
+      urls.set(identity, attachment);
     }
     const embeds = own(row, 'article[class*="embed"], [class*="embedFull"]')
       .filter(el => !el.parentElement.closest('article[class*="embed"], [class*="embedFull"]'))
@@ -158,6 +170,7 @@ class SnapshotTracker:
         self.channel_id = channel_id
         self.high_water = 0
         self.seen: dict[str, str] = {}
+        self.transport_seen: dict[str, str] = {}
         self.needs_baseline = True
         self.started = False
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -190,6 +203,10 @@ class SnapshotTracker:
         for message in messages:
             old_revision = self.seen.get(message["id"])
             if old_revision == message["revision"]:
+                if self.transport_seen.get(message["id"]) != message["transport_revision"]:
+                    message.update(ingestion="refresh", ingestion_reason="image_url_refresh")
+                    events.append(message)
+                    self.transport_seen[message["id"]] = message["transport_revision"]
                 continue
             before_empty = self.empty_cutoff is not None and instant(message["timestamp"]) <= self.empty_cutoff
             contextual = baseline or before_empty or old_revision is not None or int(message["id"]) <= previous_high_water
@@ -199,6 +216,7 @@ class SnapshotTracker:
                                            else "backscroll" if int(message["id"]) <= previous_high_water else "live")
             events.append(message)
             self.seen[message["id"]] = message["revision"]
+            self.transport_seen[message["id"]] = message["transport_revision"]
         self.high_water = max(self.high_water, *(int(m["id"]) for m in messages))
         self.needs_baseline = False
         self.started = True
@@ -209,6 +227,7 @@ class SnapshotTracker:
         # ponytail: bounded DOM cache; SQLite downstream owns durable deduplication.
         if len(self.seen) > 2000:
             self.seen = dict(sorted(self.seen.items(), key=lambda item: int(item[0]))[-1000:])
+            self.transport_seen = {key: value for key, value in self.transport_seen.items() if key in self.seen}
         return events
 
 

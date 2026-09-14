@@ -159,6 +159,8 @@ async def run(config, *, observe_only=False, on_status=None):
                 return
             message = dict(message, source_group=channel["source_group"])
             observed = store.observe(message)
+            if message.get("ingestion") == "refresh":
+                return
             try:
                 queue.put_nowait((message, observed))
             except asyncio.QueueFull as exc:

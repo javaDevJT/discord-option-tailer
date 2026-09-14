@@ -121,6 +121,10 @@ Evaluation retries once for transient failures and invalid structured output or 
 
 ## Monitor and operate
 
+Expand a message's **Images** section to inspect its attachments. Previews are served through the authenticated dashboard and do not invoke Codex or Robinhood. If a preview fails, its link shows a specific, sanitized error and lets you retry. Discord refreshes signed attachment URLs; the reader retains rendered proxy alternatives and saves URL renewals without issuing another signal evaluation.
+
+The interpreter supplies current-message and reply images to Codex. If an entry cites an older original alert whose pictures were not supplied, it adds those pictures for one second evaluation. Transient image timeouts, network errors, rate limits, and server failures can also use that retry; the total remains two attempts. Missing, inaccessible, unsupported, or oversized pictures produce a specific image error and block the entry. Each evaluation retains the four-image and 16 MiB download limits. Old failed decisions are not automatically replayed by this update.
+
 The dashboard provides an operational snapshot, runtime status for Discord/Codex/Robinhood, observed messages, interpretation states, held decisions, recorded orders, relay-owned positions, and the decision trail. Relay-owned positions represent what this ledger recorded; they are not a complete broker account statement.
 
 Use the dashboard controls for **Pause relay**, **Resume relay**, and **Reconnect**. For container-level checks and logs:

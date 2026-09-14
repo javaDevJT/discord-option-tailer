@@ -18,7 +18,13 @@ import tomllib
 from zoneinfo import ZoneInfo
 
 from .status import publish_status
-from .images import collect_images, download_images
+from .images import (
+    IMAGE_DIAGNOSTIC_DETAILS,
+    ImageTransportError,
+    attachment_identity,
+    collect_images,
+    download_images,
+)
 
 
 ACTIONS = ("IGNORE", "WAIT", "OPEN", "REDUCE", "CLOSE", "UPDATE_STOP")
@@ -239,12 +245,15 @@ DIAGNOSTIC_DETAILS = {
     "config_invalid": "Codex configuration is invalid",
     "credentials_missing": "file-backed ChatGPT login is required",
     "image_unavailable": "Attached pictures could not be inspected; no expiry was assumed",
+    "image_context_missing": "Original alert pictures were not supplied; no trade accepted",
+    "image_input": "Attached picture input could not be provided to Codex",
     "unsafe_tool_action": "Codex attempted a tool action; no decision accepted",
     "invalid_output": "Codex returned invalid structured output",
     "invalid_evidence": "Decision evidence failed local validation",
     "provider_failed": "Codex reported a failed interpretation",
     "input_invalid": "Invalid message or position context",
     "internal_error": "interpreter failed before producing a decision",
+    **IMAGE_DIAGNOSTIC_DETAILS,
 }
 
 RETRYABLE_DIAGNOSTIC_CODES = frozenset({
@@ -318,6 +327,60 @@ def _diagnostic_code(message):
 
 def _retryable_code(code):
     return code in RETRYABLE_DIAGNOSTIC_CODES
+
+
+def _image_interpretation_error(error, *, fallback_code="image_input"):
+    code = getattr(error, "code", None)
+    if not isinstance(code, str) or code not in DIAGNOSTIC_DETAILS or not code.startswith("image_"):
+        code = fallback_code
+    retryable = getattr(error, "retryable", False)
+    return InterpretationError(DIAGNOSTIC_DETAILS[code], code=code, retryable=bool(retryable))
+
+
+def _collect_image_sources(messages):
+    try:
+        return collect_images(messages)
+    except ImageTransportError as error:
+        raise _image_interpretation_error(error) from None
+    except (ValueError, OSError) as error:
+        raise _image_interpretation_error(error) from None
+
+
+def _merge_image_sources(existing, additions):
+    merged = []
+    seen = set()
+    for source in (*existing, *additions):
+        if not isinstance(source, dict):
+            continue
+        key = _image_source_key(source)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(source)
+    return merged
+
+
+def _image_source_key(source):
+    message_id = source.get("message_id")
+    url = source.get("url")
+    try:
+        identity = attachment_identity(url)
+    except (ImageTransportError, ValueError, TypeError):
+        identity = url
+    return message_id, identity
+
+
+def _set_image_inputs(data, image_sources):
+    if image_sources:
+        data["image_inputs"] = [{"message_id": source["message_id"]} for source in image_sources]
+    else:
+        data.pop("image_inputs", None)
+
+
+class _ImageContextMissing(InterpretationError):
+    def __init__(self, sources):
+        self.sources = list(sources)
+        super().__init__(code="image_context_missing", retryable=False)
 
 
 def safe_interpretation_reason(error):
@@ -952,25 +1015,30 @@ class CodexInterpreter:
         data = {"current_message": current, "context": history, "positions": [_position(position) for position in positions]}
         image_messages = [message] + [record for record in context[-60:]
             if record.get("id", record.get("message_id")) == message.get("reply_to") and message.get("reply_to") != current["id"]]
-        image_sources = collect_images(image_messages)
+        image_sources = _collect_image_sources(image_messages)
         if image_sources:
-            data["image_inputs"] = [{"message_id": source["message_id"]} for source in image_sources]
+            _set_image_inputs(data, image_sources)
         self.last_usage = self.last_authentication = self.last_model = None
         self.last_notices = []
 
         def validate(result):
             decision = validate_decision(result, current, history)
-            if decision.get("action") == "OPEN" and (decision.get("contract") or {}).get("expiry") == "nearest":
+            if decision.get("action") == "OPEN":
                 origin_id = decision.get("origin_message_id")
                 origins = [record for record in [*context[-60:], message]
                     if record.get("id", record.get("message_id")) == origin_id]
-                if origins and collect_images(origins[-1:]) and origin_id not in {source["message_id"] for source in image_sources}:
-                    raise InterpretationError("The original entry's pictures must be inspected before defaulting its expiry")
+                if origins:
+                    origin_sources = _collect_image_sources(origins[-1:])
+                    loaded = {_image_source_key(source) for source in image_sources}
+                    missing = [
+                        source for source in origin_sources
+                        if _image_source_key(source) not in loaded
+                    ]
+                    if missing:
+                        raise _ImageContextMissing(missing)
             return decision
 
-        options = {"validator": validate}
-        if image_sources:
-            options["image_sources"] = image_sources
+        options = {"validator": validate, "image_sources": image_sources}
         return await self._request(data, **options)
 
     async def assess_recovery(self, message: dict, context: list[dict], positions: list[dict], decision: dict, facts: dict) -> dict:
@@ -1000,9 +1068,8 @@ class CodexInterpreter:
         self.last_usage = self.last_authentication = self.last_model = None
         self.last_notices = []
         image_messages = [record for record in context if origin_id != current["id"] and record.get("id", record.get("message_id")) == origin_id] + [message]
-        image_sources = collect_images(image_messages)
-        if image_sources:
-            data["image_inputs"] = [{"message_id": source["message_id"]} for source in image_sources]
+        image_sources = _collect_image_sources(image_messages)
+        _set_image_inputs(data, image_sources)
         assessment = await self._request(
             data, schema=RECOVERY_SCHEMA, system_prompt=RECOVERY_SYSTEM_PROMPT,
             validator=lambda result: self._validate_recovery_result(result, current, history, decision),
@@ -1027,6 +1094,9 @@ class CodexInterpreter:
     async def _request(self, data, **options):
         # Publish on the event loop, including failures during background recovery.
         validator = options.pop("validator", None)
+        supplied_image_sources = options.get("image_sources")
+        image_sources = supplied_image_sources if isinstance(supplied_image_sources, list) else list(supplied_image_sources or ())
+        context_retry_used = False
         self.last_attempts = 0
         last_error = None
         for attempt in (1, 2):
@@ -1038,15 +1108,25 @@ class CodexInterpreter:
                 publish_status(self.on_status, "codex", "ready")
                 return result
             except Exception as exc:
-                if isinstance(exc, InterpretationError):
+                if isinstance(exc, ImageTransportError):
+                    error = _image_interpretation_error(exc)
+                elif isinstance(exc, InterpretationError):
                     error = exc
                 else:
                     error = InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False)
                 error.attempts = attempt
                 last_error = error
+                if isinstance(error, _ImageContextMissing) and not context_retry_used and attempt < 2:
+                    updated_sources = _merge_image_sources(image_sources, error.sources)
+                    if len(updated_sources) > len(image_sources):
+                        context_retry_used = True
+                        image_sources[:] = updated_sources
+                        options["image_sources"] = image_sources
+                        _set_image_inputs(data, image_sources)
+                        continue
                 if attempt >= 2 or not error.retryable:
                     break
-        if self.on_status and last_error is not None:
+        if self.on_status and last_error is not None and not last_error.code.startswith("image_"):
             state = "auth_required" if last_error.code == "auth_required" else "unavailable"
             publish_status(self.on_status, "codex", state)
         raise last_error
@@ -1084,8 +1164,10 @@ class CodexInterpreter:
             if image_sources:
                 try:
                     image_paths = download_images(image_sources, root)
-                except (ValueError, OSError):
-                    raise InterpretationError("Attached pictures could not be inspected; no expiry was assumed") from None
+                except ImageTransportError as error:
+                    raise _image_interpretation_error(error) from None
+                except (ValueError, OSError) as error:
+                    raise _image_interpretation_error(error) from None
                 for path in image_paths:
                     args.extend(["--image", str(path)])
             overrides = {

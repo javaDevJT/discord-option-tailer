@@ -16,6 +16,8 @@ function relayReadTimeoutSignal() {
     account: "/api/account",
   });
   const PAGE_SIZE = 25;
+  const expandedImagePreviews = new Set();
+  const failedImagePreviews = new Set();
   const STALE_AFTER_MS = 120_000;
   const RECOVERY_STATES = Object.freeze([
     ["recovery_pending", "Recovery pending"],
@@ -556,6 +558,55 @@ function relayReadTimeoutSignal() {
     }
   }
 
+  function renderMessageImages(body, message) {
+    const images = (Array.isArray(message.images) ? message.images : []).slice(0, 4)
+      .filter((item) => typeof item?.url === "string" && item.url.startsWith("/api/message-image?"));
+    if (!images.length) return;
+    const key = `${message.id}:${message.revision}`;
+    const details = node("details", "message-images");
+    append(details, node("summary", "", `${images.length} image${images.length === 1 ? "" : "s"}`));
+    const previews = node("div", "message-image-list");
+    append(details, previews);
+    const load = () => {
+      if (previews.hasChildNodes()) return;
+      images.forEach((item, index) => {
+        const link = node("a", "message-image-link");
+        link.href = item.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        const caption = node("span", "record-meta", `Open image ${index + 1}`);
+        append(link, caption);
+        if (failedImagePreviews.has(item.url)) {
+          caption.textContent = `Image ${index + 1} unavailable — open for details or retry`;
+        } else {
+          const image = node("img", "message-image");
+          image.alt = `Attachment ${index + 1}`;
+          image.loading = "lazy";
+          image.decoding = "async";
+          image.addEventListener("error", () => {
+            failedImagePreviews.add(item.url);
+            image.remove();
+            caption.textContent = `Image ${index + 1} unavailable — open for details or retry`;
+          });
+          image.src = item.url;
+          append(link, image);
+        }
+        append(previews, link);
+      });
+    };
+    details.addEventListener("toggle", () => {
+      if (details.open) {
+        expandedImagePreviews.add(key);
+        load();
+      } else {
+        expandedImagePreviews.delete(key);
+      }
+    });
+    details.open = expandedImagePreviews.has(key);
+    if (details.open) load();
+    append(body, details);
+  }
+
   function renderMessages() {
     const list = $("#message-list");
     if (!list) return;
@@ -591,6 +642,7 @@ function relayReadTimeoutSignal() {
         if (text) append(body, node("div", "message-embed", text));
       }
       if (!body.hasChildNodes()) append(body, node("p", "message-content", "(No text content recorded)"));
+      renderMessageImages(body, message);
       const revision = firstValue(message.revision, message.revision_id);
       if (revision !== undefined) append(body, node("p", "message-revision", `Revision ${revision}`));
 

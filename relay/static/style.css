@@ -953,6 +953,12 @@ h2 {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+.message-images { margin-top: 16px; }
+.message-images summary { cursor: pointer; color: var(--paper-100); }
+.message-image-list { display: grid; gap: 12px; margin-top: 12px; }
+.message-image-link { display: grid; gap: 6px; min-width: 0; }
+.message-image { max-width: 100%; max-height: 300px; object-fit: contain; border: 1px solid var(--line-strong); }
+
 .message-revision {
   margin-top: 0.72rem;
   color: var(--muted);

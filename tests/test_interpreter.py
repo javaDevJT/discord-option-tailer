@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from relay.interpreter import _record
+from relay.images import ImageTransportError
 
 from relay.interpreter import (
     DECISION_SCHEMA, RECOVERY_SCHEMA, CodexInterpreter, InterpretationError,
@@ -277,6 +278,154 @@ class InterpreterChecks(unittest.TestCase):
                 _strict_json(content)
 
 class CodexInterpreterChecks(unittest.TestCase):
+    def test_retryable_image_transport_failure_retries_once_then_succeeds(self):
+        message = MESSAGE | {"attachments": [{
+            "filename": "alert.png", "content_type": "image/png",
+            "url": "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/alert.png",
+        }]}
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory)
+            interpreter.on_status = events.append
+            with patch.object(interpreter, "_run_process", side_effect=self.response), patch(
+                "relay.interpreter.download_images",
+                side_effect=[ImageTransportError(code="image_network_error"), [Path(directory) / "alert.png"]],
+            ) as download:
+                result = asyncio.run(interpreter.interpret(message, [], []))
+        self.assertEqual(result, DECISION)
+        self.assertEqual(download.call_count, 2)
+        self.assertEqual(interpreter.last_attempts, 2)
+        self.assertEqual(events, [{"component": "codex", "state": "ready"}])
+
+    def test_permanent_image_failure_uses_exact_code_once_without_disconnect_status(self):
+        message = MESSAGE | {"attachments": [{
+            "filename": "alert.png", "content_type": "image/png",
+            "url": "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/alert.png",
+        }]}
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory)
+            interpreter.on_status = events.append
+            with patch.object(interpreter, "_run_process", side_effect=self.response), patch(
+                "relay.interpreter.download_images",
+                side_effect=ImageTransportError(code="image_not_found"),
+            ) as download:
+                with self.assertRaises(InterpretationError) as raised:
+                    asyncio.run(interpreter.interpret(message, [], []))
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual((raised.exception.code, raised.exception.attempts), ("image_not_found", 1))
+        self.assertEqual(str(raised.exception), "Image not found")
+        self.assertEqual(events, [])
+
+    def test_missing_older_origin_images_get_one_retry_with_added_sources(self):
+        origin = MESSAGE | {
+            "id": "origin",
+            "content": "Buy TSLA 352.5 put at .87",
+            "attachments": [{
+                "filename": "origin.png", "content_type": "image/png",
+                "url": "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/origin.png",
+            }],
+        }
+        context = [origin] + [dict(LATER, id=f"filler-{index}") for index in range(59)]
+        decision = DECISION | {
+            "origin_message_id": "origin",
+            "evidence": [
+                {"message_id": "origin", "quote": origin["content"]},
+                {"message_id": MESSAGE["id"], "quote": MESSAGE["content"]},
+            ],
+        }
+        observed = []
+
+        def model(data, **options):
+            observed.append((copy.deepcopy(data), list(options["image_sources"])))
+            return decision
+
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory)
+            with patch.object(interpreter, "_interpret", side_effect=model) as run:
+                result = asyncio.run(interpreter.interpret(MESSAGE, context, []))
+        self.assertEqual(result, decision)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(interpreter.last_attempts, 2)
+        self.assertEqual(observed[0][1], [])
+        self.assertIsNone(observed[0][0].get("image_inputs"))
+        self.assertEqual([source["message_id"] for source in observed[1][1]], ["origin"])
+        self.assertEqual(observed[1][0]["image_inputs"], [{"message_id": "origin"}])
+
+    def test_different_missing_origin_on_second_pass_stays_blocked_at_two_attempts(self):
+        origins = []
+        decisions = []
+        for index in ("a", "b"):
+            origin = MESSAGE | {
+                "id": f"origin-{index}",
+                "content": f"Buy TSLA 352.5 put from origin {index}",
+                "attachments": [{
+                    "filename": f"origin-{index}.png", "content_type": "image/png",
+                    "url": f"https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/origin-{index}.png",
+                }],
+            }
+            origins.append(origin)
+            decisions.append(DECISION | {
+                "origin_message_id": origin["id"],
+                "evidence": [
+                    {"message_id": origin["id"], "quote": origin["content"]},
+                    {"message_id": MESSAGE["id"], "quote": MESSAGE["content"]},
+                ],
+            })
+        observed = []
+
+        def model(data, **options):
+            observed.append((copy.deepcopy(data), list(options["image_sources"])))
+            return decisions[len(observed) - 1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory)
+            with patch.object(interpreter, "_interpret", side_effect=model) as run:
+                with self.assertRaises(InterpretationError) as raised:
+                    asyncio.run(interpreter.interpret(MESSAGE, origins, []))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(interpreter.last_attempts, 2)
+        self.assertEqual((raised.exception.code, raised.exception.attempts), ("image_context_missing", 2))
+        self.assertEqual([source["message_id"] for source in observed[1][1]], ["origin-a"])
+
+    def test_cli_image_order_matches_payload_message_ids(self):
+        origin = MESSAGE | {
+            "id": "origin",
+            "content": "Earlier TSLA alert",
+            "attachments": [{
+                "filename": "origin.png", "content_type": "image/png",
+                "url": "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/origin.png",
+            }],
+        }
+        message = MESSAGE | {
+            "reply_to": "origin",
+            "attachments": [{
+                "filename": "current.png", "content_type": "image/png",
+                "url": "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/current.png",
+            }],
+        }
+        captured = []
+
+        def execute(args, env, cwd, input_bytes=None):
+            if "exec" in args:
+                payload = json.loads(input_bytes)
+                image_args = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--image"]
+                captured.append((payload, image_args))
+            return self.response(args, env, cwd, input_bytes)
+
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory)
+            current_path = Path(directory) / "current.png"
+            origin_path = Path(directory) / "origin.png"
+            with patch.object(interpreter, "_run_process", side_effect=execute), patch(
+                "relay.interpreter.download_images", return_value=[current_path, origin_path],
+            ):
+                self.assertEqual(asyncio.run(interpreter.interpret(message, [origin], [])), DECISION)
+        self.assertEqual(len(captured), 1)
+        payload, image_args = captured[0]
+        self.assertEqual(payload["image_inputs"], [{"message_id": "new"}, {"message_id": "origin"}])
+        self.assertEqual(image_args, [str(current_path), str(origin_path)])
+
     def test_pictured_expiry_reaches_codex_without_signed_url_and_is_preserved(self):
         message = MESSAGE | {"content": "Buy TSLA 352.5 put at .87", "attachments": [{
             "filename": "alert.png", "content_type": "image/png",
@@ -298,8 +447,10 @@ class CodexInterpreterChecks(unittest.TestCase):
                 result = asyncio.run(instance.interpret(message, [], []))
             self.assertEqual(result["contract"]["expiry"], "2026-09-18")
             with patch.object(instance, "_run_process", side_effect=response), patch("relay.interpreter.download_images", side_effect=ValueError("unreadable")):
-                with self.assertRaisesRegex(InterpretationError, "no expiry was assumed"):
+                with self.assertRaises(InterpretationError) as raised:
                     asyncio.run(instance.interpret(message, [], []))
+                self.assertEqual(raised.exception.code, "image_input")
+                self.assertFalse(raised.exception.retryable)
 
     def interpreter(self, directory, **llm):
         home = Path(directory) / "source-home"

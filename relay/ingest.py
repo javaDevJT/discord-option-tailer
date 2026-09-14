@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from .images import attachment_identity, ImageTransportError
 from datetime import datetime, timezone
 
 
@@ -33,6 +34,19 @@ def _timestamp(value, field: str) -> str:
     if parsed.tzinfo is None:
         raise ValueError(f"{field} must include a timezone")
     return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _semantic_media(value):
+    if isinstance(value, dict):
+        return {key: _semantic_media(item) for key, item in value.items() if key != "proxy_url"}
+    if isinstance(value, list):
+        return [_semantic_media(item) for item in value]
+    if isinstance(value, str):
+        try:
+            return "https://cdn.discordapp.com" + attachment_identity(value)
+        except ImageTransportError:
+            pass
+    return value
 
 
 def normalize(raw: dict, channel_id: str | None = None) -> dict:
@@ -72,7 +86,7 @@ def normalize(raw: dict, channel_id: str | None = None) -> dict:
         "reply_to": _id(reply_to, "reply_to", optional=True) or None,
         "attachments": [
             {key: attachment[key] for key in
-             ("id", "filename", "url", "size", "content_type", "width", "height", "description")
+             ("id", "filename", "url", "proxy_url", "size", "content_type", "width", "height", "description")
              if key in attachment}
             for attachment in attachments
         ],
@@ -80,6 +94,12 @@ def normalize(raw: dict, channel_id: str | None = None) -> dict:
         "source": source,
     }
     semantic = {key: value for key, value in message.items() if key != "source"}
+    message["transport_revision"] = hashlib.sha256(
+        json.dumps(semantic, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                   allow_nan=False).encode("utf-8")
+    ).hexdigest()
+    semantic["attachments"] = _semantic_media(semantic["attachments"])
+    semantic["embeds"] = _semantic_media(semantic["embeds"])
     message["revision"] = hashlib.sha256(
         json.dumps(semantic, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
                    allow_nan=False).encode("utf-8")

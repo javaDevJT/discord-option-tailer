@@ -303,8 +303,17 @@ class Store:
                 self.db.execute("INSERT INTO metadata VALUES ('execution_binding', ?)", (binding,))
 
     def observe(self, message):
-        old = self.db.execute("SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()
+        old = self.db.execute("SELECT revision, body FROM messages WHERE id=?", (message["id"],)).fetchone()
         if old and old[0] == message["revision"]:
+            if message.get("transport_revision"):
+                stored = json.loads(old[1])
+                if stored.get("transport_revision") != message["transport_revision"]:
+                    for key in ("attachments", "embeds", "transport_revision"):
+                        if key in message:
+                            stored[key] = message[key]
+                    with self.db:
+                        self.db.execute("UPDATE messages SET body=? WHERE id=? AND revision=?",
+                                        (json.dumps(stored), message["id"], message["revision"]))
             return "same"
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?)", (
