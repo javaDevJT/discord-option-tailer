@@ -48,6 +48,15 @@ class Response:
 
 
 class ImageTests(unittest.TestCase):
+    def test_download_identifies_application_without_account_credentials(self):
+        with tempfile.TemporaryDirectory() as directory, patch("relay.images._open_url", return_value=Response(PNG)) as opening:
+            download_images([{"message_id": "123", "url": URL}], directory)
+        request = opening.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"),
+                         "DiscordOptionTailer/0.1 (+https://github.com/javaDevJT/discord-option-tailer)")
+        self.assertFalse(request.has_header("Authorization"))
+        self.assertFalse(request.has_header("Cookie"))
+
     def assert_transport(self, context, code, *, retryable=None):
         with self.assertRaises(ImageTransportError) as raised:
             context()

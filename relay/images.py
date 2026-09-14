@@ -367,7 +367,10 @@ def _download_one(url: str, target: Path, index: int, budget: int, deadline: flo
     try:
         if deadline - time.monotonic() <= 0:
             raise _error("image_timeout")
-        request = Request(url, headers={"Accept": ",".join(_MEDIA_SUFFIXES)})
+        request = Request(url, headers={
+            "Accept": ",".join(_MEDIA_SUFFIXES),
+            "User-Agent": "DiscordOptionTailer/0.1 (+https://github.com/javaDevJT/discord-option-tailer)",
+        })
         try:
             response = _open_url(
                 request,
