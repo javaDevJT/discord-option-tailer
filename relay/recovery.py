@@ -146,7 +146,7 @@ class RecoveryEvaluator:
                 if not entry_chase_within_cap(evaluation):
                     blockers.append(entry_chase_reason("Current ask or rounded limit exceeds permitted chase from the original alert premium", evaluation))
                 if snapshot is not None:
-                    quantity, _ = entry_size(engine.config["risk"], snapshot, contract, decision["confidence"], ask, message["source_group"])
+                    quantity, _ = entry_size(engine.config["risk"], snapshot, contract, decision["confidence"], limit, message["source_group"])
                     facts["affordable_quantity"] = quantity
         except Hold as exc:
             blockers.append(str(exc))

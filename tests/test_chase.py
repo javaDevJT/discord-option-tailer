@@ -115,3 +115,17 @@ class ChaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("evaluated ask=$1.14", blockers)
         self.assertIn("limit deviation=+20%", blockers)
         self.assertEqual(self.broker.submissions, [])
+
+    async def test_recovery_affordability_uses_rounded_limit(self):
+        self.prices("1.14", ".10")
+        self.config["risk"].update(max_chase_fraction=".25", entry_risk_min_fraction=".10",
+                                   entry_risk_max_fraction=".10", buying_power_reserve_fraction="0",
+                                   fee_reserve_per_contract="0")
+        self.broker.account["buying_power"] = "117"
+        message = self.message()
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        decision = await self.interpreter.interpret(message, [], [])
+        facts = await RecoveryEvaluator(self.engine).facts(message, decision)
+        self.assertIn("one whole contract", " ".join(facts["blockers"]))
+        self.assertIsNone(facts.get("affordable_quantity"))
+        self.assertEqual(self.broker.submissions, [])
