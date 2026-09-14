@@ -1,6 +1,7 @@
 """Offline checks only: every Robinhood response is supplied by a local fake."""
 import copy
 from datetime import datetime, timezone
+from decimal import Decimal
 import importlib.util
 import unittest
 from unittest.mock import AsyncMock
@@ -25,7 +26,9 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             "ask_size": 10, "mark_price": "0.975", "updated_at": self.now.isoformat()}
         self.account = {"account_number": "TEST0001", "agentic_allowed": True, "state": "active", "deactivated": False,
             "permanently_deactivated": False, "option_level": "option_level_2", "type": "cash"}
-        self.portfolio = {"total_value": "1000", "equity_value": "20", "currency": "USD",
+        self.portfolio = {"total_value": "1000", "equity_value": "20", "options_value": "0",
+            "futures_value": "0", "event_contracts_value": "0", "crypto_value": "0", "cash": "20",
+            "pending_deposits": "0", "mutual_funds_value": "0", "fixed_income_value": "0", "currency": "USD",
             "buying_power": {"buying_power": "900", "unleveraged_buying_power": "800", "display_currency": "USD"}}
         self.positions, self.orders, self.calls = [], [], []
         self.review_alert = {}
@@ -84,6 +87,95 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.instrument["strike_price"] = "501"
         with self.assertRaisesRegex(BrokerError, "missing or ambiguous"):
             await self.broker.quote(self.contract)
+
+    async def test_account_overview_projects_negative_short_adjusted_and_stale(self):
+        self.positions = [{
+            "option_id": self.instrument["id"],
+            "quantity": "2",
+            "type": "short",
+            "trade_value_multiplier": "150",
+            "average_price": "-120",
+        }]
+        self.quote["updated_at"] = "2026-09-01T15:00:00+00:00"
+
+        overview = await self.broker.account_overview()
+
+        self.assertEqual(overview["currency"], "USD")
+        self.assertEqual(overview["equity"], "1000")
+        self.assertEqual(overview["cash"], "20")
+        self.assertEqual(overview["buying_power"], "900")
+        self.assertEqual(overview["unleveraged_buying_power"], "800")
+        position = overview["positions"][0]
+        self.assertEqual(position["position_type"], "short")
+        self.assertEqual(position["quantity"], "2")
+        self.assertEqual(position["average_price"], "-0.8")
+        self.assertEqual(Decimal(position["market_value"]), Decimal("-292.500"))
+        self.assertEqual(position["multiplier"], "150")
+        self.assertEqual(position["quote_timestamp"], self.quote["updated_at"])
+
+    async def test_account_overview_keeps_position_when_quote_unavailable_and_propagates_auth(self):
+        self.positions = [{
+            "option_id": self.instrument["id"],
+            "quantity": "1",
+            "type": "long",
+            "trade_value_multiplier": "100",
+            "average_price": "120",
+        }]
+        self.broker._raw_quote = AsyncMock(side_effect=BrokerError("quote unavailable"))
+        overview = await self.broker.account_overview()
+        self.assertEqual(len(overview["positions"]), 1)
+        self.assertIsNone(overview["positions"][0]["market_value"])
+        self.assertIsNone(overview["positions"][0]["quote_timestamp"])
+
+        self.broker._raw_quote = AsyncMock(
+            side_effect=BrokerError("Robinhood authorization required")
+        )
+        with self.assertRaisesRegex(BrokerError, "authorization"):
+            await self.broker.account_overview()
+
+    async def test_account_changed_only_tracks_actual_submission_and_changed_status(self):
+        result = await self.broker.submit(self.order)
+        self.assertTrue(self.broker.account_changed.is_set())
+
+        self.broker.account_changed.clear()
+        self.assertEqual(result, await self.broker.submit(self.order))
+        self.order["entry_evaluation"] = {"ask": "1.14", "ask_deviation_percent": "+14"}
+        self.assertEqual(result, await self.broker.submit(self.order))
+        with self.assertRaisesRegex(BrokerError, "reused"):
+            await self.broker.submit(self.order | {"quantity": 2})
+        self.assertFalse(self.broker.account_changed.is_set())
+
+        self.broker.account_changed.clear()
+        await self.broker.order_status(result["id"])
+        self.assertTrue(self.broker.account_changed.is_set())
+        self.orders[0]["state"] = "partially_filled"
+        self.orders[0]["processed_quantity"] = "0"
+        self.orders[0]["processed_premium"] = "0"
+        self.broker.account_changed.clear()
+        await self.broker.order_status(result["id"])
+        self.assertTrue(self.broker.account_changed.is_set())
+
+        self.broker.account_changed.clear()
+        await self.broker.order_status(result["id"])
+        self.assertFalse(self.broker.account_changed.is_set())
+
+    async def test_account_changed_marks_unknown_submission_but_not_preflight_hold(self):
+        self.broker.account_changed.clear()
+        self.place_error = True
+        with self.assertRaises(TimeoutError):
+            await self.broker.submit(dict(self.order, client_order_id="unknown-result"))
+        self.assertTrue(self.broker.account_changed.is_set())
+
+        self.broker.account_changed.clear()
+        async def block_before_submit(snapshot, quote):
+            raise ValueError("fixture changed")
+
+        with self.assertRaises(BrokerPreflightHold):
+            await self.broker.submit(
+                dict(self.order, client_order_id="preflight-hold"),
+                before_submit=block_before_submit,
+            )
+        self.assertFalse(self.broker.account_changed.is_set())
 
     async def test_captured_blank_underlying_symbol_is_verified_without_url_fetch(self):
         # Sanitized shape of the actual SPY chain response observed on 2026-09-06.

@@ -701,6 +701,7 @@ class RobinhoodBroker(RobinhoodMCP):
         self.order_bodies = {}
         self.order_results = {}
         self.attempted = set()
+        self.account_changed = asyncio.Event()
 
     def _qualified(self, name):
         tool = self.catalog.get(name)
@@ -793,6 +794,142 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Option quote is missing or ambiguous")
         _instant(matches[0]["updated_at"])
         return matches[0]
+
+    async def account_overview(self):
+        """Return display-only account balances and option positions.
+
+        This deliberately does not use the trading snapshot: closed markets,
+        stale quotes, negative balances, and short or adjusted positions are
+        valid account display states.
+        """
+        portfolio, positions = await asyncio.gather(
+            self._data("get_portfolio", {"account_number": self.account_number}),
+            self._pages(
+                "get_option_positions",
+                {"account_number": self.account_number, "nonzero": True},
+                "positions",
+            ),
+        )
+        if portfolio.get("currency") != "USD":
+            raise BrokerError("Robinhood account overview requires USD currency")
+
+        def display_decimal(value, field):
+            try:
+                result = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                raise BrokerError(f"Invalid {field}") from None
+            if not result.is_finite():
+                raise BrokerError(f"Invalid {field}")
+            return result
+
+        def display_string(value, field):
+            return format(display_decimal(value, field), "f")
+
+        power = portfolio.get("buying_power")
+        buying_power = unleveraged_buying_power = None
+        if power is not None:
+            if not isinstance(power, dict) or power.get("display_currency") != "USD":
+                raise BrokerError("Robinhood account overview requires USD buying power")
+            buying_power = display_string(power.get("buying_power"), "buying power")
+            unleveraged_buying_power = display_string(
+                power.get("unleveraged_buying_power"), "unleveraged buying power"
+            )
+
+        asset_names = (
+            "equity_value",
+            "options_value",
+            "futures_value",
+            "event_contracts_value",
+            "crypto_value",
+            "mutual_funds_value",
+            "fixed_income_value",
+        )
+        asset_values = {
+            name: display_string(portfolio.get(name), name) for name in asset_names
+        }
+
+        normalized = []
+        for position in positions:
+            quantity = display_decimal(position.get("quantity"), "position quantity")
+            if quantity < 0 or quantity != quantity.to_integral_value():
+                raise BrokerError("Invalid option position quantity")
+            if not quantity:
+                continue
+            position_type = position.get("type")
+            if position_type not in {"long", "short"}:
+                raise BrokerError("Invalid option position type")
+            multiplier = display_decimal(
+                position.get("trade_value_multiplier"), "position multiplier"
+            )
+            if multiplier <= 0:
+                raise BrokerError("Invalid position multiplier")
+
+            instrument = await self._instrument(position["option_id"])
+            contract = {
+                "symbol": instrument.get("chain_symbol") or position.get("chain_symbol"),
+                "expiry": instrument.get("expiration_date"),
+                "strike": instrument.get("strike_price"),
+                "option_type": instrument.get("type"),
+            }
+            _contract_key(contract)
+
+            average_price = display_decimal(
+                position.get("average_price"), "position average price"
+            ) / multiplier
+            market_value = None
+            quote_timestamp = None
+            try:
+                quote = await self._raw_quote(position["option_id"])
+            except Exception as exc:
+                if is_auth_required(exc):
+                    raise
+            else:
+                quote_timestamp = quote.get("updated_at")
+                mark_value = quote.get("mark_price")
+                if mark_value is None:
+                    mark_value = quote.get("adjusted_mark_price")
+                if mark_value is None:
+                    try:
+                        bid = display_decimal(quote.get("bid_price"), "option bid")
+                        ask = display_decimal(quote.get("ask_price"), "option ask")
+                        if bid >= 0 and ask >= 0 and (bid or ask):
+                            mark_value = (bid + ask) / Decimal(2)
+                    except BrokerError:
+                        mark_value = None
+                if mark_value is not None:
+                    try:
+                        mark = display_decimal(mark_value, "option mark")
+                        if mark < 0:
+                            raise BrokerError("Invalid option mark")
+                        value = mark * multiplier * quantity
+                        if position_type == "short":
+                            value = -value
+                        market_value = format(value, "f")
+                    except BrokerError:
+                        market_value = None
+
+            normalized.append(
+                {
+                    "contract": contract,
+                    "quantity": format(quantity, "f"),
+                    "average_price": format(average_price, "f"),
+                    "market_value": market_value,
+                    "position_type": position_type,
+                    "multiplier": format(multiplier, "f"),
+                    "quote_timestamp": quote_timestamp,
+                }
+            )
+
+        return {
+            "currency": "USD",
+            "equity": display_string(portfolio.get("total_value"), "total equity"),
+            "cash": display_string(portfolio.get("cash"), "cash"),
+            "buying_power": buying_power,
+            "unleveraged_buying_power": unleveraged_buying_power,
+            "asset_values": asset_values,
+            "positions": normalized,
+            "scope": "option_positions",
+        }
 
     async def snapshot(self):
         observed_at = self.clock()
@@ -1039,7 +1176,8 @@ class RobinhoodBroker(RobinhoodMCP):
         client_id = order.get("client_order_id")
         if not isinstance(client_id, str) or not client_id:
             raise BrokerError("A persistent client_order_id is required")
-        body = json.dumps(dict(order, contract=_contract_key(order.get("contract")),
+        # A later quote observation does not change the economic order identity.
+        body = json.dumps(dict({key: value for key, value in order.items() if key != "entry_evaluation"}, contract=_contract_key(order.get("contract")),
             limit_price=str(_decimal(order.get("limit_price"), "limit price").normalize())), sort_keys=True, separators=(",", ":"))
         if client_id in self.order_bodies and self.order_bodies[client_id] != body:
             raise BrokerError("client_order_id was reused with different order details")
@@ -1079,7 +1217,10 @@ class RobinhoodBroker(RobinhoodMCP):
             except Exception as exc:
                 raise BrokerPreflightHold("Final dispatch validation held this order; nothing was submitted") from None
         self.attempted.add(client_id)
-        result = await self._data("place_option_order", dict(args, ref_id=ref_id))
+        try:
+            result = await self._data("place_option_order", dict(args, ref_id=ref_id))
+        finally:
+            self.account_changed.set()
         normalized = self._order_result(result.get("order"), client_id, args)
         normalized["ref_id"] = ref_id
         self.order_results[client_id] = normalized
@@ -1122,6 +1263,12 @@ class RobinhoodBroker(RobinhoodMCP):
         rows = await self._pages("get_option_orders", {"account_number": self.account_number, "order_id": broker_id}, "orders")
         if len(rows) != 1 or rows[0]["id"] != broker_id:
             raise BrokerError("Broker order could not be reconciled on the bound account")
+        previous = self.order_results.get(order_id)
         result = self._order_result(rows[0], order_id)
         self.order_results[order_id] = result
+        if previous is None or (
+            result["filled_quantity"] != previous.get("filled_quantity")
+            or result["status"] != previous.get("status")
+        ):
+            self.account_changed.set()
         return result

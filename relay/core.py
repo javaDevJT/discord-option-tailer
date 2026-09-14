@@ -58,6 +58,48 @@ def money(value, *, positive=False):
         raise Hold("invalid monetary value") from exc
 
 
+def _decimal_text(value, *, signed=False):
+    text = format(Decimal(value).normalize(), "f")
+    if text in {"", "-0"}:
+        text = "0"
+    if signed and not text.startswith("-"):
+        text = "+" + text
+    return text
+
+
+def entry_chase_evaluation(ask, reference_price, limit_price, max_chase_fraction):
+    """Return finite decimal diagnostics for the bounded entry premium check."""
+    ask = money(ask, positive=True)
+    reference_price = money(reference_price, positive=True)
+    limit_price = money(limit_price, positive=True)
+    max_chase_fraction = money(max_chase_fraction)
+    return {
+        "ask": _decimal_text(ask),
+        "reference_price": _decimal_text(reference_price),
+        "ask_deviation_percent": _decimal_text((ask - reference_price) / reference_price * 100, signed=True),
+        "limit_price": _decimal_text(limit_price),
+        "limit_deviation_percent": _decimal_text((limit_price - reference_price) / reference_price * 100, signed=True),
+        "max_chase_percent": _decimal_text(max_chase_fraction * 100),
+    }
+
+
+def entry_chase_within_cap(evaluation):
+    ceiling = money(evaluation["reference_price"], positive=True) * (1 + money(evaluation["max_chase_percent"]) / 100)
+    return money(evaluation["ask"], positive=True) <= ceiling and money(evaluation["limit_price"], positive=True) <= ceiling
+
+
+def entry_chase_reason(prefix, evaluation):
+    if not evaluation:
+        return prefix
+    return (
+        f"{prefix}; evaluated ask=${evaluation['ask']}, reference=${evaluation['reference_price']}, "
+        f"ask deviation={evaluation['ask_deviation_percent']}%, "
+        f"limit={evaluation['limit_price']}, limit deviation={evaluation['limit_deviation_percent']}%, "
+        f"cap={evaluation['max_chase_percent']}%"
+    )
+
+
+
 def canonical_contract(value):
     if not isinstance(value, dict) or set(value) != {"symbol", "expiry", "strike", "option_type"}:
         raise Hold("an exact option contract is required")
@@ -454,6 +496,14 @@ class Engine:
                 if ask < bid or (ask - bid) / ask > money(self.config["risk"]["max_spread_fraction"]):
                     raise Hold("reviewed quote spread exceeds the configured limit")
                 if order["side"] == "buy":
+                    evaluation = entry_chase_evaluation(ask, decision["alert_price"], order["limit_price"], self.config["risk"]["max_chase_fraction"])
+                    decision["entry_evaluation"] = order["entry_evaluation"] = evaluation
+                    # Notifications read the durable order reserved before broker review.
+                    with self.store.db:
+                        self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
+                                              (json.dumps(order), order["client_order_id"]))
+                    if not entry_chase_within_cap(evaluation):
+                        raise Hold(entry_chase_reason("current ask exceeds permitted chase during broker review", evaluation))
                     quantity, _ = entry_size(self.config["risk"], snapshot, order["contract"], decision["confidence"], order["limit_price"], message["source_group"])
                     if quantity < order["quantity"]:
                         raise Hold("available account risk capacity fell during broker review")
@@ -531,7 +581,7 @@ class Engine:
                 order = await self.plan(message, decision)
                 await self.verify_dispatch(message, decision, order)
                 if self.mode == "shadow":
-                    return self.store.record(message, "shadow_order", "account-sized proposal; no order submitted",
+                    return self.store.record(message, "shadow_order", entry_chase_reason("account-sized proposal; no order submitted", decision.get("entry_evaluation")),
                                              decision | {"order_proposal": order})
                 self.store.reserve(message, decision, order, self.clock())
                 try:
@@ -542,13 +592,17 @@ class Engine:
                     self.store.apply_result(order["client_order_id"], result)
                 except BrokerPreflightHold as exc:
                     self.store.reject_before_submission(order["client_order_id"])
-                    return self.store.record(message, "held", "no order submitted: " + str(exc), decision | {"order_proposal": order})
+                    evaluation = decision.get("entry_evaluation")
+                    reason = "no order submitted: " + str(exc)
+                    if evaluation and not entry_chase_within_cap(evaluation):
+                        reason = "no order submitted: current ask or rounded limit exceeds permitted chase during broker review"
+                    return self.store.record(message, "held", entry_chase_reason(reason, evaluation), decision | {"order_proposal": order})
                 except Exception:
                     self.store.mark_unknown(order["client_order_id"])
                     return self.store.record(message, "unknown", "submission or fill result is uncertain; all new orders are blocked pending reconciliation", decision)
                 state = "paper_order" if self.mode == "paper" else "broker_order"
                 label = "simulated order: " if self.mode == "paper" else "broker order: "
-                return self.store.record(message, state, label + result["status"], decision | {"order_proposal": order})
+                return self.store.record(message, state, entry_chase_reason(label + result["status"], decision.get("entry_evaluation")), decision | {"order_proposal": order})
             except Hold as exc:
                 return self.store.record(message, "held", str(exc), decision)
             except InterpretationError as exc:
@@ -641,8 +695,10 @@ class Engine:
         sizing = None
         if action == "OPEN":
             reference = money(decision.get("alert_price"), positive=True)
-            if price > reference * (1 + money(risk["max_chase_fraction"])):
-                raise Hold("current ask exceeds the permitted chase from the alert premium")
+            evaluation = entry_chase_evaluation(ask, reference, price, risk["max_chase_fraction"])
+            decision["entry_evaluation"] = evaluation
+            if not entry_chase_within_cap(evaluation):
+                raise Hold(entry_chase_reason("current ask or rounded limit exceeds permitted chase from alert premium", evaluation))
             qty, sizing = entry_size(risk, snapshot, contract, decision["confidence"], price, message["source_group"])
         self.check_quote_age(quote, self.clock())
         identity = message["id"] + ":" + message["revision"]
@@ -652,6 +708,7 @@ class Engine:
                      signal_fingerprint=signal_fingerprint)
         if sizing:
             order["sizing"] = sizing
+            order["entry_evaluation"] = decision["entry_evaluation"]
         return order
 
     def check_quote_age(self, quote, now, label="option quote"):

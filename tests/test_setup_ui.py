@@ -1052,6 +1052,27 @@ class SetupUITests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_initial_setup_poll_preserves_dirty_channel_draft(self):
+        state = {
+            "status": self.status_payload(),
+            "headers": [],
+            "requests": [],
+            "discovery_requests": [],
+            "hold_next_setup": True,
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                name = page.locator('[data-channel-index="0"] input[data-channel-field="name"]')
+                name.fill("Draft before initial status")
+                self.assertIn("held_setup", state)
+                route, held_status = state.pop("held_setup")
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(held_status))
+                page.wait_for_timeout(250)
+                expect(name).to_have_value("Draft before initial status")
+            finally:
+                browser.close()
+
 
 if __name__ == "__main__":
     unittest.main()

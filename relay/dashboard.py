@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import json
 import math
 from pathlib import Path
@@ -10,6 +11,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from .account import AUTH_ERROR, CACHE_KEY, REFRESH_ERROR, REFRESH_SECONDS
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -33,7 +35,7 @@ ORDER_STATUSES = frozenset({
 EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
-    "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery",
+    "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
 )
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
@@ -112,6 +114,15 @@ def _project_contract(value):
     return result
 
 
+def _account_money(value):
+    if not isinstance(value, (str, int)) or isinstance(value, bool) or len(str(value)) > 100:
+        return None
+    try:
+        return str(value) if Decimal(str(value)).is_finite() else None
+    except InvalidOperation:
+        return None
+
+
 def _project_embeds(value):
     """Keep display text and metadata; attachment URLs and arbitrary fields stay private."""
     result = []
@@ -151,9 +162,19 @@ def _project_sizing(value):
     return {key: _safe_scalar(sizing[key], 256) for key in SIZING_FIELDS if key in sizing and _safe_scalar(sizing[key], 256) is not None}
 
 
+def _project_entry_evaluation(value):
+    evaluation = _json_object(value)
+    return {key: number for key in (
+        "ask", "reference_price", "ask_deviation_percent", "limit_price",
+        "limit_deviation_percent", "max_chase_percent",
+    ) if (number := _account_money(evaluation.get(key))) is not None}
+
+
 def _project_order_proposal(value):
     order = _json_object(value)
     result = {}
+    if "entry_evaluation" in order:
+        result["entry_evaluation"] = _project_entry_evaluation(order["entry_evaluation"])
     for key in ("client_order_id", "side", "quantity", "limit_price", "position_effect", "quote_timestamp", "account_timestamp", "signal_fingerprint"):
         if key not in order:
             continue
@@ -296,6 +317,8 @@ def _project_decision(value):
             result[key] = _project_order_proposal(current)
         elif key == "recovery":
             result[key] = _project_recovery(current)
+        elif key == "entry_evaluation":
+            result[key] = _project_entry_evaluation(current)
         elif key in {"action", "origin_message_id", "reason"}:
             result[key] = _safe_text(current, 4000 if key == "reason" else 128)
         elif key in {"quantity"}:
@@ -371,6 +394,7 @@ def _project_order(row, mode):
         "account_timestamp": _safe_text(body.get("account_timestamp"), 128),
         "mode": mode,
         "sizing": _project_sizing(body.get("sizing")),
+        "entry_evaluation": _project_entry_evaluation(body.get("entry_evaluation")),
     }
     return result
 
@@ -757,6 +781,49 @@ class DashboardApp:
         result, _ = self._ledger(config, read, {"items": []})
         return result
 
+    def account(self):
+        """Project persisted account data without any provider calls."""
+        config = self.snapshot()
+
+        def read(connection, tables):
+            if "metadata" not in tables or config["mode"] == "paper":
+                return {}
+            row = connection.execute("SELECT value FROM metadata WHERE key=?", (CACHE_KEY,)).fetchone()
+            value = _json_object(row[0]) if row else {}
+            section = config["raw"].get("robinhood")
+            account = section.get("account_number") if isinstance(section, dict) else None
+            return value if isinstance(account, str) and account and value.get("account_id") == account else {}
+
+        cached, _ = self._ledger(config, read, {})
+        updated_at = _safe_timestamp(cached.get("updated_at"))
+        error = cached.get("error")
+        error = error if error in (AUTH_ERROR, REFRESH_ERROR) else None
+        available = updated_at is not None and cached.get("currency") == "USD" and _account_money(cached.get("equity")) is not None
+        age = (datetime.now(UTC) - _parse_iso(updated_at)).total_seconds() if available else None
+        positions = []
+        for item in _json_list(cached.get("positions")):
+            if not isinstance(item, dict):
+                continue
+            positions.append({
+                "contract": _project_contract(item.get("contract")),
+                **{key: _account_money(item.get(key)) for key in ("quantity", "average_price", "market_value", "multiplier")},
+                "position_type": item.get("position_type") if item.get("position_type") in ("long", "short") else None,
+                "quote_timestamp": _safe_timestamp(item.get("quote_timestamp")),
+            })
+        assets = _json_object(cached.get("asset_values"))
+        return {
+            "available": available, "status": "error" if error else "ready" if available else "unavailable",
+            "updated_at": updated_at, "last_attempt_at": _safe_timestamp(cached.get("last_attempt_at")),
+            "error": error, "stale": not available or bool(error) or age < 0 or age >= REFRESH_SECONDS,
+            "currency": "USD", "scope": "option_positions", "refresh_interval_seconds": REFRESH_SECONDS,
+            **{key: _account_money(cached.get(key)) if available else None for key in ("equity", "cash", "buying_power", "unleveraged_buying_power")},
+            "asset_values": {key: _account_money(assets.get(key)) for key in (
+                "equity_value", "options_value", "futures_value", "event_contracts_value",
+                "crypto_value", "mutual_funds_value", "fixed_income_value",
+            )} if available else {},
+            "positions": positions if available else [],
+        }
+
     def static_file(self, request_path):
         if request_path == "/":
             relative = "index.html"
@@ -964,6 +1031,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if parsed.query:
                     raise QueryError("positions does not accept query parameters")
                 self._json(200, self.app.positions(), api=True, head=head)
+                return
+            if path == "/api/account":
+                if parsed.query:
+                    raise QueryError("account does not accept query parameters")
+                self._json(200, self.app.account(), api=True, head=head)
                 return
             if path.startswith("/api/"):
                 self._json(404, {"error": "not found"}, api=True, head=head)

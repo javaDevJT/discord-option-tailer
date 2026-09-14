@@ -89,6 +89,8 @@ def seed_dashboard(base, template):
                 body = dict(client_order_id="demo-order", contract=contract, side="buy", quantity=1,
                             limit_price="0.50", position_effect="open", mode="paper",
                             sizing={"budget": "75", "risk_fraction": "0.075", "method": "confidence_allocation_cap"})
+                body["entry_evaluation"] = {"ask": "0.50", "reference_price": "0.48", "ask_deviation_percent": "4.1667",
+                                            "limit_price": "0.50", "limit_deviation_percent": "4.1667", "max_chase_percent": "15"}
                 store.reserve(message, decision, body, datetime.now(timezone.utc))
                 with store.db:
                     store.db.execute("UPDATE orders SET status='filled',broker_id='paper-demo',filled_quantity=1,filled_notional='50' WHERE id='demo-order'")
@@ -136,6 +138,8 @@ class DashboardUITests(unittest.TestCase):
                     self.assertEqual(failed_event.locator(".event-action").text_content(), "Evaluation failed")
                     self.assertIn("SPY", page.locator("#orders-shell").inner_text())
                     self.assertIn("filled", page.locator("#orders-shell").inner_text().lower())
+                    self.assertIn("Evaluated ask $0.50", page.locator("#orders-shell").inner_text())
+                    self.assertIn("+4.1667% vs alert", page.locator("#orders-shell").inner_text())
                     self.assertIn("SPY", page.locator("#positions-shell").inner_text())
                     self.assertEqual(page.locator("#messages-shell img").count(), 0)
                     embeds = page.locator("#messages-shell .message-embed")

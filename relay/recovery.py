@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from decimal import ROUND_CEILING
 from pathlib import Path
 
-from .core import EASTERN, Hold, canonical_contract, channel_allows_author, entry_size, instant, money
+from .core import EASTERN, Hold, canonical_contract, channel_allows_author, entry_size, instant, money, entry_chase_evaluation, entry_chase_reason, entry_chase_within_cap
 from .interpreter import safe_interpretation_reason
 
 
@@ -138,8 +139,12 @@ class RecoveryEvaluator:
                 blockers.append("Current option spread exceeds the configured limit")
             if decision["action"] == "OPEN":
                 reference = money(decision.get("alert_price"), positive=True)
-                if ask > reference * (1 + money(engine.config["risk"]["max_chase_fraction"])):
-                    blockers.append("Current ask exceeds the permitted chase from the original alert premium")
+                tick = money(quote.get("tick_size"), positive=True)
+                limit = (ask / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+                evaluation = entry_chase_evaluation(ask, reference, limit, engine.config["risk"]["max_chase_fraction"])
+                decision["entry_evaluation"] = evaluation
+                if not entry_chase_within_cap(evaluation):
+                    blockers.append(entry_chase_reason("Current ask or rounded limit exceeds permitted chase from the original alert premium", evaluation))
                 if snapshot is not None:
                     quantity, _ = entry_size(engine.config["risk"], snapshot, contract, decision["confidence"], ask, message["source_group"])
                     facts["affordable_quantity"] = quantity

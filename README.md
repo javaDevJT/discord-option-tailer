@@ -6,6 +6,8 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 
 ## Project index
 
+The [account monitoring guide](docs/container.md#account-balances-and-holdings) explains cached balances, account option holdings, and refresh timing.
+
 - [Container setup and dashboard](docs/container.md): start the service and complete Discord, Codex, Robinhood, notification, and trading-mode setup in the frontend.
 - [TrueNAS deployment](docs/truenas.md): deploy the published image with persistent private storage.
 - [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.

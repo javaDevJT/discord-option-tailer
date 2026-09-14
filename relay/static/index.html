@@ -26,10 +26,11 @@
         <nav class="side-nav" aria-label="Sections">
           <a class="side-nav-link is-active" href="#overview"><span class="nav-index">01</span><span>Overview</span></a>
           <a class="side-nav-link" href="#setup"><span class="nav-index">02</span><span>Setup</span></a>
-          <a class="side-nav-link" href="#messages"><span class="nav-index">03</span><span>Messages</span></a>
-          <a class="side-nav-link" href="#orders"><span class="nav-index">04</span><span>Recorded orders</span></a>
-          <a class="side-nav-link" href="#positions"><span class="nav-index">05</span><span>Relay positions</span></a>
-          <a class="side-nav-link" href="#events"><span class="nav-index">06</span><span>Decision trail</span></a>
+          <a class="side-nav-link" href="#account"><span class="nav-index">03</span><span>Account snapshot</span></a>
+          <a class="side-nav-link" href="#messages"><span class="nav-index">04</span><span>Messages</span></a>
+          <a class="side-nav-link" href="#orders"><span class="nav-index">05</span><span>Recorded orders</span></a>
+          <a class="side-nav-link" href="#positions"><span class="nav-index">06</span><span>Relay positions</span></a>
+          <a class="side-nav-link" href="#events"><span class="nav-index">07</span><span>Decision trail</span></a>
         </nav>
 
         <div class="sidebar-spacer"></div>
@@ -429,6 +430,144 @@
               <p id="runtime-broker-detail">No broker state yet.</p>
             </article>
           </div>
+        </section>
+
+        <section class="panel-section account-section" id="account" aria-labelledby="account-title">
+
+          <div class="section-heading">
+
+            <div>
+
+              <p class="eyebrow">03 / BROKER SNAPSHOT</p>
+
+              <h2 id="account-title">Robinhood account</h2>
+
+              <p class="section-lede">Cached account values refresh hourly or after a broker action. Detailed positions below are options only.</p>
+
+            </div>
+
+            <span class="section-stamp section-stamp-green" id="account-scope-stamp">OPTION POSITIONS</span>
+
+          </div>
+
+          <div class="account-shell">
+
+            <article class="account-summary" aria-live="polite">
+
+              <div class="account-status-row">
+
+                <span class="status-pill is-context" id="account-status">Loading</span>
+
+                <span class="muted-label" id="account-updated">Waiting for account snapshot</span>
+
+              </div>
+
+              <p class="account-status-detail" id="account-status-detail">The cached Robinhood account snapshot is loading.</p>
+
+              <div class="account-metric-grid" aria-label="Robinhood account values">
+
+                <div class="account-metric account-metric-primary">
+
+                  <span class="field-label">Account equity</span>
+
+                  <strong id="account-equity">—</strong>
+
+                </div>
+
+                <div class="account-metric">
+
+                  <span class="field-label">Cash</span>
+
+                  <strong id="account-cash">—</strong>
+
+                </div>
+
+                <div class="account-metric">
+
+                  <span class="field-label">Buying power</span>
+
+                  <strong id="account-buying-power">—</strong>
+
+                </div>
+
+                <div class="account-metric">
+
+                  <span class="field-label">Unleveraged buying power</span>
+
+                  <strong id="account-unleveraged-buying-power">—</strong>
+
+                </div>
+
+              </div>
+
+              <div class="account-assets" id="account-assets" hidden>
+
+                <div class="account-subheading">Reported asset values</div>
+
+                <div class="account-asset-grid" id="account-asset-values"></div>
+
+                <p class="account-asset-note">Broker portfolio summary by asset class; detailed holdings here are limited to options.</p>
+
+              </div>
+
+            </article>
+
+            <article class="account-positions-panel">
+
+              <div class="account-positions-heading">
+
+                <div>
+
+                  <p class="eyebrow">OPTION POSITIONS</p>
+
+                  <h3>Broker option positions</h3>
+
+                </div>
+
+                <span class="muted-label" id="account-position-count">—</span>
+
+              </div>
+
+              <div class="list-shell compact-list-shell" id="account-positions-shell" aria-live="polite">
+
+                <div class="loading-state" data-loading="account">
+
+                  <span class="loading-line loading-line-wide"></span>
+
+                  <span class="loading-line"></span>
+
+                  <span class="loading-line loading-line-short"></span>
+
+                </div>
+
+                <div class="error-state" data-error="account" hidden>
+
+                  <span class="state-symbol" aria-hidden="true">!</span>
+
+                  <div><strong>Account snapshot unavailable</strong><p data-error-message="account">The dashboard could not read the cached Robinhood account snapshot.</p></div>
+
+                  <button class="button button-quiet" data-retry="account" type="button">Retry</button>
+
+                </div>
+
+                <div class="empty-state" data-empty="account" hidden>
+
+                  <span class="state-symbol" aria-hidden="true">∅</span>
+
+                  <div><strong id="account-empty-title">No option positions</strong><p id="account-empty-detail">The cached account snapshot has no option positions to show.</p></div>
+
+                </div>
+
+                <div class="record-list" id="account-position-list" role="list" hidden></div>
+
+              </div>
+
+              <p class="panel-note" id="account-scope-note">Scope: option positions only. Values are cached broker observations.</p>
+
+            </article>
+
+          </div>
+
         </section>
 
         <section class="panel-section" id="messages" aria-labelledby="messages-title">

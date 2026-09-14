@@ -17,6 +17,26 @@ UTC = timezone.utc
 
 
 class NotificationTests(unittest.TestCase):
+    def test_chase_diagnostics_are_numeric_and_reach_hold_and_order_notifications(self):
+        evaluation = {"ask": "1.16", "reference_price": "1.00", "ask_deviation_percent": "16",
+                      "limit_price": "1.20", "limit_deviation_percent": "20", "max_chase_percent": "15",
+                      "provider_response": "SECRET"}
+        decision = {"action": "OPEN", "entry_evaluation": evaluation}
+        event = {"id": 1, "state": "held", "message_id": "1", "decision": json.dumps(decision)}
+        held = notifications._event_candidate(event, mode="live", order_ids=set(), order_message_ids=set())
+        self.assertIn("evaluated ask $1.16 (+16% vs alert)", held.payload["content"])
+        self.assertIn("chase cap 15%", held.payload["content"])
+        self.assertIn("limit $1.2 (+20%)", held.payload["content"])
+        order = {"id": "order", "status": "filled", "body": json.dumps({"side": "buy", "position_effect": "open", "entry_evaluation": evaluation}),
+                 "action": "OPEN", "filled_quantity": 1}
+        entered = notifications._order_candidate(order, mode="live")
+        self.assertIn("evaluated ask $1.16 (+16% vs alert)", entered.payload["content"])
+        self.assertNotIn("SECRET", json.dumps(entered.payload))
+        evaluation["ask_deviation_percent"] = "-5"
+        self.assertIn("(-5% vs alert)", notifications._format_projection(notifications._projection(decision)))
+        evaluation["ask"] = "NaN"
+        self.assertNotIn("entry_evaluation", notifications._projection(decision))
+
     def test_worker_failure_keeps_specific_provider_reauthentication_reason(self):
         path = self.state / "runtime-status.json"
         path.write_text(json.dumps({"state": "error", "heartbeat_at": datetime.now(UTC).isoformat(),

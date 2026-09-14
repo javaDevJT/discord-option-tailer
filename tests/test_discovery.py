@@ -531,6 +531,7 @@ const fs = require('fs');
   const browser = await chromium.launch({headless: true});
   try {
     const page = await browser.newPage();
+    await page.route('**/*', route => route.abort());
     await page.setContent(input.html);
     let guilds, channels, authors;
     try { guilds = await page.evaluate('(' + input.guilds + ')()'); }

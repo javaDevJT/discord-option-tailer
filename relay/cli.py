@@ -182,6 +182,11 @@ async def run(config, *, observe_only=False, on_status=None):
         async with asyncio.TaskGroup() as tasks:
             consumer = tasks.create_task(consume())
             recovery_consumer = tasks.create_task(recovery.consume(queue, emit))
+            if config["mode"] != "paper":
+                from .account import AccountCache
+                account_reader = tasks.create_task(AccountCache(store, broker).run())
+            else:
+                account_reader = None
 
             async def read():
                 try:
@@ -189,6 +194,8 @@ async def run(config, *, observe_only=False, on_status=None):
                 finally:
                     consumer.cancel()
                     recovery_consumer.cancel()
+                    if account_reader is not None:
+                        account_reader.cancel()
 
             tasks.create_task(read())
     finally:

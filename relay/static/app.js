@@ -1,3 +1,9 @@
+const RELAY_READ_TIMEOUT_MS = 10_000;
+
+function relayReadTimeoutSignal() {
+  return AbortSignal.timeout(RELAY_READ_TIMEOUT_MS);
+}
+
 (() => {
   "use strict";
 
@@ -7,6 +13,7 @@
     orders: "/api/orders",
     events: "/api/events",
     positions: "/api/positions",
+    account: "/api/account",
   });
   const PAGE_SIZE = 25;
   const STALE_AFTER_MS = 120_000;
@@ -39,8 +46,8 @@
       orders: { offset: 0, nextOffset: null, page: 1 },
       events: { offset: 0, nextOffset: null, page: 1 },
     },
-    loaded: { messages: false, orders: false, positions: false, events: false },
-    data: { messages: [], orders: [], relationOrders: [], positions: [], events: [] },
+    loaded: { messages: false, orders: false, positions: false, events: false, account: false },
+    data: { messages: [], orders: [], relationOrders: [], positions: [], events: [], account: null },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -383,7 +390,7 @@
       if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
     });
     const url = query.toString() ? `${path}?${query.toString()}` : path;
-    const response = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
+    const response = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store", signal: relayReadTimeoutSignal() });
     if (!response.ok) throw new ApiError(response.status);
     return response.json();
   }
@@ -393,7 +400,7 @@
       loading: $(`[data-loading="${name}"]`),
       error: $(`[data-error="${name}"]`),
       empty: $(`[data-empty="${name}"]`),
-      list: name === "messages" ? $("#message-list") : name === "orders" ? $("#order-list") : name === "positions" ? $("#position-list") : $("#event-list"),
+      list: name === "messages" ? $("#message-list") : name === "orders" ? $("#order-list") : name === "positions" ? $("#position-list") : name === "account" ? $("#account-position-list") : $("#event-list"),
       errorMessage: $(`[data-error-message="${name}"]`),
     };
   }
@@ -641,6 +648,13 @@
       const contract = node("div");
       append(contract, node("div", "record-title", formatContract(order.contract)), node("div", "record-meta", `${humanize(firstValue(order.action, order.side, "recorded"))} · ${humanize(firstValue(order.mode, "mode unavailable"))}`));
       const quantities = node("div", "record-detail");
+      const evaluation = order.entry_evaluation;
+      if (evaluation?.ask != null && evaluation?.ask_deviation_percent != null) {
+        const deviation = Number(evaluation.ask_deviation_percent);
+        if (Number.isFinite(deviation)) {
+          append(contract, node("div", "record-meta", `Evaluated ask ${formatMoney(evaluation.ask)} · ${deviation >= 0 ? "+" : ""}${formatNumber(deviation)}% vs alert`));
+        }
+      }
       const quantity = firstValue(order.quantity, 0);
       const filled = firstValue(order.filled_quantity, order.filledQuantity, 0);
       append(quantities, node("strong", "", `${formatNumber(filled)} / ${formatNumber(quantity)}`), node("div", "record-meta", "filled / requested"));
@@ -670,6 +684,143 @@
       append(row, contract, price, quantity);
       list.appendChild(row);
     });
+  }
+
+  function accountStatusClass(status, stale) {
+    if (status === "error") return "is-error";
+    if (status === "ready" && !stale) return "is-order";
+    if (status === "unavailable" || stale) return "is-held";
+    return "is-context";
+  }
+
+  function accountStatusLabel(status, stale) {
+    if (status === "ready") return stale ? "Stale" : "Ready";
+    if (status === "error") return "Error";
+    if (status === "unavailable") return "Unavailable";
+    return "Loading";
+  }
+
+  function accountAssetLabel(key) {
+    return {
+      equity_value: "Equities",
+      options_value: "Options",
+      futures_value: "Futures",
+      event_contracts_value: "Event contracts",
+      crypto_value: "Crypto",
+      mutual_funds_value: "Mutual funds",
+      fixed_income_value: "Fixed income",
+    }[key] || humanize(key, "Other");
+  }
+
+  function renderAccountPositions(positions) {
+    const list = $("#account-position-list");
+    if (!list) return;
+    while (list.firstChild) list.removeChild(list.firstChild);
+    positions.forEach((position) => {
+      const row = node("article", "record-row account-position-row");
+      row.setAttribute("role", "listitem");
+      const contract = node("div");
+      const positionType = firstValue(position?.position_type, position?.side, "");
+      const multiplierValue = Number(firstValue(position?.multiplier, null));
+      const quoteTimestamp = firstValue(position?.quote_timestamp, position?.quote_time, position?.market_data?.timestamp, null);
+      const metadata = [
+        positionType ? humanize(positionType) : "Option position",
+        Number.isFinite(multiplierValue) ? `Multiplier ×${formatNumber(multiplierValue)}` : "",
+        quoteTimestamp ? `Quote ${formatDate(quoteTimestamp, true)}` : "",
+      ].filter(Boolean).join(" · ");
+      append(
+        contract,
+        node("div", "record-title", formatContract(position?.contract)),
+        node("div", "record-meta", metadata),
+      );
+      const average = node("div", "record-detail");
+      append(average, node("strong", "", formatMoney(position?.average_price)), node("div", "record-meta", "average price / unit"));
+      const market = node("div", "record-detail");
+      append(market, node("strong", "", formatMoney(position?.market_value)), node("div", "record-meta", "market value"));
+      const quantity = node("div", "position-quantity");
+      append(quantity, node("strong", "", formatNumber(position?.quantity)), node("div", "record-meta", "quantity"));
+      append(row, contract, average, market, quantity);
+      list.appendChild(row);
+    });
+  }
+
+  function renderAccount() {
+    const account = state.data.account && typeof state.data.account === "object" ? state.data.account : {};
+    const status = safeString(account.status, state.loaded.account ? "unavailable" : "loading").toLowerCase();
+    const available = account.available === true;
+    const updatedAt = firstValue(account.updated_at, null);
+    const attemptAt = firstValue(account.last_attempt_at, null);
+    const updatedTimestamp = updatedAt ? new Date(updatedAt).getTime() : NaN;
+    const stale = account.stale === true || (available && !Number.isFinite(updatedTimestamp));
+    const statusNode = $("#account-status");
+    if (statusNode) {
+      statusNode.className = `status-pill ${accountStatusClass(status, stale)}`;
+      statusNode.textContent = accountStatusLabel(status, stale);
+    }
+    setText("#account-updated", updatedAt
+      ? `Updated ${formatRelative(updatedAt)}`
+      : attemptAt
+        ? `Last attempt ${formatRelative(attemptAt)}`
+        : "Waiting for account snapshot");
+
+    const equity = firstValue(account.equity, account.total_value, null);
+    setText("#account-equity", formatMoney(equity));
+    setText("#account-cash", formatMoney(account.cash));
+    setText("#account-buying-power", formatMoney(account.buying_power));
+    setText("#account-unleveraged-buying-power", formatMoney(account.unleveraged_buying_power));
+
+    const detail = status === "error"
+      ? safeString(account.error, "The cached Robinhood account snapshot could not be refreshed.")
+      : status === "unavailable"
+        ? safeString(account.error, "Robinhood account data is unavailable. The next scheduled refresh will retry.")
+        : stale
+          ? `Snapshot is stale${updatedAt ? `; last updated ${formatRelative(updatedAt)}` : "."}${attemptAt ? ` Last attempt ${formatRelative(attemptAt)}.` : ""}`
+          : available
+            ? "Cached broker values are ready."
+            : "The cached Robinhood account snapshot is loading.";
+    setText("#account-status-detail", detail);
+
+    const assetContainer = $("#account-assets");
+    const assetValues = $("#account-asset-values");
+    const assets = account.asset_values && typeof account.asset_values === "object" ? account.asset_values : {};
+    const assetEntries = Object.entries(assets).filter(([, value]) => value !== null && value !== undefined && value !== "");
+    if (assetContainer && assetValues) {
+      assetValues.replaceChildren(...assetEntries.map(([key, value]) => {
+        const item = node("div", "account-asset-item");
+        append(item, node("span", "field-label", accountAssetLabel(key)), node("strong", "", formatMoney(value)));
+        return item;
+      }));
+      assetContainer.hidden = !assetEntries.length;
+    }
+
+    const positions = Array.isArray(account.positions) ? account.positions : [];
+    setText("#account-position-count", state.loaded.account && available ? `${positions.length} option position${positions.length === 1 ? "" : "s"}` : "—");
+    const nodes = resourceNodes("account");
+    const errorFromPanel = state.panelErrors.has("account");
+    const errorMessage = safeString(account.error, "The dashboard could not read the cached Robinhood account snapshot.");
+    if (!state.loaded.account) return;
+    if (nodes.loading) nodes.loading.hidden = true;
+    if (errorFromPanel || (status === "error" && !available)) {
+      if (nodes.error) nodes.error.hidden = false;
+      if (nodes.errorMessage) nodes.errorMessage.textContent = errorMessage;
+      if (nodes.empty) nodes.empty.hidden = true;
+      if (nodes.list) nodes.list.hidden = true;
+      return;
+    }
+    if (nodes.error) nodes.error.hidden = status !== "error";
+    if (status === "error" && nodes.errorMessage) nodes.errorMessage.textContent = errorMessage;
+    if (!available) {
+      if (nodes.empty) nodes.empty.hidden = false;
+      if (nodes.list) nodes.list.hidden = true;
+      setText("#account-empty-title", "Account data unavailable");
+      setText("#account-empty-detail", errorMessage || "No cached account snapshot is available yet.");
+      return;
+    }
+    setText("#account-empty-title", "No option positions");
+    setText("#account-empty-detail", "The cached account snapshot has no option positions to show.");
+    if (nodes.empty) nodes.empty.hidden = positions.length > 0;
+    if (nodes.list) nodes.list.hidden = positions.length === 0;
+    if (positions.length) renderAccountPositions(positions);
   }
 
   function renderEvents() {
@@ -800,6 +951,25 @@
     }
   }
 
+  async function loadAccount() {
+    beginResource("account");
+    try {
+      const payload = await request(API.account);
+      state.data.account = payload && typeof payload === "object" ? payload : {};
+      state.loaded.account = true;
+      state.panelErrors.delete("account");
+      renderAccount();
+      return true;
+    } catch (error) {
+      state.data.account = { available: false, status: "error", error: apiErrorText(error) };
+      state.loaded.account = true;
+      state.panelErrors.add("account");
+      renderAccount();
+      renderConnection();
+      return false;
+    }
+  }
+
   async function loadEvents() {
     const page = state.pages.events;
     beginResource("events");
@@ -826,21 +996,25 @@
     state.panelErrors.clear();
     setText("#last-sync", "Syncing…");
     renderConnection();
-    const results = await Promise.allSettled([
-      loadStatus(),
-      loadMessages(),
-      loadOrders(),
-      loadRelationshipOrders(),
-      loadPositions(),
-      loadEvents(),
-    ]);
-    if (cycle === state.cycle) {
-      state.lastSync = new Date();
-      setText("#last-sync", `Synced ${formatRelative(state.lastSync)}`);
-      renderConnection();
+    try {
+      const results = await Promise.allSettled([
+        loadStatus(),
+        loadMessages(),
+        loadOrders(),
+        loadRelationshipOrders(),
+        loadPositions(),
+        loadAccount(),
+        loadEvents(),
+      ]);
+      if (cycle === state.cycle) {
+        state.lastSync = new Date();
+        setText("#last-sync", `Synced ${formatRelative(state.lastSync)}`);
+        renderConnection();
+      }
+      return results;
+    } finally {
+      state.refreshing = false;
     }
-    state.refreshing = false;
-    return results;
   }
 
   async function reloadResource(name) {
@@ -848,6 +1022,7 @@
     if (name === "messages") await loadMessages();
     if (name === "orders") await loadOrders();
     if (name === "positions") await loadPositions();
+    if (name === "account") await loadAccount();
     if (name === "events") await loadEvents();
     renderConnection();
   }
@@ -1090,6 +1265,7 @@
     const method = options.method || "GET";
     const headers = { Accept: "application/json" };
     const request = { method, headers, cache: "no-store" };
+    if (method === "GET") request.signal = relayReadTimeoutSignal();
     if (options.body !== undefined) {
       headers["Content-Type"] = "application/json";
       request.body = JSON.stringify(options.body);
@@ -1685,11 +1861,11 @@
     const activeTrading = setupTradingStatus(setupState.status);
     const active = setupState.authActive.codex || setupState.authActive.robinhood || setupState.modeChangeInFlight || setupState.notificationsSaveInFlight || activeTrading.pending || setupById("browser-login-dialog")?.open || setupState.discoveryRequestInFlight || setupState.discovery.state === "waiting";
     setupState.pollTimer = window.setTimeout(async () => {
-      await setupLoadStatus(true);
+      await setupLoadStatus();
       setupSchedulePoll();
     }, active ? 1600 : 9000);
   };
-  async function setupLoadStatus(preserveDirty = true) {
+  async function setupLoadStatus() {
     const discoveryVersion = setupState.discoveryVersion;
     const readSequence = ++setupState.statusReadSequence;
     try {
@@ -1697,7 +1873,7 @@
       if (discoveryVersion !== setupState.discoveryVersion || readSequence !== setupState.statusReadSequence) return null;
       const status = setupUnwrap(payload);
       setupRenderStatus(status);
-      if (!preserveDirty || !setupState.dirtyChannels || !setupState.loadedChannels) setupHydrateChannels(status);
+      if (!setupState.dirtyChannels) setupHydrateChannels(status);
       setupMaybeAutoDiscover(status);
       setupSchedulePoll();
       return status;
@@ -2108,7 +2284,7 @@
       event.returnValue = "";
     });
     setupBind();
-    setupLoadStatus(false);
+    setupLoadStatus();
   };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setupStart, { once: true });
   else setupStart();

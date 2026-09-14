@@ -143,6 +143,26 @@ class DashboardTests(unittest.TestCase):
             payload = body.decode("utf-8")
         return response.status, headers, payload
 
+    def test_account_endpoint_is_cached_read_only_and_rejects_refresh_parameters(self):
+        status, headers, account = self.request("/api/account")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertFalse(account["available"])
+        self.assertIsNone(account["equity"])
+        self.assertEqual(self.request("/api/account?refresh=true")[0], 400)
+        self.assertEqual(self.request("/api/account", method="HEAD")[0], 200)
+
+    def test_entry_evaluation_projection_keeps_only_finite_numeric_context(self):
+        from relay.dashboard import _project_decision, _project_order_proposal
+        evaluation = {"ask": "0.95", "reference_price": "1", "ask_deviation_percent": "-5",
+                      "limit_price": "1.00", "limit_deviation_percent": "0", "max_chase_percent": "15",
+                      "provider_response": "SECRET"}
+        decision = _project_decision({"action": "OPEN", "entry_evaluation": evaluation})
+        self.assertEqual(decision["entry_evaluation"]["ask_deviation_percent"], "-5")
+        self.assertNotIn("SECRET", json.dumps(decision))
+        proposal = _project_order_proposal({"entry_evaluation": evaluation | {"ask": "NaN"}})
+        self.assertNotIn("ask", proposal["entry_evaluation"])
+
     def test_status_reports_counts_and_stale_detection_without_sensitive_fields(self):
         status, headers, payload = self.request("/api/status")
         self.assertEqual(status, 200)

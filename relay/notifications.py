@@ -181,7 +181,7 @@ def _timestamp(value=None):
     return value.astimezone(UTC)
 
 
-def _number(value, *, positive=False):
+def _number(value, *, positive=False, signed=False):
     if isinstance(value, bool) or value is None:
         return None
     try:
@@ -190,7 +190,7 @@ def _number(value, *, positive=False):
             return None
         from decimal import Decimal, InvalidOperation
         parsed = Decimal(text)
-        if not parsed.is_finite() or parsed < 0 or (positive and parsed <= 0):
+        if not parsed.is_finite() or (not signed and parsed < 0) or (positive and parsed <= 0):
             return None
         if parsed.adjusted() > 1000 or parsed.adjusted() < -1000:
             return None
@@ -266,6 +266,14 @@ def _projection(decision, *, fallback_action=None, fallback_contract=None, fallb
         result["quantity"] = quantity
     if price:
         result["price"] = price
+    evaluation = decision.get("entry_evaluation", proposal.get("entry_evaluation"))
+    if isinstance(evaluation, dict):
+        clean = {key: value for key in (
+            "ask", "reference_price", "ask_deviation_percent", "limit_price",
+            "limit_deviation_percent", "max_chase_percent",
+        ) if (value := _number(evaluation.get(key), signed=key.endswith("deviation_percent"))) is not None}
+        if "ask" in clean and "ask_deviation_percent" in clean:
+            result["entry_evaluation"] = clean
     return result
 
 
@@ -282,6 +290,19 @@ def _format_projection(projection):
         parts.append(f"x{projection['quantity']}")
     if projection.get("price"):
         parts.append(f"at ${projection['price']}")
+    evaluation = projection.get("entry_evaluation")
+    if evaluation:
+        deviation = evaluation["ask_deviation_percent"]
+        deviation = deviation if deviation.startswith("-") else "+" + deviation
+        parts.append(f"— evaluated ask ${evaluation['ask']} ({deviation}% vs alert)")
+        if "reference_price" in evaluation:
+            parts.append(f"alert ${evaluation['reference_price']}")
+        if "max_chase_percent" in evaluation:
+            parts.append(f"chase cap {evaluation['max_chase_percent']}%")
+        if "limit_price" in evaluation and "limit_deviation_percent" in evaluation:
+            limit_deviation = evaluation["limit_deviation_percent"]
+            limit_deviation = limit_deviation if limit_deviation.startswith("-") else "+" + limit_deviation
+            parts.append(f"limit ${evaluation['limit_price']} ({limit_deviation}%)")
     return " ".join(parts) or "an option action"
 
 

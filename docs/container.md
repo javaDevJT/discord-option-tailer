@@ -134,6 +134,18 @@ docker compose start
 
 Pausing and stopping are safe operational controls for new work. Preserve the Docker volume when restarting or moving the service; it contains the browser profile, Codex subscription state, Robinhood OAuth state, configuration, and mode-specific ledgers.
 
+### Entry price diagnostics
+
+Entry diagnostics show the evaluated ask, cited alert premium, signed percentage deviation, configured chase cap, and rounded order limit. Chase uses `(price / alert premium - 1) × 100`: at a 15% setting, a $1.00 alert permits up to $1.15, including the boundary. Both the ask and the limit after tick rounding must fit the cap, and the check runs again on the final broker-review quote. Exits are not subject to entry chase limits.
+
+### Account balances and holdings
+
+The account panel shows Robinhood's total account value, cash, reported buying power, cash-only buying power, asset-class totals, and account option positions. The reviewed Agentic API exposes detailed option holdings; other asset types appear as portfolio totals. These holdings are separate from positions owned by the relay's ledger.
+
+The connected worker refreshes this display on its first uncached read, hourly thereafter, and after an order submission attempt or an observed order-status change. Dashboard polling reads only the persisted cache. Restarting the worker retains the hourly schedule. Pausing new trading does not stop account refreshes; a disconnected or stopped worker leaves the last cached values visible with their age.
+
+Failed refreshes retain the last successful values and show an error. Option marks may be from the previous market session; their quote times remain visible. This display cache never supplies execution-time balance, inventory, or quote checks.
+
 ## Network and security boundary
 
 The dashboard is published on port `8787` and the Robinhood callback on port `8766`; both bind to host loopback by default. HTTP Basic authentication protects the dashboard and browser desktop. If you intentionally expose the service through a private network or reverse proxy, preserve the original Host and browser Origin and add transport protection. Do not publish the browser gateway to the open internet.
