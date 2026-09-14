@@ -95,7 +95,7 @@ class ImagePreviewTests(unittest.TestCase):
                 self.assertEqual(download.call_count, 0)
                 card.locator("summary").click()
                 expect(card.locator("img.message-image")).to_be_visible()
-                page.wait_for_function("document.querySelector('img.message-image')?.naturalWidth === 1")
+                expect(card.locator("img.message-image")).to_have_js_property("naturalWidth", 1)
                 self.assertTrue(card.locator("a.message-image-link").get_attribute("href").startswith("/api/message-image?"))
                 page.locator("#refresh-button").click()
                 expect(card.locator("details.message-images")).to_have_attribute("open", "")
