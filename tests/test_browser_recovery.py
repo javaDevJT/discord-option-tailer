@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from relay.browser import EXTRACT_MESSAGES_JS, SnapshotTracker, login, monitor
+from relay.browser import AUTH_REQUIRED_JS, EXTRACT_MESSAGES_JS, SnapshotTracker, login, monitor
 
 
 CHANNEL = "1000000000000000001"
@@ -47,6 +47,12 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 async def __aexit__(self, *args):
                     return False
 
+            async def evaluate(expression):
+                self.assertEqual(expression, AUTH_REQUIRED_JS)
+                return False
+
+            page.evaluate = evaluate
+
             async def sign_in_then_stop(seconds):
                 if page.url.endswith("/login"):
                     page.url = "https://discord.com/channels/@me"
@@ -61,10 +67,48 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row["state"] for row in statuses], ["starting", "login_required", "connected"])
             self.assertIn("sign-in detected", statuses[-1]["detail"])
             self.assertIn("Return to Setup", statuses[-1]["detail"])
-            page.goto.assert_awaited_once()
+            page.goto.assert_not_awaited()
             context.close.assert_awaited_once()
 
-    async def _monitor_fixture(self, snapshot):
+    async def test_login_does_not_navigate_visible_captcha_on_channels_me(self):
+        with tempfile.TemporaryDirectory() as directory:
+            statuses = []
+            page = SimpleNamespace(
+                url="https://discord.com/channels/@me",
+                auth_required=True,
+                is_closed=lambda: False,
+                goto=AsyncMock(),
+            )
+            context = SimpleNamespace(pages=[page], close=AsyncMock())
+
+            async def evaluate(expression):
+                self.assertEqual(expression, AUTH_REQUIRED_JS)
+                return page.auth_required
+
+            page.evaluate = evaluate
+
+            class Playwright:
+                async def __aenter__(self):
+                    return SimpleNamespace(chromium=SimpleNamespace(
+                        launch_persistent_context=AsyncMock(return_value=context)))
+
+                async def __aexit__(self, *args):
+                    return False
+
+            async def finish_challenge(seconds):
+                del seconds
+                page.auth_required = False
+
+            with patch("relay.browser._playwright", return_value=Playwright), patch(
+                "relay.browser.asyncio.sleep", finish_challenge
+            ):
+                await login(directory, on_status=statuses.append)
+
+            self.assertEqual([row["state"] for row in statuses], ["starting", "login_required", "connected"])
+            page.goto.assert_not_awaited()
+            context.close.assert_awaited_once()
+
+    async def _monitor_fixture(self, snapshot, *, page_specs=None, sleep_hook=None):
         with tempfile.TemporaryDirectory() as directory:
             config = _config(Path(directory))
             statuses = []
@@ -72,9 +116,12 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             goto_calls = []
 
             class Page:
-                def __init__(self, index):
+                def __init__(self, index, spec=None):
+                    spec = spec or {}
                     self.index = index
-                    self.url = "about:blank"
+                    self.url = spec.get("url", "about:blank")
+                    self.auth_required = spec.get("auth_required", snapshot.get("auth_required", False))
+                    self.closed = False
 
                 def is_closed(self):
                     return False
@@ -83,12 +130,23 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     goto_calls.append(url)
                     self.url = url
 
-                async def evaluate(self, expression, channel_id):
-                    return snapshot | {"url": self.url}
+                async def evaluate(self, expression, channel_id=None):
+                    if expression == AUTH_REQUIRED_JS:
+                        return self.auth_required
+                    if expression == EXTRACT_MESSAGES_JS:
+                        result = snapshot | {"url": self.url}
+                        if result.get("messages") and channel_id is not None:
+                            result["messages"] = [
+                                message | {"channel_id": str(channel_id)}
+                                for message in result["messages"]
+                            ]
+                        return result
+                    raise AssertionError(f"unexpected browser expression: {expression!r}")
 
             class Context:
                 def __init__(self):
-                    self.pages = [Page(0), Page(1)]
+                    specs = page_specs or [{}, {}]
+                    self.pages = [Page(index, spec) for index, spec in enumerate(specs)]
                     self.closed = False
 
                 async def close(self):
@@ -107,6 +165,9 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     return False
 
             async def stop_after_one_sleep(seconds):
+                if sleep_hook is not None:
+                    await sleep_hook(context, seconds)
+                    return
                 raise RuntimeError("fixture complete")
 
             async def record(message):
@@ -117,6 +178,7 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "fixture complete"):
                     await monitor(config, record, on_status=statuses.append)
+            self._last_monitor_context = context
             return statuses, events, goto_calls, context.closed
 
     async def test_empty_ready_channel_connects_without_emitting(self):
@@ -134,7 +196,7 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([item["state"] for item in statuses], ["login_required", "login_required"])
         self.assertEqual(events, [])
-        self.assertEqual(len(goto_calls), 2)
+        self.assertEqual(len(goto_calls), 1)
         self.assertTrue(closed)
 
     async def test_loading_snapshot_does_not_qualify_as_empty_or_connected(self):
@@ -143,7 +205,63 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("connected", [item["state"] for item in statuses])
         self.assertEqual(events, [])
-        self.assertGreater(len(goto_calls), 2)
+        self.assertEqual(len(goto_calls), 2)
+        self.assertTrue(any("without reloading" in item.get("detail", "") for item in statuses))
+        self.assertTrue(closed)
+
+    async def test_third_tab_challenge_is_retained_and_pauses_both_channels(self):
+        statuses, events, goto_calls, closed = await self._monitor_fixture(
+            {"ready": True, "empty_ready": True, "messages": [], "at_bottom": True, "connection_epoch": "fixture"},
+            page_specs=[
+                {},
+                {},
+                {"url": "https://discord.com/channels/@me", "auth_required": True},
+            ],
+        )
+        context = self._last_monitor_context
+        self.assertEqual(goto_calls, [])
+        self.assertEqual([item["state"] for item in statuses], ["login_required", "login_required"])
+        self.assertEqual(events, [])
+        self.assertTrue(closed)
+        self.assertEqual(len(context.pages), 3)
+        self.assertFalse(context.pages[2].closed)
+
+    async def test_all_tabs_pause_then_resume_with_context_only_baseline(self):
+        messages = [_message(1, "2026-09-15T12:00:00Z")]
+        snapshot = {
+            "ready": True,
+            "empty_ready": False,
+            "messages": messages,
+            "at_bottom": True,
+            "connection_epoch": "fixture",
+        }
+        first_channel_url = "https://discord.com/channels/3000000000000000010/1000000000000000001"
+        second_channel_url = "https://discord.com/channels/3000000000000000010/1000000000000000002"
+        sleeps = 0
+
+        async def clear_auth_then_stop(context, seconds):
+            nonlocal sleeps
+            del seconds
+            sleeps += 1
+            if sleeps == 1:
+                context.pages[0].auth_required = False
+                return
+            raise RuntimeError("fixture complete")
+
+        statuses, events, goto_calls, closed = await self._monitor_fixture(
+            snapshot,
+            page_specs=[
+                {"url": first_channel_url, "auth_required": True},
+                {"url": second_channel_url, "auth_required": False},
+            ],
+            sleep_hook=clear_auth_then_stop,
+        )
+        states = [item["state"] for item in statuses]
+        self.assertGreaterEqual(states.count("login_required"), 2)
+        self.assertGreaterEqual(states.count("connected"), 2)
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(message["ingestion"] == "baseline" for message in events))
+        self.assertEqual(goto_calls, [])
         self.assertTrue(closed)
 
     def test_tracker_accepts_confirmed_empty_start_without_replaying_delayed_rows(self):

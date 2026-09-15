@@ -23,6 +23,16 @@ LOG = logging.getLogger(__name__)
 
 # Selectors deliberately stay together so a Discord UI change can be reviewed.
 # Only mounted, rendered channel rows are read; no hidden React state is accessed.
+AUTH_REQUIRED_JS = r"""() => {
+  const visible = el => !!el && !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+  return [...document.querySelectorAll(`
+    input[type="password"], input[autocomplete="one-time-code"],
+    [role="dialog"] input[name*="code" i], [role="dialog"] input[id*="code" i],
+    form[action*="/login"], form[action*="/verify"], form[action*="/challenge"],
+    iframe[src*="hcaptcha.com"], iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"]
+  `)].some(el => visible(el) && !el.closest('[data-list-id="chat-messages"], [id^="chat-messages-"], [class*="embed"]'));
+}"""
+
 EXTRACT_MESSAGES_JS = r"""(expectedChannelId = null) => {
   if (!window.__discordRelayConnection) {
     window.__discordRelayConnection = {epoch: 0};
@@ -35,12 +45,7 @@ EXTRACT_MESSAGES_JS = r"""(expectedChannelId = null) => {
     .some(el => el.getClientRects().length && /reconnecting|connecting to discord|connection lost|disconnected from discord|trying to reconnect/i.test(el.innerText));
   const observation = {url: location.href, connection_epoch: connectionEpoch};
   const visible = el => !!el && !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
-  const authControls = [...document.querySelectorAll(`
-    input[type="password"], input[autocomplete="one-time-code"],
-    [role="dialog"] input[name*="code" i], [role="dialog"] input[id*="code" i],
-    form[action*="/login"], form[action*="/verify"], form[action*="/challenge"],
-    iframe[src*="hcaptcha.com"], iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"]
-  `)].some(el => visible(el) && !el.closest('[data-list-id="chat-messages"], [id^="chat-messages-"], [class*="embed"]'));
+  const authControls = (""" + AUTH_REQUIRED_JS + r""")();
   if (authControls) return {...observation, ready: false, auth_required: true, at_bottom: false, messages: []};
   if (!navigator.onLine || connecting) return {...observation, ready: false, auth_required: false, at_bottom: false, messages: []};
   const list = document.querySelector('[data-list-id="chat-messages"]');
@@ -265,9 +270,36 @@ NAVIGATION_TIMEOUT_MS = 60000
 NAVIGATION_PROGRESS_SECONDS = 3
 
 
+async def requires_manual_auth(page) -> bool | None:
+    """None means the document could not be inspected, not a proven challenge."""
+    if page.is_closed():
+        return False
+    parsed = urlsplit(page.url)
+    if parsed.scheme != "https" or parsed.netloc != "discord.com":
+        return False
+    if session_state(page.url) == "login_required":
+        page._relay_manual_auth_detected = True
+        return True
+    try:
+        detected = await page.evaluate(AUTH_REQUIRED_JS) is True
+        page._relay_manual_auth_detected = detected
+        return detected
+    except Exception:
+        # Preserve a known challenge across a changing document.
+        return True if getattr(page, "_relay_manual_auth_detected", False) else None
+
+
+async def manual_auth_page(context):
+    """Leave every tab alone while a user completes sign-in or a challenge."""
+    for page in context.pages:
+        if await requires_manual_auth(page) is not False:
+            return page
+    return None
+
+
 async def _navigate_with_progress(page, url: str, *, on_progress=None) -> None:
     """Navigate with bounded waits while keeping cancellation cleanup explicit."""
-    navigation = asyncio.create_task(page.goto(url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS))
+    navigation = asyncio.create_task(page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS))
     try:
         while not navigation.done():
             await asyncio.wait({navigation}, timeout=NAVIGATION_PROGRESS_SECONDS)
@@ -294,19 +326,22 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
         )
         discovery_task = None
         try:
-            page = context.pages[0] if context.pages else await context.new_page()
+            page = await manual_auth_page(context)
+            if page is None:
+                page = context.pages[0] if context.pages else await context.new_page()
             navigation_problem = ""
             try:
-                await _navigate_with_progress(
-                    page,
-                    "https://discord.com/login",
-                    on_progress=lambda: publish_status(
-                        on_status,
-                        "discord",
-                        "starting",
-                        detail="Discord is still loading. The browser will stay open; manual sign-in has no time limit.",
-                    ),
-                )
+                if session_state(page.url) != "connected" and await manual_auth_page(context) is None:
+                    await _navigate_with_progress(
+                        page,
+                        "https://discord.com/login",
+                        on_progress=lambda: publish_status(
+                            on_status,
+                            "discord",
+                            "starting",
+                            detail="Discord is still loading. The browser will stay open; manual sign-in has no time limit.",
+                        ),
+                    )
             except Exception as exc:
                 if page.is_closed():
                     raise
@@ -320,10 +355,12 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
             LOG.warning("Sign in manually in the browser, including any MFA. Waiting for Discord's channel view.")
             while not page.is_closed():
                 state = session_state(page.url)
+                if await manual_auth_page(context) is not None:
+                    state = "login_required"
                 if state == "connected":
                     detail = "Discord sign-in detected. Return to Setup and save both channel URLs to start monitoring."
                 elif state == "login_required":
-                    detail = "Complete Discord sign-in and any verification in the browser. Manual sign-in has no time limit."
+                    detail = "Complete Discord sign-in and any verification in the browser; close unused sign-in tabs. Manual sign-in has no time limit."
                 else:
                     state = "reconnecting"
                     detail = navigation_problem or "Discord is still loading or redirecting. The browser will stay open; finish sign-in when it appears."
@@ -371,11 +408,14 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             pages = list(context.pages)
             while len(pages) < 2:
                 pages.append(await context.new_page())
-            for page in pages[2:]:
-                await page.close()
+            # Restored extra tabs may contain an in-progress manual challenge.
             pages = pages[:2]
             urls = [f"https://discord.com/channels/{c['guild_id']}/{c['id']}" for c in channels]
             for channel, page, url in zip(channels, pages, urls):
+                if await manual_auth_page(context) is not None:
+                    break
+                if _channel_url_matches(page.url, channel):
+                    continue
                 try:
                     await _navigate_with_progress(
                         page,
@@ -414,6 +454,13 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             last_recovery: dict[str, float] = {}
 
             while True:
+                if await manual_auth_page(context) is not None:
+                    for channel in channels:
+                        trackers[str(channel["id"])].reset()
+                        unavailable.add(str(channel["id"]))
+                        status(channel, "login_required", "Discord sign-in or CAPTCHA is pending. Automatic navigation is paused in all tabs; finish verification in Browser login and close unused sign-in tabs.")
+                    await asyncio.sleep(poll_seconds)
+                    continue
                 for index, channel in enumerate(channels):
                     channel_id = str(channel["id"])
                     tracker = trackers[channel_id]
@@ -434,7 +481,12 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                             unavailable.add(channel_id)
                             status(channel, state, "Discord requires login or verification in Browser login.")
                             continue
+                        snapshot = await page.evaluate(EXTRACT_MESSAGES_JS, channel_id)
+                        if snapshot.get("auth_required"):
+                            raise ValueError("Manual Discord verification is pending")
                         if not _channel_url_matches(page.url, channel):
+                            if await manual_auth_page(context) is not None:
+                                break
                             if now - last_recovery.get(channel_id, -60) >= 30:
                                 last_recovery[channel_id] = now
                                 tracker.reset()
@@ -448,7 +500,6 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                                     ),
                                 )
                             raise ValueError("Restoring the configured channel after navigation or login")
-                        snapshot = await page.evaluate(EXTRACT_MESSAGES_JS, channel_id)
                         if not _channel_url_matches(snapshot.get("url", ""), channel) or not _channel_url_matches(page.url, channel):
                             raise ValueError("Channel changed during observation")
                         if not snapshot.get("ready") or (not snapshot["messages"] and not snapshot.get("empty_ready")):
@@ -486,28 +537,12 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                         if state == "login_required":
                             detail = "Discord requires sign-in or verification. Complete it in Browser login; manual sign-in has no time limit."
                         elif isinstance(exc, ValueError):
-                            detail = "Discord's channel message list is not ready. Let the page finish loading, then confirm the configured channel opens and scroll to its newest messages. Monitoring will resume automatically."
+                            detail = "Discord's channel message list is not ready. Waiting without reloading the page. Finish any verification; if the page stays blank, reload it manually or use Reconnect."
                         else:
                             detail = failure_detail(exc, provider="Discord", phase="channel observation")
                         status(channel, "login_required" if state == "login_required" else "reconnecting", detail)
-                        if state != "login_required" and now - last_recovery.get(channel_id, -60) >= 30:
-                            last_recovery[channel_id] = now
-                            try:
-                                await _navigate_with_progress(
-                                    page,
-                                    urls[index],
-                                    on_progress=lambda channel=channel: status(
-                                        channel,
-                                        "reconnecting",
-                                        "Discord is still loading the configured channel. Monitoring will resume when it appears.",
-                                    ),
-                                )
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as recovery_exc:
-                                status(channel, "reconnecting", failure_detail(
-                                    recovery_exc, provider="Discord", phase="channel navigation"
-                                ))
+                        if state == "login_required":
+                            break
                         continue
                     # Callback failure propagates and stops the monitor; never blindly replay a money action.
                     for message in events:

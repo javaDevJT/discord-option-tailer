@@ -123,6 +123,8 @@ Evaluation retries once for transient failures and invalid structured output or 
 
 Discord's initial navigation has a 60-second network timeout. A slow page keeps the browser open and reports loading or recovery guidance; completing manual sign-in or MFA has no time limit. Use **Back to setup** to leave the browser view without ending the saved session. If the page stays blank, reload it in the embedded browser; use **Reconnect** if the browser worker has stopped.
 
+While a Discord tab shows sign-in, MFA, or CAPTCHA, automatic channel navigation and discovery pause. Loading message lists wait without repeated reloads, and discovery keeps verification tabs open after a request fails. Finish verification in **Browser login**; close any extra sign-in tabs you no longer need. Monitoring resumes with existing messages treated as context. Avoid **Reconnect** or changing channels during verification, since those deliberately restart the browser worker.
+
 Setup and the Overview connection cards display provider diagnostics. Errors identify the operation, a stable failure code, and a suggested next step; authentication failures can also include the phase, HTTP status, exception type, and application source location. DNS, certificate, connection, timeout, missing executable, and local permission failures have distinct guidance. Provider response bodies, tokens, and callback codes are withheld. Saved credentials alone do not override a reported runtime failure.
 
 Codex device login has a 15-minute local process deadline, and its device code can expire sooner. Robinhood waits five minutes for its OAuth callback. An expired attempt requires a new sign-in; these deadlines are separate from Discord's unlimited manual login wait.

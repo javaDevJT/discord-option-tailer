@@ -579,6 +579,12 @@ async def _wait_briefly(page: object, milliseconds: int = 250) -> None:
 
 
 async def _goto(page: object, url: str) -> None:
+    from .browser import requires_manual_auth
+    auth = await requires_manual_auth(page)
+    if auth is None:
+        raise RuntimeError("Discord page could not be inspected before navigation")
+    if auth:
+        raise _LoginRequired()
     # Discord can render its sidebar while ancillary scripts delay DOMContentLoaded.
     # The directory reader checks the rendered UI before returning any choices.
     await page.goto(url, wait_until="commit", timeout=15000)
@@ -586,6 +592,12 @@ async def _goto(page: object, url: str) -> None:
 
 
 async def _evaluate(page: object, expression: str, argument: object = None) -> dict:
+    from .browser import requires_manual_auth
+    auth = await requires_manual_auth(page)
+    if auth is None:
+        raise RuntimeError("Discord page could not be inspected before discovery")
+    if auth:
+        raise _LoginRequired()
     if argument is None:
         value = await page.evaluate(expression)
     else:
@@ -613,6 +625,17 @@ async def _new_page(context: object) -> object:
     return await context.new_page()
 
 
+async def _close_discovery_page(context: object, page: object | None) -> None:
+    from .browser import requires_manual_auth
+    if page is None:
+        return
+    try:
+        if not page.is_closed() and await requires_manual_auth(page) is not True:
+            await page.close()
+    except Exception:
+        pass
+
+
 async def _ensure_page(context: object, page: object | None) -> object:
     dedicated = page
     try:
@@ -627,33 +650,18 @@ async def _ensure_page(context: object, page: object | None) -> object:
         url = _page_url(dedicated)
         if not url or url == "about:blank" or not url.startswith("https://discord.com/"):
             await _goto(dedicated, DISCOVERY_START_URL)
-        elif _login_url(url):
-            # A prior request may have left this dedicated tab on the login
-            # page.  Revisit the fixed Discord entry point on each new request
-            # so a manual sign-in in another existing tab can take effect.
-            await _goto(dedicated, DISCOVERY_START_URL)
             if _login_url(_page_url(dedicated)):
                 raise _LoginRequired()
         return dedicated
     except asyncio.CancelledError:
         # If cancellation happens before the await in the caller assigns the
         # returned page, this function still owns the newly-created tab.
-        if dedicated is not None:
-            try:
-                if not dedicated.is_closed():
-                    await dedicated.close()
-            except Exception:
-                pass
+        await _close_discovery_page(context, dedicated)
         raise
     except Exception:
         # Navigation failures can happen before the caller receives the page;
-        # close it here so a timed out or rejected login tab is not leaked.
-        if dedicated is not None:
-            try:
-                if not dedicated.is_closed():
-                    await dedicated.close()
-            except Exception:
-                pass
+        # close unused tabs here, but preserve manual verification.
+        await _close_discovery_page(context, dedicated)
         raise
 
 
@@ -776,6 +784,8 @@ async def _discover_page(page: object, request: dict) -> dict:
     channel_id = request.get("channel_id")
     try:
         guild_data = await _directory_snapshot(page, EXTRACT_GUILDS_JS, require_items=True)
+    except _LoginRequired:
+        raise
     except Exception as exc:
         del exc
         raise RuntimeError("Discord guild sidebar is unavailable or still loading.")
@@ -798,6 +808,8 @@ async def _discover_page(page: object, request: dict) -> dict:
     await _select_guild(page, selected_guild)
     try:
         channel_data = await _collect_channels(page, guild_id, request.get("channel_id"))
+    except _LoginRequired:
+        raise
     except Exception as exc:
         del exc
         raise RuntimeError("Discord channel sidebar is unavailable or still loading.")
@@ -831,6 +843,8 @@ async def _discover_page(page: object, request: dict) -> dict:
         raise RuntimeError("Discord navigated away from the selected channel.")
     try:
         author_data = await _directory_snapshot(page, EXTRACT_AUTHORS_JS, channel_id)
+    except _LoginRequired:
+        raise
     except Exception as exc:
         del exc
         raise RuntimeError("Discord messages are unavailable in the selected channel.")
@@ -879,17 +893,15 @@ async def _prepare_and_process(context: object, page: object | None, request: di
     dedicated = page
     try:
         dedicated = await _ensure_page(context, dedicated)
-        return dedicated, await _process_request(dedicated, request)
+        result = await _process_request(dedicated, request)
+        if result.get("state") == "failed":
+            await _close_discovery_page(context, dedicated)
+        return dedicated, result
     except asyncio.CancelledError:
         # wait_for cancels this coroutine on timeout.  Closing the page here
         # prevents a timed-out navigation from leaking a tab into the shared
         # persistent context.
-        if dedicated is not None:
-            try:
-                if not dedicated.is_closed():
-                    await dedicated.close()
-            except Exception:
-                pass
+        await _close_discovery_page(context, dedicated)
         raise
 
 
@@ -897,8 +909,10 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
     """Use the open setup tab, or own a separate tab during active monitoring.
 
     Discovery never navigates or closes monitoring pages. Only its dedicated
-    tab is closed when the worker stops; the borrowed setup tab stays open.
+    tab is closed when the worker stops unless it needs manual verification;
+    the borrowed setup tab stays open.
     """
+    from .browser import manual_auth_page
     runtime = _runtime_path(runtime_path)
     request_path = _request_path(runtime)
     result_path = _result_path(runtime)
@@ -926,6 +940,8 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
                 else:
                     processed_id = request["request_id"]
                     try:
+                        if await manual_auth_page(context) is not None:
+                            raise _LoginRequired()
                         if setup_page is not None:
                             result = await asyncio.wait_for(_process_request(setup_page, request), timeout=REQUEST_TIMEOUT_SECONDS)
                         else:
@@ -967,12 +983,7 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
     except asyncio.CancelledError:
         raise
     finally:
-        if page is not None:
-            try:
-                if not page.is_closed():
-                    await page.close()
-            except Exception:
-                pass
+        await _close_discovery_page(context, page)
 
 
 __all__ = [

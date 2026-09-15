@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from relay.browser import monitor, session_state
+from relay.browser import AUTH_REQUIRED_JS, monitor, session_state
 from relay.core import Engine, Hold, Store, load_config
 from relay.ingest import normalize
 from relay.service import RuntimeStatus, observe, run_until_change, serve, signature, watch_changes
@@ -230,7 +230,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 return False
             async def goto(self, url, **kwargs):
                 self.url = url
-            async def evaluate(self, expression, channel_id):
+            async def evaluate(self, expression, channel_id=None):
+                if expression == AUTH_REQUIRED_JS:
+                    return False
                 numbers = [1] if self.index else [1] + ([2] if step[0] >= 1 else []) + ([3] if step[0] >= 4 else [])
                 rows = [{"id": str(1545000000000000000 + self.index * 100 + number),
                          "channel_id": channel_id,

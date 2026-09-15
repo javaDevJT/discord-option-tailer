@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from relay.browser import login, monitor
+from relay.browser import AUTH_REQUIRED_JS, login, monitor
 from relay.dashboard import _safe_runtime
 from relay.service import RuntimeStatus
 from relay.status import failure_detail
@@ -27,6 +27,10 @@ class ProviderDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             async def goto(self, url, **options):
                 navigation.append(options)
                 raise asyncio.TimeoutError("https://private.example/?token=PRIVATE")
+
+            async def evaluate(self, expression):
+                del expression
+                return False
 
         page = Page()
 
@@ -61,7 +65,7 @@ class ProviderDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch("relay.browser._playwright", return_value=Playwright), patch("relay.browser.asyncio.sleep", advance):
             await login(directory, keep_open=True, on_status=events.append)
-        self.assertEqual(navigation, [{"wait_until": "commit", "timeout": 60000}])
+        self.assertEqual(navigation, [{"wait_until": "domcontentloaded", "timeout": 60000}])
         self.assertGreater(sum(steps), 360)
         self.assertTrue(any("exceeded 60 seconds" in event.get("detail", "") for event in events))
         self.assertTrue(any(event["state"] == "connected" for event in events))
@@ -118,6 +122,10 @@ class ProviderDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         navigation_cancelled.set()
 
+                async def evaluate(self, expression):
+                    del expression
+                    return False
+
             class Context:
                 pages = [Page(), Page()]
                 closed = False
@@ -158,7 +166,7 @@ class ProviderDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(navigation_cancelled.is_set())
             self.assertTrue(context.closed)
-            self.assertEqual(navigation[0][1], {"wait_until": "commit", "timeout": 60000})
+            self.assertEqual(navigation[0][1], {"wait_until": "domcontentloaded", "timeout": 60000})
             self.assertTrue(any("still loading" in event.get("detail", "") for event in events))
             self.assertNotIn("PRIVATE", json.dumps(events))
 

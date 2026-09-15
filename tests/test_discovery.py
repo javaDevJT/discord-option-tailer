@@ -16,6 +16,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from relay.browser import AUTH_REQUIRED_JS, requires_manual_auth
 from relay.discovery import (
     DISCOVERY_START_URL,
     EXTRACT_AUTHORS_JS,
@@ -26,6 +27,7 @@ from relay.discovery import (
     RESULT_FILENAME,
     _atomic_json_write,
     _collect_channels,
+    _close_discovery_page,
     _directory_snapshot,
     _discover_page,
     _ensure_page,
@@ -167,13 +169,15 @@ class DiscoveryFileTests(unittest.TestCase):
 
 
 class _FakePage:
-    def __init__(self, *, slow: bool = False):
+    def __init__(self, *, slow: bool = False, auth_required: bool = False, auth_probe_error: bool = False):
         self.url = "about:blank"
         self.goto_calls: list[str] = []
         self.navigation_options: list[dict] = []
         self.clicked_links = []
         self.closed = False
         self.slow = slow
+        self.auth_required = auth_required
+        self.auth_probe_error = auth_probe_error
 
     def is_closed(self):
         return self.closed
@@ -201,6 +205,10 @@ class _FakePage:
         return Link()
 
     async def evaluate(self, expression, argument=None):
+        if expression == AUTH_REQUIRED_JS:
+            if self.auth_probe_error:
+                raise RuntimeError("fixture auth probe failed")
+            return self.auth_required
         import asyncio
         if self.slow:
             await asyncio.sleep(2)
@@ -228,6 +236,14 @@ class _FakePage:
 
     async def close(self):
         self.closed = True
+
+
+class _RedirectingAuthPage(_FakePage):
+    async def goto(self, url, **kwargs):
+        self.navigation_options.append(kwargs)
+        self.goto_calls.append(url)
+        self.url = DISCOVERY_START_URL
+        self.auth_required = True
 
 
 class _SlowNavigationPage(_FakePage):
@@ -259,9 +275,15 @@ class _ErrorNavigationPage(_FakePage):
 class _DelayedDirectoryPage:
     def __init__(self):
         self.calls = 0
+        self.url = DISCOVERY_START_URL
+
+    def is_closed(self):
+        return False
 
     async def evaluate(self, expression, argument=None):
-        del expression, argument
+        if expression == AUTH_REQUIRED_JS:
+            return False
+        del argument
         self.calls += 1
         if self.calls < 3:
             return {"sidebar_present": False, "guilds": []}
@@ -272,9 +294,9 @@ class _DelayedDirectoryPage:
 
 
 class _FakeContext:
-    def __init__(self, page):
+    def __init__(self, page, *, pages=None):
         self.page = page
-        self.pages = [object()]  # Existing monitored page; discovery must not use it.
+        self.pages = list(pages) if pages is not None else [page]
         self.new_page_calls = 0
 
     async def new_page(self):
@@ -374,6 +396,67 @@ class DiscoveryWorkerTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(discovered["state"], "ready" if result["complete"] else "partial")
 
+    async def test_pending_auth_blocks_discovery_without_new_page_or_navigation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = _runtime(Path(directory))
+            request = request_discovery(runtime, {})
+            page = _FakePage(auth_required=True)
+            page.url = DISCOVERY_START_URL
+            context = _FakeContext(page)
+            task = asyncio.create_task(serve_discovery(context, runtime))
+            try:
+                status = await self._wait_async(lambda: discovery_status(runtime))
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            self.assertEqual(status["state"], "login_required")
+            self.assertEqual(status["request_id"], request["request_id"])
+            self.assertEqual(context.new_page_calls, 0)
+            self.assertEqual(page.goto_calls, [])
+            self.assertFalse(page.closed)
+
+    async def test_redirected_discovery_auth_tab_is_preserved_during_worker_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = _runtime(Path(directory))
+            request_discovery(runtime, {})
+            page = _RedirectingAuthPage()
+            context = _FakeContext(page)
+            task = asyncio.create_task(serve_discovery(context, runtime))
+            try:
+                status = await self._wait_async(lambda: discovery_status(runtime))
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            self.assertEqual(status["state"], "login_required")
+            self.assertEqual(context.new_page_calls, 1)
+            self.assertEqual(page.goto_calls, [DISCOVERY_START_URL])
+            self.assertFalse(page.closed)
+
+    async def test_unknown_auth_probe_closes_owned_discovery_tab(self):
+        page = _FakePage(auth_probe_error=True)
+        page.url = DISCOVERY_START_URL
+        context = _FakeContext(page)
+
+        await _close_discovery_page(context, page)
+
+        self.assertTrue(page.closed)
+
+    async def test_known_challenge_survives_later_auth_probe_error(self):
+        page = _FakePage(auth_required=True)
+        page.url = DISCOVERY_START_URL
+        context = _FakeContext(page)
+
+        self.assertTrue(await requires_manual_auth(page))
+        page.auth_required = False
+        page.auth_probe_error = True
+        await _close_discovery_page(context, page)
+
+        self.assertFalse(page.closed)
+
     async def test_setup_discovery_reuses_open_tab_without_closing_it(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = _runtime(Path(directory))
@@ -463,13 +546,13 @@ class DiscoveryWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["guilds"][0]["id"], GUILD)
         self.assertEqual(page.calls, 3)
 
-    async def test_login_page_retries_fixed_entry_point_for_saved_auth(self):
+    async def test_login_page_is_left_for_manual_auth(self):
         page = _LoginRetryPage()
         context = _FakeContext(page)
         restored = await _ensure_page(context, page)
         self.assertIs(restored, page)
-        self.assertEqual(page.goto_calls, [DISCOVERY_START_URL])
-        self.assertEqual(page.url, DISCOVERY_START_URL)
+        self.assertEqual(page.goto_calls, [])
+        self.assertEqual(page.url, "https://discord.com/login")
 
     @staticmethod
     async def _wait_async(predicate, timeout=3):
