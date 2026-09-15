@@ -58,7 +58,7 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "fixture complete"):
                     await login(directory, keep_open=True, on_status=statuses.append)
-            self.assertEqual([row["state"] for row in statuses], ["login_required", "connected"])
+            self.assertEqual([row["state"] for row in statuses], ["starting", "login_required", "connected"])
             self.assertIn("sign-in detected", statuses[-1]["detail"])
             self.assertIn("Return to Setup", statuses[-1]["detail"])
             page.goto.assert_awaited_once()

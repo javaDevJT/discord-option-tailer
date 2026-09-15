@@ -429,6 +429,43 @@ class SetupManagerTests(unittest.TestCase):
         self.assertNotIn("signed in", stale["detail"])
         self.assertEqual(report("needs_attention")["state"], "failed")
 
+    def test_provider_diagnostics_survive_setup_projection_and_loading(self):
+        from relay.interpreter import InterpretationError, safe_interpretation_reason
+        from relay.status import failure_detail
+
+        runtime_path = self.base / "state/runtime-status.json"
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        loading = "Discord is still loading. The browser will stay open; manual sign-in has no time limit."
+        codex = safe_interpretation_reason(InterpretationError(code="timeout", attempts=2))
+        broker = failure_detail(ConnectionError("private-token"), provider="Robinhood", phase="connection")
+        runtime = {
+            "updated_at": datetime.now(timezone.utc).isoformat(), "state": "running",
+            "discord": {"state": "reconnecting", "detail": loading},
+            "codex": {"state": "unavailable", "detail": codex},
+            "broker": {"state": "unavailable", "detail": broker},
+        }
+        runtime_path.write_text(json.dumps(runtime))
+        with patch.object(self.manager, "_codex_ready", return_value=True):
+            status = self.manager.status()
+        self.assertEqual(status["discord"]["state"], "starting")
+        self.assertEqual(status["discord"]["detail"], loading)
+        self.assertEqual(status["codex"]["detail"], codex)
+        self.assertEqual(status["codex"]["state"], "failed")
+        self.assertEqual(status["robinhood"]["detail"], broker)
+        self.assertNotIn("private-token", json.dumps(status))
+        self.manager._auth_state["robinhood"] = {"state": "failed", **self.manager._robinhood_failure(TimeoutError(), "callback")}
+        self.assertEqual(self.manager.status()["robinhood"]["failure"]["code"], "auth_expired")
+        runtime.update(state="error", detail="Worker startup failed [browser_profile_busy]. Keep the saved profile and reconnect.")
+        runtime_path.write_text(json.dumps(runtime))
+        discord = self.manager.status()["discord"]
+        self.assertEqual(discord["state"], "failed")
+        self.assertIn("browser_profile_busy", discord["detail"])
+        runtime["updated_at"] = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        runtime_path.write_text(json.dumps(runtime))
+        self.assertEqual(self.manager.status()["discord"]["state"], "unknown")
+        for detail in ("Codex failure token=private-token", "Codex failure https://secret.example/token"):
+            self.assertEqual(self.manager._runtime_auth_detail({"detail": detail}, "Codex", "fallback"), "fallback")
+
     def test_cancellation_closes_real_local_oauth_listener(self):
         from relay.broker import RobinhoodMCP
         started = threading.Event()
@@ -634,6 +671,11 @@ class SetupManagerTests(unittest.TestCase):
         self.assertEqual(len(self.manager.robinhood_schemas()["tools"]), 1)
 
     def test_robinhood_failure_diagnostics_omit_exception_secrets(self):
+        class UnprintableError(Exception):
+            def __str__(self):
+                raise ValueError("private error")
+
+        self.assertIn("[operation_failed]", self.manager._robinhood_failure(UnprintableError(), "authorization")["detail"])
         error = RuntimeError("token=private-token code=private-code /private/path")
         error.response = SimpleNamespace(status_code=401)
         result = self.manager._robinhood_failure(ExceptionGroup("private response", [error]), "account_inspection")
@@ -642,6 +684,44 @@ class SetupManagerTests(unittest.TestCase):
         timeout = self.manager._robinhood_failure(TimeoutError("private timeout"), "callback")
         self.assertIn("expired before its callback", timeout["detail"])
         self.assertNotIn("private", json.dumps(timeout))
+
+    def test_auth_failure_diagnostics_have_fixed_codes_and_actions(self):
+        cases = (
+            (TimeoutError("provider timeout secret=private"), "callback", "auth_expired"),
+            (RuntimeError("capability report does not match account=123456789"), "account_binding", "report_mismatch"),
+            (RuntimeError("robinhood.auth must be oauth or token"), "initialization", "setup_unsupported"),
+            (RuntimeError("name or service not known /private/provider"), "authorization", "dns_failed"),
+        )
+        for error, phase, code in cases:
+            with self.subTest(code=code):
+                result = self.manager._robinhood_failure(error, phase)
+                self.assertIn(f"[{code}]", result["detail"])
+                self.assertIn("Action:", result["detail"])
+                self.assertEqual(result["failure"]["code"], code)
+                self.assertNotIn("private", json.dumps(result))
+
+    def test_codex_cli_diagnostics_are_fixed_and_runtime_detail_is_bounded(self):
+        self.assertEqual(self.manager._codex_line_code("TLS certificate verify failed"), "tls_failed")
+        detail = self.manager._codex_failure_detail("runtime_unavailable", "initialization")
+        self.assertIn("[runtime_unavailable]", detail)
+        self.assertIn("Action:", detail)
+        self.assertNotIn("https://", detail)
+        self.assertEqual(
+            self.manager._runtime_auth_detail(
+                {"detail": "Codex login failed [auth_required]. Action: retry."},
+                "Codex",
+                "fallback",
+            ),
+            "Codex login failed [auth_required]. Action: retry.",
+        )
+        self.assertEqual(
+            self.manager._runtime_auth_detail(
+                {"detail": "provider=https://secret.example/token"},
+                "Codex",
+                "fallback",
+            ),
+            "fallback",
+        )
 
     def test_fresh_robinhood_binding_uses_shadow_ledger(self):
         async def fake_login(config, *, authorization_handler=None):

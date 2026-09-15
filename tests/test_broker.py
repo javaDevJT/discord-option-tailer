@@ -20,6 +20,16 @@ from relay.broker import (
 
 
 class BrokerChecks(unittest.IsolatedAsyncioTestCase):
+    def assert_provider_event(self, event, state, code=None):
+        self.assertEqual({key: event[key] for key in ("component", "state")}, {"component": "broker", "state": state})
+        if state == "connected":
+            self.assertEqual(set(event), {"component", "state"})
+        else:
+            self.assertRegex(event["detail"], r"\[[a-z0-9_]+\]")
+            self.assertNotIn("private", event["detail"])
+            if code:
+                self.assertIn(f"[{code}]", event["detail"])
+
     async def test_paper_nearest_expiry_uses_only_standard_matching_fixture_contracts(self):
         contract = {"symbol": "SPY", "expiry": "2026-09-10", "strike": "650", "option_type": "call"}
         quote = {"contract": contract, "tradable": True, "multiplier": 100,
@@ -63,7 +73,7 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(type(original)) as raised:
                         await broker.__aenter__()
                 self.assertIs(raised.exception, original)
-                self.assertEqual(events[-1], {"component": "broker", "state": state})
+                self.assert_provider_event(events[-1], state, "auth_required" if state == "auth_required" else "network_unavailable")
                 self.assertIsNone(broker.session)
 
     async def test_cleanup_auth_group_publishes_and_propagates_cleanup_exception(self):
@@ -79,7 +89,7 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ExceptionGroup) as raised:
                 await broker.__aenter__()
         self.assertIs(raised.exception, cleanup)
-        self.assertEqual(events[-1], {"component": "broker", "state": "auth_required"})
+        self.assert_provider_event(events[-1], "auth_required", "auth_required")
 
     async def test_initialization_cancellation_without_cleanup_failure_stays_cancellation(self):
         events = []
@@ -99,17 +109,16 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
         broker.session.call_tool = AsyncMock(side_effect=BrokerError("Robinhood authorization required; private details"))
         with self.assertRaises(BrokerError):
             await broker._call_tool("get_accounts", {})
-        self.assertEqual(events[-1], {"component": "broker", "state": "auth_required"})
+        self.assert_provider_event(events[-1], "auth_required", "auth_required")
         broker.session.call_tool.side_effect = ConnectionError("private transport details")
         with self.assertRaises(ConnectionError):
             await broker._call_tool("get_accounts", {})
-        self.assertEqual(events[-1], {"component": "broker", "state": "unavailable"})
+        self.assert_provider_event(events[-1], "unavailable", "network_unavailable")
         broker.session.call_tool.side_effect = None
         for failed, state in ((True, "unavailable"), (False, "connected")):
             broker.session.call_tool.return_value = MagicMock(isError=failed)
             await broker._call_tool("get_accounts", {})
-            self.assertEqual(events[-1], {"component": "broker", "state": state})
-        self.assertTrue(all(set(event) == {"component", "state"} for event in events))
+            self.assert_provider_event(events[-1], state, "tool_error" if failed else None)
 
     async def test_mcp_error_result_publishes_auth_failure_without_error_text(self):
         events = []
@@ -123,7 +132,7 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
         ))
         with self.assertRaisesRegex(BrokerError, "tool error"):
             await broker.call("get_accounts", {})
-        self.assertEqual(events[-1], {"component": "broker", "state": "auth_required"})
+        self.assert_provider_event(events[-1], "auth_required", "auth_required")
 
     async def test_mcp_error_result_recovers_to_connected(self):
         events = []
@@ -139,10 +148,8 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BrokerError):
             await broker.call("get_accounts", {})
         await broker.call("get_accounts", {})
-        self.assertEqual(events[-2:], [
-            {"component": "broker", "state": "auth_required"},
-            {"component": "broker", "state": "connected"},
-        ])
+        self.assert_provider_event(events[-2], "auth_required", "auth_required")
+        self.assert_provider_event(events[-1], "connected")
 
     async def test_explicit_quote_and_idempotent_paper_fill(self):
         with tempfile.TemporaryDirectory() as directory:

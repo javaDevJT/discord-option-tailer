@@ -121,6 +121,12 @@ Evaluation retries once for transient failures and invalid structured output or 
 
 ## Monitor and operate
 
+Discord's initial navigation has a 60-second network timeout. A slow page keeps the browser open and reports loading or recovery guidance; completing manual sign-in or MFA has no time limit. Use **Back to setup** to leave the browser view without ending the saved session. If the page stays blank, reload it in the embedded browser; use **Reconnect** if the browser worker has stopped.
+
+Setup and the Overview connection cards display provider diagnostics. Errors identify the operation, a stable failure code, and a suggested next step; authentication failures can also include the phase, HTTP status, exception type, and application source location. DNS, certificate, connection, timeout, missing executable, and local permission failures have distinct guidance. Provider response bodies, tokens, and callback codes are withheld. Saved credentials alone do not override a reported runtime failure.
+
+Codex device login has a 15-minute local process deadline, and its device code can expire sooner. Robinhood waits five minutes for its OAuth callback. An expired attempt requires a new sign-in; these deadlines are separate from Discord's unlimited manual login wait.
+
 Expand a message's **Images** section to inspect its attachments. Previews are served through the authenticated dashboard and do not invoke Codex or Robinhood. If a preview fails, its link shows a specific, sanitized error and lets you retry. Discord refreshes signed attachment URLs; the reader retains rendered proxy alternatives and saves URL renewals without issuing another signal evaluation.
 
 The interpreter supplies current-message and reply images to Codex. If an entry cites an older original alert whose pictures were not supplied, it adds those pictures for one second evaluation. Transient image timeouts, network errors, rate limits, and server failures can also use that retry; the total remains two attempts. Missing, inaccessible, unsupported, or oversized pictures produce a specific image error and block the entry. Each evaluation retains the four-image and 16 MiB download limits. Old failed decisions are not automatically replayed by this update.

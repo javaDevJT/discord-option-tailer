@@ -511,7 +511,7 @@ def _safe_runtime(raw, path):
         "heartbeat_at": _safe_text(value.get("heartbeat_at"), 128),
         "state": _safe_state(value.get("state")),
         "detail": _safe_detail(value.get("detail")),
-        "discord": {"state": _safe_state(discord.get("state")), "channels": channels},
+        "discord": {"state": _safe_state(discord.get("state")), "detail": _safe_detail(discord.get("detail")), "channels": channels},
         "codex": _safe_runtime_section(value.get("codex")),
         "broker": _safe_runtime_section(value.get("broker")),
     }

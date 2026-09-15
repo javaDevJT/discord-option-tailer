@@ -172,11 +172,12 @@ class InterpreterChecks(unittest.TestCase):
                     with patch.object(interpreter, "_interpret", side_effect=InterpretationError(error)):
                         with self.assertRaises(InterpretationError):
                             await operation()
-                    self.assertEqual(events[-1], {"component": "codex", "state": state})
+                    self.assertEqual({key: events[-1][key] for key in ("component", "state")}, {"component": "codex", "state": state})
+                    self.assertIn("code=", events[-1]["detail"])
                 with patch.object(interpreter, "_interpret", return_value=copy.deepcopy(result)):
                     await operation()
                 self.assertEqual(events[-1], {"component": "codex", "state": "ready"})
-            self.assertTrue(all(set(event) == {"component", "state"} for event in events))
+            self.assertTrue(all(set(event) <= {"component", "state", "detail"} for event in events))
         asyncio.run(scenario())
 
     def test_recovery_keeps_old_origin_when_context_is_full(self):
@@ -682,7 +683,9 @@ class CodexInterpreterChecks(unittest.TestCase):
                         asyncio.run(interpreter.interpret(MESSAGE, [], []))
                 self.assertEqual(run.call_count, 2)  # login status plus one model request
                 self.assertEqual((raised.exception.code, raised.exception.attempts), ("auth_required", 1))
-                self.assertEqual(events[-1], {"component": "codex", "state": "auth_required"})
+                self.assertEqual({key: events[-1][key] for key in ("component", "state")}, {"component": "codex", "state": "auth_required"})
+                self.assertIn("Use Codex sign-in", events[-1]["detail"])
+                self.assertIn("attempts=1", events[-1]["detail"])
 
     def test_only_exact_disabled_code_mode_startup_notice_is_accepted(self):
         notice = {"type": "item.completed", "item": {"type": "error", "message": CodexInterpreter._DISABLED_CODE_MODE_NOTICE}}

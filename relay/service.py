@@ -15,8 +15,8 @@ from pathlib import Path
 from .browser import SNOWFLAKE, login, monitor
 from .broker import broker_credentials_state
 from .core import Store, channel_allows_author, load_config
-from .interpreter import CodexInterpreter, InterpretationError
-from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, previous_auth_state
+from .interpreter import CodexInterpreter, InterpretationError, safe_interpretation_reason
+from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, failure_detail, previous_auth_state
 
 LOG = logging.getLogger(__name__)
 
@@ -54,11 +54,12 @@ class RuntimeStatus:
             states = [rows.get(key, {}).get("state", "starting") for key in self.channel_ids]
             aggregate = next((candidate for candidate in ("login_required", "needs_attention", "reconnecting", "starting")
                               if candidate in states), "connected")
-            self.value[component].update(state=aggregate, channels=list(rows.values()))
+            affected = next((row for row in rows.values() if row.get("state") == aggregate), {})
+            self.value[component].update(state=aggregate, detail=affected.get("detail", ""), channels=list(rows.values()))
         else:
             if (component in {"codex", "broker"}
                     and str(self.value[component].get("state", "")).lower() in AUTH_REQUIRED_STATES
-                    and state not in HEALTHY_STATES):
+                    and state not in HEALTHY_STATES and state not in AUTH_REQUIRED_STATES):
                 # A credential file, saved login, or nonhealthy probe is only a
                 # setup signal. Preserve a provider failure until real health.
                 self.write(heartbeat=True)
@@ -163,9 +164,11 @@ async def serve(config_path):
                     # authenticate; interpreter success publishes the clearing ready event.
                     codex_state = "configured"
                 status.event({"component": "codex", "state": codex_state})
-            except (InterpretationError, OSError):
+            except (InterpretationError, OSError) as exc:
                 codex_ready = False
-                status.event({"component": "codex", "state": "unavailable"})
+                detail = (f"Codex startup check: {safe_interpretation_reason(exc)}. Use Codex sign-in if authorization expired; otherwise check the configured model and container runtime."
+                          if isinstance(exc, InterpretationError) else failure_detail(exc, provider="Codex", phase="startup check"))
+                status.event({"component": "codex", "state": "auth_required" if isinstance(exc, InterpretationError) and exc.code == "auth_required" else "unavailable", "detail": detail})
             status.ready = configured_channels and broker_ready and codex_ready
             status.detail = ("Monitoring configured channels; execution follows the configured mode." if status.ready else
                              "Observation only until channel IDs, Robinhood authorization and Codex subscription login are configured.")
@@ -202,7 +205,8 @@ async def serve(config_path):
                     failure_frame = failure_frame.tb_next
                 location = f" at {Path(failure_frame.tb_frame.f_code.co_filename).name}:{failure_frame.tb_lineno}" if failure_frame else ""
                 failures.append(f"{type(failure).__name__}{location}")
-            status.write(state="error", detail=f"Worker unavailable ({'; '.join(failures)}). Check configuration and login; connection recovery will retry automatically.")
+            detail = failure_detail(exc, provider="Worker", phase="startup or processing")
+            status.write(state="error", detail=f"{detail} ({'; '.join(failures)}). Automatic retry in {delay} seconds.")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 

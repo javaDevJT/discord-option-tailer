@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import webbrowser
 import uuid
 
-from .status import publish_status
+from .status import failure_detail, publish_status
 
 
 ROBINHOOD_ENDPOINT = "https://agent.robinhood.com/mcp/trading"
@@ -600,11 +600,18 @@ class RobinhoodMCP:
             state = "auth_required" if is_auth_required(result) else "unavailable"
         else:
             state = "connected"
-        publish_status(self.on_status, "broker", state)
+        detail = None
+        if result.isError:
+            detail = ("Robinhood rejected the operation because authorization needs attention [auth_required]. Use Robinhood sign-in and verify account access."
+                      if state == "auth_required" else "Robinhood reported an operation error [tool_error]. Check the transaction's recorded reason and account permissions before retrying.")
+        publish_status(self.on_status, "broker", state, detail=detail)
         return result
 
     def _connection_failed(self, exc):
-        publish_status(self.on_status, "broker", "auth_required" if is_auth_required(exc) else "unavailable")
+        auth_required = is_auth_required(exc)
+        detail = ("Robinhood authorization failed or expired [auth_required]. Use Robinhood sign-in to renew access to the bound account."
+                  if auth_required else failure_detail(exc, provider="Robinhood", phase="connection"))
+        publish_status(self.on_status, "broker", "auth_required" if auth_required else "unavailable", detail=detail)
 
 
 async def login(config, *, authorization_handler=None):

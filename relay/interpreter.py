@@ -1128,7 +1128,12 @@ class CodexInterpreter:
                     break
         if self.on_status and last_error is not None and not last_error.code.startswith("image_"):
             state = "auth_required" if last_error.code == "auth_required" else "unavailable"
-            publish_status(self.on_status, "codex", state)
+            action = ("Use Codex sign-in to renew the ChatGPT subscription session." if last_error.code in {"auth_required", "credentials_missing"}
+                      else "Check the ChatGPT usage allowance and wait for its reset before retrying." if last_error.code == "quota_exhausted"
+                      else "Check NAS internet access and OpenAI service availability." if last_error.code in {"network_unavailable", "timeout"}
+                      else "Check the configured Codex model, executable, and container runtime." if last_error.code in {"runtime_unavailable", "local_runtime", "config_invalid"}
+                      else "Inspect the message and recorded evidence before requesting another evaluation.")
+            publish_status(self.on_status, "codex", state, detail=f"{safe_interpretation_reason(last_error)}. {action}")
         raise last_error
 
     def _interpret(self, data, *, schema=DECISION_SCHEMA, system_prompt=SYSTEM_PROMPT, image_sources=()):

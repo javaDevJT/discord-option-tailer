@@ -33,7 +33,7 @@ from .broker import SCHEMA_PINS, _OAuthStorage, login as broker_login
 from .cli import inspect_broker
 from .core import Hold, Store, instant, load_config, money
 from .interpreter import CodexInterpreter
-from .status import is_auth_required_state
+from .status import failure_detail, is_auth_required_state
 
 
 SNOWFLAKE = re.compile(r"\d{15,22}\Z")
@@ -68,6 +68,8 @@ class _AuthJob:
     process: subprocess.Popen[str] | None = None
     expects_device_code: bool = False
     schema_catalog: list = field(default_factory=list)
+    failure_code: str | None = None
+    timed_out: bool = False
 
 
 class SetupManager:
@@ -198,7 +200,9 @@ class SetupManager:
                     or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in supplied)):
                 raise ValueError
         except ValueError:
-            raise ValueError("The returned URL must match the callback address for this sign-in") from None
+            raise ValueError(
+                "Robinhood callback mismatch [callback_mismatch]. Action: paste the complete callback address from this sign-in attempt."
+            ) from None
         # The destination is fixed: pasted URLs never control a network host.
         connection = http.client.HTTPConnection("127.0.0.1", 8766, timeout=5)
         try:
@@ -207,13 +211,19 @@ class SetupManager:
             status = response.status
             response.read(4096)
         except (OSError, http.client.HTTPException, UnicodeError):
-            raise RuntimeError("The callback listener is unavailable. Start Robinhood sign-in again.") from None
+            raise RuntimeError(
+                "Robinhood callback listener is unavailable [callback_unreachable]. Action: start Robinhood sign-in again."
+            ) from None
         finally:
             connection.close()
         if status != 200:
-            raise ValueError("The callback was rejected. Copy the complete address from this sign-in attempt.")
+            raise ValueError(
+                "Robinhood callback was rejected [auth_rejected]. Action: copy the complete address from this sign-in attempt."
+            )
         if "error" in parse_qs(actual.query):
-            raise ValueError("Robinhood authorization was denied. Start sign-in again.")
+            raise ValueError(
+                "Robinhood authorization was denied [auth_rejected]. Action: start sign-in again."
+            )
         with self._lock:
             if self._jobs.get("robinhood") is job and job.phase == "callback":
                 job.phase = "token_exchange"
@@ -667,13 +677,49 @@ class SetupManager:
             valid = False
         return public, valid, poll
 
+    @staticmethod
+    def _runtime_is_failed(runtime: object) -> bool:
+        return isinstance(runtime, dict) and str(runtime.get("state", "")).lower() in {
+            "unavailable", "error", "failed", "needs_attention"
+        }
+
+    @staticmethod
+    def _runtime_auth_detail(runtime: dict, provider: str, fallback: str) -> str:
+        """Reuse the dashboard's bounded, credential-safe runtime projection."""
+        from .dashboard import _safe_detail
+        detail = runtime.get("detail")
+        if not isinstance(detail, str):
+            return fallback
+        detail = detail.strip()
+        if (
+            not 1 <= len(detail) <= 400
+            or not (detail.startswith(provider + " ")
+                    or (provider == "Codex" and detail.startswith("evaluation failed:")))
+            or "http://" in detail.lower()
+            or "https://" in detail.lower()
+            or any(ord(char) < 32 or ord(char) == 127 for char in detail)
+        ):
+            return fallback
+        detail = _safe_detail(detail)
+        return detail if detail and detail != "details withheld" else fallback
+
     def _public_codex_locked(self) -> dict:
         state = copy.deepcopy(self._auth_state["codex"])
         if state["state"] in {"starting", "waiting", "failed", "cancelled"}:
             return self._safe_auth_projection(state)
         runtime = self._read_runtime(self._read_raw_locked(allow_missing=True)).get("codex", {})
         if isinstance(runtime, dict) and is_auth_required_state(runtime.get("state")):
-            return {"state": "auth_required", "detail": "Codex needs ChatGPT reauthentication. Use Codex sign-in below."}
+            return {"state": "auth_required", "detail": self._runtime_auth_detail(
+                runtime,
+                "Codex",
+                "Codex needs ChatGPT reauthentication [auth_required]. Action: Use Codex sign-in below.",
+            )}
+        if self._runtime_is_failed(runtime):
+            return {"state": "failed", "detail": self._runtime_auth_detail(
+                runtime,
+                "Codex",
+                "Codex runtime is unavailable [runtime_unavailable]. Check worker diagnostics and provider availability; reconnect if authentication is required.",
+            )}
         if self._codex_ready():
             state = {"state": "connected", "detail": "Codex ChatGPT login is available locally."}
         else:
@@ -730,12 +776,20 @@ class SetupManager:
                 state = {"state": "not_connected", "detail": "Robinhood login is not configured."}
 
         runtime = self._read_runtime(raw).get("broker", {})
-        if state["state"] not in {"starting", "waiting"} and isinstance(runtime, dict) and is_auth_required_state(runtime.get("state")):
-            state = {"state": "auth_required", "detail": "Robinhood needs reauthentication. Use Robinhood sign-in below."}
+        if state["state"] not in {"starting", "waiting", "failed", "cancelled"} and isinstance(runtime, dict) and is_auth_required_state(runtime.get("state")):
+            state = {"state": "auth_required", "detail": self._runtime_auth_detail(
+                runtime,
+                "Robinhood",
+                "Robinhood needs reauthentication [auth_required]. Action: Use Robinhood sign-in below.",
+            )}
+        elif state["state"] not in {"starting", "waiting", "failed", "cancelled"} and self._runtime_is_failed(runtime):
+            state = {"state": "failed", "detail": self._runtime_auth_detail(
+                runtime,
+                "Robinhood",
+                "Robinhood runtime is unavailable [runtime_unavailable]. Check worker diagnostics and provider availability; reconnect if authentication is required.",
+            )}
         result = self._safe_auth_projection(state)
         result["token_present"] = token_ready
-        if isinstance(state.get("failure"), dict):
-            result["failure"] = {key: state["failure"][key] for key in ("phase", "type", "source", "line", "http_status") if key in state["failure"]}
         if account_number:
             result["last_four"] = account_number[-4:]
         report = self._read_safe_report(raw)
@@ -802,6 +856,11 @@ class SetupManager:
             "unknown": "Discord login status is unavailable. Wait for the browser worker to reconnect.",
         }
         detail = details[mapped]
+        if not runtime["stale"] and mapped != "connected":
+            detail = section.get("detail") or detail
+        if not runtime["stale"] and runtime.get("state") == "error":
+            mapped = "failed"
+            detail = runtime.get("detail") or "Discord browser worker stopped. Use Reconnect to retry the saved session."
         if mapped == "connected":
             _, channels_valid, _ = self._public_channels(raw)
             if not channels_valid:
@@ -1019,7 +1078,7 @@ class SetupManager:
             self._codex_home.chmod(0o700)
             executable = self._codex_executable()
             if not executable:
-                raise RuntimeError("Codex executable is unavailable")
+                raise FileNotFoundError("Codex executable is unavailable")
             environment = os.environ.copy()
             environment["CODEX_HOME"] = str(self._codex_home)
             # Device authentication must not inherit an API key or desktop
@@ -1051,6 +1110,7 @@ class SetupManager:
             def expire_login() -> None:
                 with self._lock:
                     if job.thread is not None and job.thread.is_alive() and job.process is process:
+                        job.timed_out = True
                         self._terminate_codex_process_locked(job, force=True)
 
             timeout_timer = threading.Timer(CODEX_AUTH_TIMEOUT_SECONDS, expire_login)
@@ -1087,16 +1147,20 @@ class SetupManager:
                         "detail": "Codex ChatGPT login is available locally.",
                     }
                 elif return_code == 0:
+                    code = job.failure_code or "auth_incomplete"
                     self._auth_state["codex"] = {
                         "state": "failed",
-                        "detail": "Codex login finished without a local login file.",
+                        "detail": self._codex_failure_detail(code, "device login"),
+                        "failure": {"phase": "device_login", "code": code},
                     }
                 else:
+                    code = "timeout" if job.timed_out else (job.failure_code or "cli_failed")
                     self._auth_state["codex"] = {
                         "state": "failed",
-                        "detail": "Codex login failed; inspect the Browser login flow.",
+                        "detail": self._codex_failure_detail(code, "device login"),
+                        "failure": {"phase": "device_login", "code": code},
                     }
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 if job.cancelled.is_set():
                     self._auth_state["codex"] = {
@@ -1104,9 +1168,11 @@ class SetupManager:
                         "detail": "Codex setup was cancelled.",
                     }
                 else:
+                    code = self._codex_exception_code(exc)
                     self._auth_state["codex"] = {
                         "state": "failed",
-                        "detail": "Codex login could not be started.",
+                        "detail": self._codex_failure_detail(code, "initialization"),
+                        "failure": {"phase": "initialization", "code": code},
                     }
         finally:
             if timeout_timer is not None:
@@ -1123,6 +1189,9 @@ class SetupManager:
             return
         # Pinned CLI prints ANSI-colored URL/code on separate lines.
         line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        code = self._codex_line_code(line)
+        if code is not None and code != "auth_required":
+            job.failure_code = code
         url = self._whitelisted_device_url(line)
         code = self._device_code(line)
         if job.expects_device_code:
@@ -1141,6 +1210,55 @@ class SetupManager:
                 state["verification_url"] = url
             if code is not None:
                 state["user_code"] = code
+
+    @staticmethod
+    def _codex_line_code(line: str) -> str | None:
+        text = line[:4096].lower()
+        if any(term in text for term in ("certificate verify failed", "certificate_verify_failed", "ssl error", "tls error")):
+            return "tls_failed"
+        if any(term in text for term in ("name or service not known", "failed to lookup", "dns", "could not resolve")):
+            return "dns_failed"
+        if any(term in text for term in ("timed out", "timeout", "connection timed out")):
+            return "timeout"
+        if any(term in text for term in ("network is unreachable", "connection refused", "connection error", "network error")):
+            return "network_unavailable"
+        if any(term in text for term in ("expired", "invalid code", "authorization denied", "access denied", "unauthorized")):
+            return "auth_rejected"
+        if any(term in text for term in ("authentication required", "not authenticated", "please log in", "reauth")):
+            return "auth_required"
+        if any(term in text for term in ("command not found", "unknown option", "no such file", "could not start")):
+            return "runtime_unavailable"
+        if any(term in text for term in ("login failed", "device login failed", "unexpected response")):
+            return "cli_failed"
+        return None
+
+    @staticmethod
+    def _codex_exception_code(error: Exception) -> str:
+        if isinstance(error, FileNotFoundError):
+            return "runtime_unavailable"
+        if isinstance(error, subprocess.TimeoutExpired):
+            return "timeout"
+        detail = failure_detail(error, provider="Codex", phase="initialization")
+        match = re.search(r"\[([a-z0-9_]+)\]", detail)
+        return match.group(1) if match else "cli_failed"
+
+    @staticmethod
+    def _codex_failure_detail(code: str, phase: str) -> str:
+        details = {
+            "runtime_unavailable": ("the Codex CLI is unavailable", "Check the configured Codex executable and install it if needed."),
+            "runtime_missing": ("a required executable is missing", "Check the container installation and configured executable."),
+            "local_permission": ("Codex could not access a required local file", "Check persistent volume ownership and permissions."),
+            "tls_failed": ("the HTTPS connection could not be verified", "Check the NAS clock, trusted certificates, and HTTPS proxy."),
+            "dns_failed": ("the Codex hostname could not be resolved", "Check DNS and internet access from the NAS."),
+            "network_unavailable": ("the Codex service could not be reached", "Check NAS internet access, firewall, proxy, and provider status."),
+            "timeout": ("device login timed out", "Start a new Codex sign-in and finish it before the device code expires."),
+            "auth_rejected": ("Codex rejected the device sign-in", "Start a new sign-in and use the current device code."),
+            "auth_required": ("Codex authentication is required", "Complete ChatGPT sign-in, then retry."),
+            "auth_incomplete": ("device login did not create a local login", "Start Codex sign-in again and complete it in the browser."),
+            "cli_failed": ("the Codex CLI could not complete device login", "Check the CLI installation, then retry sign-in."),
+        }
+        explanation, action = details.get(code, details["cli_failed"])
+        return f"Codex {phase} failed [{code}]. {explanation}. Action: {action}"
 
     @staticmethod
     def _whitelisted_device_url(line: str) -> str | None:
@@ -1346,14 +1464,41 @@ class SetupManager:
             failure["http_status"] = status
         label = {"initialization": "initialization", "authorization": "authorization", "callback": "callback wait",
                  "token_exchange": "token exchange", "account_inspection": "account inspection", "account_binding": "account binding"}.get(phase, "setup")
-        detail = f"Robinhood {label} failed ({kind}). Saved credentials were kept."
+        code, action, explanation = "operation_failed", "Retry the operation; if it persists, report this code.", "the setup operation failed"
+        try:
+            text = str(current)[:4096].lower()
+        except Exception:
+            text = ""
         if isinstance(current, TimeoutError) and phase == "callback":
-            detail = "Robinhood sign-in expired before its callback arrived. Start a new attempt and finish within five minutes."
-        elif kind == "OAuthTokenError":
-            failure["phase"] = "token_exchange"
-            detail = "Robinhood token exchange failed. Saved credentials were kept; a new sign-in may be required."
-        elif status in (401, 403):
-            detail = f"Robinhood rejected account access during {label} (HTTP {status})."
+            code, explanation = "auth_expired", "sign-in expired before its callback arrived"
+            action = "Start a new attempt and finish Robinhood sign-in within five minutes."
+        elif kind == "OAuthTokenError" or status in (401, 403) or any(term in text for term in (
+            "invalid token", "token expired", "invalid_grant", "unauthorized", "authentication required",
+        )):
+            code, explanation = "auth_rejected", "Robinhood rejected authorization"
+            action = "Start Robinhood sign-in again; if it repeats, verify the account is authorized."
+            if kind == "OAuthTokenError":
+                failure["phase"] = "token_exchange"
+                label = "token exchange"
+        elif any(term in text for term in (
+            "must be oauth or token", "unsupported setup", "tool is absent", "not allowed",
+        )):
+            code, explanation = "setup_unsupported", "the Robinhood setup or authenticated tool contract is unsupported"
+            action = "Use the supported OAuth setup and reconnect to refresh the authenticated tool contract."
+        elif any(term in text for term in ("capability report is missing", "capability report is invalid", "report does not match")):
+            code, explanation = "report_mismatch", "the Robinhood capability report does not match the selected account"
+            action = "Start Robinhood sign-in again and keep the selected account unchanged."
+        elif any(term in text for term in ("account selection was invalid", "account selection conflicts", "not unique")):
+            code, explanation = "account_selection", "the Robinhood account selection is unsupported"
+            action = "Configure one active Agentic account, then start Robinhood sign-in again."
+        else:
+            safe = failure_detail(current, provider="Robinhood", phase=label)
+            match = re.search(r"\[([a-z0-9_]+)\]\.\s*(.+)$", safe)
+            if match:
+                code, action = match.group(1), match.group(2)
+                explanation = "the provider operation failed"
+        failure.update(code=code, action=action)
+        detail = f"Robinhood {label} failed ({kind}) [{code}]. {explanation}. Action: {action} Saved credentials were kept."
         return {"detail": detail, "failure": failure}
 
     @staticmethod
@@ -1494,6 +1639,12 @@ class SetupManager:
             "state": value.get("state", "not_connected"),
             "detail": value.get("detail", "Setup status unavailable."),
         }
+        if isinstance(value.get("failure"), dict):
+            result["failure"] = {
+                key: value["failure"][key]
+                for key in ("phase", "type", "code", "action", "source", "line", "http_status")
+                if key in value["failure"]
+            }
         if value.get("verification_url"):
             result["verification_url"] = value["verification_url"]
         if value.get("user_code"):

@@ -120,7 +120,7 @@ class SetupUITests(unittest.TestCase):
         def handle(route, request):
             path = urlparse(request.url).path
             if path == "/api/status":
-                fulfill(route, {"mode": "shadow", "live_orders_enabled": False, "counts": {}})
+                fulfill(route, state.get("runtime_status", {"mode": "shadow", "live_orders_enabled": False, "counts": {}}))
                 return
             if path in {"/api/messages", "/api/orders", "/api/events"}:
                 fulfill(route, {"items": [], "next_offset": None})
@@ -471,6 +471,38 @@ class SetupUITests(unittest.TestCase):
                 page.keyboard.press("Escape")
                 expect(dialog).to_be_hidden()
                 expect(browser_link).to_be_focused()
+            finally:
+                browser.close()
+
+    def test_loading_and_provider_diagnostics_are_visible(self):
+        loading = "Discord is still loading. The browser will stay open; manual sign-in has no time limit."
+        state = {"status": self.status_payload(
+            discord={"state": "starting", "detail": loading},
+            codex={"state": "failed", "detail": "Codex device login failed [dns_failed]. Check NAS DNS.",
+                   "failure": {"phase": "device_login", "code": "dns_failed"}},
+            robinhood={"state": "failed", "detail": "Robinhood token exchange failed [http_503]. Retry when service recovers.",
+                       "failure": {"phase": "token_exchange", "type": "HTTPStatusError", "http_status": 503, "source": "broker.py", "line": 42}},
+        ), "headers": [], "requests": []}
+        state["runtime_status"] = {"mode": "shadow", "runtime": {
+            "discord": {"state": "starting", "detail": loading},
+            "codex": {"state": "unavailable", "detail": "evaluation failed: code=timeout; attempts=2; no order submitted"},
+            "broker": {"state": "unavailable", "detail": "Robinhood connection failed [dns_failed]. Check NAS DNS."},
+        }}
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                expect(page.locator("#codex-setup-detail")).to_contain_text("Code: dns_failed")
+                expect(page.locator("#robinhood-setup-detail")).to_contain_text("HTTP: 503")
+                expect(page.locator("#robinhood-setup-detail")).to_contain_text("Source: broker.py:42")
+                page.get_by_role("link", name="Open Browser login").click()
+                expect(page.locator("#browser-login-detail")).to_have_text(loading)
+                expect(page.locator("#browser-login-status-label")).not_to_have_text("Failed")
+                page.locator("#browser-login-close").click()
+                expect(page.locator("#browser-login-dialog")).to_be_hidden()
+                expect(page.locator("#runtime-discord-detail")).to_have_text(loading)
+                expect(page.locator("#runtime-codex-detail")).to_contain_text("attempts=2")
+                expect(page.locator("#runtime-broker-detail")).to_contain_text("dns_failed")
+                self.assertEqual(state["requests"], [])
             finally:
                 browser.close()
 

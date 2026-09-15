@@ -505,11 +505,11 @@ function relayReadTimeoutSignal() {
     setText("#runtime-mode", mode.toUpperCase());
     setText("#runtime-mode-detail", `${liveEnabled ? "Live order gate flagged" : "Live order submission disabled"}${killSwitch ? " · kill switch active" : ""}`);
     setText("#runtime-discord", stateLabel(discord));
-    setText("#runtime-discord-detail", `${channelCount} configured channel${channelCount === 1 ? "" : "s"}${stale ? " · runtime stale" : ""}`);
+    setText("#runtime-discord-detail", firstValue(discord?.detail, `${channelCount} configured channel${channelCount === 1 ? "" : "s"}${stale ? " · runtime stale" : ""}`));
     setText("#runtime-codex", stateLabel(codex));
-    setText("#runtime-codex-detail", ledgerAvailable ? "Subscription interpreter boundary" : "Ledger unavailable");
+    setText("#runtime-codex-detail", firstValue(codex?.detail, ledgerAvailable ? "Subscription interpreter boundary" : "Ledger unavailable"));
     setText("#runtime-broker", stateLabel(broker));
-    setText("#runtime-broker-detail", liveEnabled ? "Live order gate reported enabled by runtime" : "Shadow proposals only · no live orders");
+    setText("#runtime-broker-detail", firstValue(broker?.detail, liveEnabled ? "Live order gate reported enabled by runtime" : "Shadow proposals only · no live orders"));
 
     const sidebarDot = $("#sidebar-status-dot");
     const sidebarLabel = $("#sidebar-status-label");
@@ -1261,7 +1261,17 @@ function relayReadTimeoutSignal() {
     if (["starting", "waiting", "paused", "stopped", "pending_reload", "pending"].includes(stateName)) return "is-held";
     return "is-context";
   };
-  const setupDetail = (part, fallback) => setupText(part?.detail, fallback);
+  const setupDetail = (part, fallback) => {
+    const failure = part?.failure;
+    const diagnostic = failure && typeof failure === "object" ? [
+      failure.phase && `Phase: ${setupText(failure.phase)}`,
+      failure.code && `Code: ${setupText(failure.code)}`,
+      failure.type && `Error: ${setupText(failure.type)}`,
+      Number.isInteger(failure.http_status) && `HTTP: ${failure.http_status}`,
+      failure.source && `Source: ${setupText(failure.source)}${Number.isInteger(failure.line) ? `:${failure.line}` : ""}`,
+    ].filter(Boolean).join(" · ") : "";
+    return [setupText(part?.detail, fallback), diagnostic].filter(Boolean).join(" ");
+  };
   const setupTradingStatus = (status) => {
     const trading = status && typeof status.trading === "object" ? status.trading : {};
     const mode = setupStateName(setupFirst(trading.mode, status?.mode, "unknown"));

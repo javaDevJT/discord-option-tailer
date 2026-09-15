@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from .core import channel_allows_author, instant
 from .ingest import SNOWFLAKE, normalize
+from .status import failure_detail, publish_status
 
 
 LOG = logging.getLogger(__name__)
@@ -260,8 +261,33 @@ def session_state(url: str, channel: dict | None = None) -> str:
     return "needs_attention"
 
 
+NAVIGATION_TIMEOUT_MS = 60000
+NAVIGATION_PROGRESS_SECONDS = 3
+
+
+async def _navigate_with_progress(page, url: str, *, on_progress=None) -> None:
+    """Navigate with bounded waits while keeping cancellation cleanup explicit."""
+    navigation = asyncio.create_task(page.goto(url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS))
+    try:
+        while not navigation.done():
+            await asyncio.wait({navigation}, timeout=NAVIGATION_PROGRESS_SECONDS)
+            if not navigation.done() and on_progress is not None:
+                try:
+                    on_progress()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    LOG.warning("Discord status publication unavailable (%s)", type(exc).__name__)
+        await navigation
+    except asyncio.CancelledError:
+        navigation.cancel()
+        await asyncio.gather(navigation, return_exceptions=True)
+        raise
+
+
 async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_runtime_path=None) -> None:
     """Open Discord for manual login and persist the dedicated browser session."""
+    publish_status(on_status, "discord", "starting", detail="Opening the saved Discord browser. Manual sign-in has no time limit.")
     async with _playwright()() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             _profile(profile_dir), headless=False, accept_downloads=False,
@@ -269,27 +295,53 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
         discovery_task = None
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto("https://discord.com/login", wait_until="domcontentloaded")
+            navigation_problem = ""
+            try:
+                await _navigate_with_progress(
+                    page,
+                    "https://discord.com/login",
+                    on_progress=lambda: publish_status(
+                        on_status,
+                        "discord",
+                        "starting",
+                        detail="Discord is still loading. The browser will stay open; manual sign-in has no time limit.",
+                    ),
+                )
+            except Exception as exc:
+                if page.is_closed():
+                    raise
+                navigation_problem = failure_detail(exc, provider="Discord", phase="page navigation")
+                if "[timeout]" in navigation_problem:
+                    navigation_problem = "Discord's initial page navigation exceeded 60 seconds [timeout]. The browser is still open. Finish sign-in there, or reload the page if it remains blank; manual sign-in has no time limit."
+                publish_status(on_status, "discord", "reconnecting", detail=navigation_problem)
             if discovery_runtime_path:
                 from .discovery import serve_discovery
                 discovery_task = asyncio.create_task(serve_discovery(context, discovery_runtime_path, setup_page=page))
             LOG.warning("Sign in manually in the browser, including any MFA. Waiting for Discord's channel view.")
-            if keep_open:
-                while not page.is_closed():
-                    if on_status:
-                        state = session_state(page.url)
-                        detail = ("Discord sign-in detected. Return to Setup and save both channel URLs to start monitoring."
-                                  if state == "connected" else "Complete Discord sign-in and any verification in the browser.")
-                        on_status({"component": "discord", "state": state, "detail": detail})
-                    await asyncio.sleep(3)
-            else:
-                await page.wait_for_url(re.compile(r"https://discord\.com/channels/"), timeout=0)
-                LOG.info("Discord channel view reached; session saved to the dedicated profile")
+            while not page.is_closed():
+                state = session_state(page.url)
+                if state == "connected":
+                    detail = "Discord sign-in detected. Return to Setup and save both channel URLs to start monitoring."
+                elif state == "login_required":
+                    detail = "Complete Discord sign-in and any verification in the browser. Manual sign-in has no time limit."
+                else:
+                    state = "reconnecting"
+                    detail = navigation_problem or "Discord is still loading or redirecting. The browser will stay open; finish sign-in when it appears."
+                publish_status(on_status, "discord", state, detail=detail)
+                if state == "connected" and not keep_open:
+                    LOG.info("Discord channel view reached; session saved to the dedicated profile")
+                    break
+                await asyncio.sleep(3)
+            if page.is_closed():
+                publish_status(on_status, "discord", "needs_attention", detail="The Discord browser window was closed. Use Reconnect to reopen the saved session.")
         finally:
             if discovery_task is not None:
                 discovery_task.cancel()
                 await asyncio.gather(discovery_task, return_exceptions=True)
-            await context.close()
+            try:
+                await context.close()
+            except Exception as exc:
+                LOG.warning("Discord browser context cleanup failed (%s)", type(exc).__name__)
 
 
 async def monitor(config: dict, on_message, register_verifier=None, on_status=None) -> None:
@@ -306,6 +358,10 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
         raise ValueError("browser.poll_seconds must be between 2 and 60")
     trackers = {str(c["id"]): SnapshotTracker(str(c["id"])) for c in channels}
     profile = _profile(browser_config["profile_dir"])
+
+    def status(channel, state, detail):
+        publish_status(on_status, "discord", state, detail=detail, channel_id=str(channel["id"]))
+
     async with _playwright()() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             profile, headless=False, accept_downloads=False,
@@ -319,11 +375,20 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                 await page.close()
             pages = pages[:2]
             urls = [f"https://discord.com/channels/{c['guild_id']}/{c['id']}" for c in channels]
-            for page, url in zip(pages, urls):
+            for channel, page, url in zip(channels, pages, urls):
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                except Exception:
+                    await _navigate_with_progress(
+                        page,
+                        url,
+                        on_progress=lambda channel=channel: status(
+                            channel,
+                            "starting",
+                            "Discord is still loading the configured channel. Monitoring will resume when it appears.",
+                        ),
+                    )
+                except Exception as exc:
                     LOG.warning("Discord navigation unavailable; the browser will reconnect")
+                    status(channel, "reconnecting", failure_detail(exc, provider="Discord", phase="channel navigation"))
 
             async def verify(message: dict) -> bool:
                 try:
@@ -347,11 +412,6 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             connection_epochs: dict[str, str] = {}
             unavailable: set[str] = set()
             last_recovery: dict[str, float] = {}
-
-            def status(channel, state, detail):
-                if on_status:
-                    on_status({"component": "discord", "channel_id": str(channel["id"]),
-                               "state": state, "detail": detail})
 
             while True:
                 for index, channel in enumerate(channels):
@@ -378,7 +438,15 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                             if now - last_recovery.get(channel_id, -60) >= 30:
                                 last_recovery[channel_id] = now
                                 tracker.reset()
-                                await page.goto(urls[index], wait_until="domcontentloaded", timeout=30000)
+                                await _navigate_with_progress(
+                                    page,
+                                    urls[index],
+                                    on_progress=lambda channel=channel: status(
+                                        channel,
+                                        "reconnecting",
+                                        "Discord is still loading the configured channel. Monitoring will resume when it appears.",
+                                    ),
+                                )
                             raise ValueError("Restoring the configured channel after navigation or login")
                         snapshot = await page.evaluate(EXTRACT_MESSAGES_JS, channel_id)
                         if not _channel_url_matches(snapshot.get("url", ""), channel) or not _channel_url_matches(page.url, channel):
@@ -415,14 +483,31 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                             LOG.warning("Channel %s unavailable (%s); messages may be missed", channel_id, exc)
                         unavailable.add(channel_id)
                         state = "login_required" if snapshot.get("auth_required") else session_state(page.url, channel)
-                        status(channel, "login_required" if state == "login_required" else "reconnecting",
-                               "Discord requires reauthentication." if state == "login_required" else "Waiting for the channel connection or visible messages.")
+                        if state == "login_required":
+                            detail = "Discord requires sign-in or verification. Complete it in Browser login; manual sign-in has no time limit."
+                        elif isinstance(exc, ValueError):
+                            detail = "Discord's channel message list is not ready. Let the page finish loading, then confirm the configured channel opens and scroll to its newest messages. Monitoring will resume automatically."
+                        else:
+                            detail = failure_detail(exc, provider="Discord", phase="channel observation")
+                        status(channel, "login_required" if state == "login_required" else "reconnecting", detail)
                         if state != "login_required" and now - last_recovery.get(channel_id, -60) >= 30:
                             last_recovery[channel_id] = now
                             try:
-                                await page.goto(urls[index], wait_until="domcontentloaded", timeout=30000)
-                            except Exception:
-                                pass
+                                await _navigate_with_progress(
+                                    page,
+                                    urls[index],
+                                    on_progress=lambda channel=channel: status(
+                                        channel,
+                                        "reconnecting",
+                                        "Discord is still loading the configured channel. Monitoring will resume when it appears.",
+                                    ),
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as recovery_exc:
+                                status(channel, "reconnecting", failure_detail(
+                                    recovery_exc, provider="Discord", phase="channel navigation"
+                                ))
                         continue
                     # Callback failure propagates and stops the monitor; never blindly replay a money action.
                     for message in events:
@@ -433,4 +518,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             if discovery_task is not None:
                 discovery_task.cancel()
                 await asyncio.gather(discovery_task, return_exceptions=True)
-            await context.close()
+            try:
+                await context.close()
+            except Exception as exc:
+                LOG.warning("Discord browser context cleanup failed (%s)", type(exc).__name__)
