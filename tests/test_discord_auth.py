@@ -65,7 +65,7 @@ class DiscordLoginDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             "response",
             _Response("https://discord.com/api/v9/auth/login", 400, {"captcha_key": ["captcha-required"]}),
         )
-        await asyncio.sleep(0)
+        await asyncio.gather(*self.diagnostics._tasks)
         self.assertIn("captcha_requested", self.diagnostics.detail("fallback"))
         self.assertNotIn("captcha_rejected", self.diagnostics.detail("fallback"))
 
@@ -74,7 +74,7 @@ class DiscordLoginDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             "response",
             _Response("https://discord.com/api/v9/auth/login", 400, {"code": "INVALID_LOGIN"}),
         )
-        await asyncio.sleep(0)
+        await asyncio.gather(*self.diagnostics._tasks)
         self.assertIn("auth_rejected", self.diagnostics.detail("fallback"))
         self.assertIn("INVALID_LOGIN", self.diagnostics.detail("fallback"))
         self.diagnostics.clear()
@@ -93,7 +93,7 @@ class DiscordLoginDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 {"code": 40001, "message": "PRIVATE", "token": "SECRET_TOKEN", "captcha_rqdata": "SECRET_RQ"},
             ),
         )
-        await asyncio.sleep(0)
+        await asyncio.gather(*self.diagnostics._tasks)
         detail = self.diagnostics.detail("fallback")
         self.assertIn("40001", detail)
         for secret in ("SECRET", "PRIVATE", "SECRET_TOKEN", "SECRET_RQ"):
