@@ -108,7 +108,7 @@ class FakeClient:
     async def start(self, token, reconnect=True):
         self.token = token
         self.reconnect = reconnect
-        await self.callbacks["on_socket_raw_receive"]({"op": 11})
+        await self.callbacks["on_socket_raw_receive"]('{"op":11,"d":null}')
         await self.callbacks["on_ready"]()
         self.started.set()
         await self.release.wait()
@@ -304,7 +304,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             status.write(heartbeat=True)
             self.assertTrue(_safe_runtime(config, status.path)["stale"])
             with patch("relay.gateway.time.monotonic", return_value=1000):
-                await runtime.client.callbacks["on_socket_raw_receive"]({"op": 11, "private": "never retain"})
+                await runtime.client.callbacks["on_socket_raw_receive"]('{"op":11,"private":"never retain"}')
                 await runtime.observe(FakeMessage("500000000000000050", FakeChannel(CHANNEL_SIGNALS)))
                 message = await runtime.queue.get()
                 runtime.queue.task_done()
@@ -320,9 +320,11 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 await runtime.report_health()
                 self.assertEqual(_safe_runtime(config, status.path)["discord"]["state"], "reconnecting")
                 self.assertFalse(await runtime.verify(message))
-                await runtime.client.callbacks["on_socket_raw_receive"]({"op": 0})
+                for payload in ('{"op":0}', 'invalid JSON', b'\xff', '[]',
+                                '{"op":11,"padding":"' + 'x' * 1024 + '"}'):
+                    await runtime.client.callbacks["on_socket_raw_receive"](payload)
                 self.assertEqual(runtime.last_gateway_ack, 1000)
-                await runtime.client.callbacks["on_socket_raw_receive"]({"op": 11})
+                await runtime.client.callbacks["on_socket_raw_receive"](b'{"op":11,"d":null}')
                 await runtime.report_health()
                 self.assertTrue(await runtime.verify(message))
                 await runtime.client.callbacks["on_disconnect"]()
@@ -601,6 +603,17 @@ class InstalledGatewayAPITests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertFalse(client._connection._chunk_guilds)
             self.assertTrue(client._enable_debug_events)
+            from discord.gateway import DiscordWebSocket
+            received = []
+            socket = SimpleNamespace(log_receive=received.append, _keep_alive=None,
+                                     DISPATCH=0, RECONNECT=7, HEARTBEAT_ACK=11)
+            await DiscordWebSocket.received_message(socket, '{"op":11,"d":null}')
+            self.assertEqual(received, ['{"op":11,"d":null}'])
+            runtime = gateway._GatewayRuntime(_config(), None, None, None)
+            runtime.client = FakeClient()
+            runtime.bind_events()
+            await runtime.client.callbacks["on_socket_raw_receive"](received[0])
+            self.assertIsNotNone(runtime.last_gateway_ack)
         finally:
             await client.close()
 

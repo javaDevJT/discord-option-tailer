@@ -12,6 +12,7 @@ import asyncio
 from collections import OrderedDict
 from datetime import datetime, timezone
 import inspect
+import json
 import logging
 import math
 import re
@@ -426,6 +427,14 @@ class _GatewayRuntime:
         async def on_socket_raw_receive(payload: Any) -> None:
             # Observe only the protocol acknowledgement. Never retain or log
             # Gateway payloads, and leave heartbeat scheduling to the library.
+            # discord.py-self dispatches this before decoding the JSON frame.
+            if isinstance(payload, (str, bytes)):
+                if len(payload) > 1024:
+                    return
+                try:
+                    payload = json.loads(payload)
+                except (ValueError, UnicodeError):
+                    return
             if isinstance(payload, dict) and payload.get("op") == 11:
                 self.last_gateway_ack = time.monotonic()
 
