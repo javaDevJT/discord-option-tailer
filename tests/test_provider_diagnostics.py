@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from relay.browser import AUTH_REQUIRED_JS, login, monitor
+from relay.discovery import EXTRACT_GUILDS_JS
 from relay.dashboard import _safe_runtime
 from relay.service import RuntimeStatus
 from relay.status import failure_detail
@@ -29,6 +30,8 @@ class ProviderDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 raise asyncio.TimeoutError("https://private.example/?token=PRIVATE")
 
             async def evaluate(self, expression):
+                if expression == EXTRACT_GUILDS_JS:
+                    return {"sidebar_present": True, "login_required": False, "guilds": [{"id": "3000000000000000010"}]}
                 del expression
                 return False
 

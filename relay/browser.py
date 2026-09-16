@@ -15,6 +15,7 @@ import time
 from urllib.parse import urlsplit
 
 from .core import channel_allows_author, instant
+from .discord_auth import DiscordLoginDiagnostics
 from .ingest import SNOWFLAKE, normalize
 from .status import failure_detail, publish_status
 
@@ -290,10 +291,21 @@ async def requires_manual_auth(page) -> bool | None:
 
 
 async def manual_auth_page(context):
-    """Leave every tab alone while a user completes sign-in or a challenge."""
+    """Wait for sign-in and the rendered account UI before navigating any tab."""
     for page in context.pages:
+        if page.is_closed():
+            continue
         if await requires_manual_auth(page) is not False:
             return page
+        if session_state(page.url) == "connected":
+            from .discovery import EXTRACT_GUILDS_JS
+            try:
+                sidebar = await page.evaluate(EXTRACT_GUILDS_JS)
+                if (not isinstance(sidebar, dict) or sidebar.get("login_required")
+                        or sidebar.get("sidebar_present") is not True or not sidebar.get("guilds")):
+                    return page
+            except Exception:
+                return page
     return None
 
 
@@ -325,6 +337,7 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
             _profile(profile_dir), headless=False, accept_downloads=False,
         )
         discovery_task = None
+        diagnostics = DiscordLoginDiagnostics(context)
         try:
             page = await manual_auth_page(context)
             if page is None:
@@ -355,16 +368,18 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
             LOG.warning("Sign in manually in the browser, including any MFA. Waiting for Discord's channel view.")
             while not page.is_closed():
                 state = session_state(page.url)
-                if await manual_auth_page(context) is not None:
-                    state = "login_required"
+                pending = await manual_auth_page(context)
+                if pending is not None:
+                    state = "login_required" if await requires_manual_auth(pending) is True else "reconnecting"
                 if state == "connected":
+                    diagnostics.clear()
                     detail = "Discord sign-in detected. Return to Setup and save both channel URLs to start monitoring."
                 elif state == "login_required":
                     detail = "Complete Discord sign-in and any verification in the browser; close unused sign-in tabs. Manual sign-in has no time limit."
                 else:
                     state = "reconnecting"
                     detail = navigation_problem or "Discord is still loading or redirecting. The browser will stay open; finish sign-in when it appears."
-                publish_status(on_status, "discord", state, detail=detail)
+                publish_status(on_status, "discord", state, detail=diagnostics.detail(detail))
                 if state == "connected" and not keep_open:
                     LOG.info("Discord channel view reached; session saved to the dedicated profile")
                     break
@@ -372,6 +387,7 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
             if page.is_closed():
                 publish_status(on_status, "discord", "needs_attention", detail="The Discord browser window was closed. Use Reconnect to reopen the saved session.")
         finally:
+            await diagnostics.close()
             if discovery_task is not None:
                 discovery_task.cancel()
                 await asyncio.gather(discovery_task, return_exceptions=True)
@@ -404,6 +420,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             profile, headless=False, accept_downloads=False,
         )
         discovery_task = None
+        diagnostics = DiscordLoginDiagnostics(context)
         try:
             pages = list(context.pages)
             while len(pages) < 2:
@@ -454,13 +471,18 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             last_recovery: dict[str, float] = {}
 
             while True:
-                if await manual_auth_page(context) is not None:
+                pending = await manual_auth_page(context)
+                if pending is not None:
+                    auth_pending = await requires_manual_auth(pending) is True
+                    detail = ("Discord sign-in or CAPTCHA is pending. Automatic navigation is paused in all tabs; finish verification in Browser login and close unused sign-in tabs."
+                              if auth_pending else "Discord's signed-in interface is still loading. Automatic navigation is paused until it appears; the browser will stay open.")
                     for channel in channels:
                         trackers[str(channel["id"])].reset()
                         unavailable.add(str(channel["id"]))
-                        status(channel, "login_required", "Discord sign-in or CAPTCHA is pending. Automatic navigation is paused in all tabs; finish verification in Browser login and close unused sign-in tabs.")
+                        status(channel, "login_required" if auth_pending else "reconnecting", diagnostics.detail(detail))
                     await asyncio.sleep(poll_seconds)
                     continue
+                all_channels_ready = True
                 for index, channel in enumerate(channels):
                     channel_id = str(channel["id"])
                     tracker = trackers[channel_id]
@@ -477,15 +499,17 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                     try:
                         state = session_state(page.url, channel)
                         if state == "login_required":
+                            all_channels_ready = False
                             tracker.reset()
                             unavailable.add(channel_id)
-                            status(channel, state, "Discord requires login or verification in Browser login.")
+                            status(channel, state, diagnostics.detail("Discord requires login or verification in Browser login."))
                             continue
                         snapshot = await page.evaluate(EXTRACT_MESSAGES_JS, channel_id)
                         if snapshot.get("auth_required"):
                             raise ValueError("Manual Discord verification is pending")
                         if not _channel_url_matches(page.url, channel):
                             if await manual_auth_page(context) is not None:
+                                all_channels_ready = False
                                 break
                             if now - last_recovery.get(channel_id, -60) >= 30:
                                 last_recovery[channel_id] = now
@@ -510,6 +534,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                             LOG.warning("Channel %s browser connection changed; next snapshot is context only", channel_id)
                         connection_epochs[channel_id] = epoch
                         if not snapshot["at_bottom"]:
+                            all_channels_ready = False
                             tracker.reset()
                             if channel_id not in unavailable:
                                 LOG.warning("Channel %s is scrolled into history; context only until the channel bottom is restored",
@@ -529,6 +554,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                         if snapshot["at_bottom"]:
                             status(channel, "connected", "Reading current messages; Discord manages this browser session.")
                     except Exception as exc:
+                        all_channels_ready = False
                         tracker.reset()
                         if channel_id not in unavailable:
                             LOG.warning("Channel %s unavailable (%s); messages may be missed", channel_id, exc)
@@ -540,7 +566,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                             detail = "Discord's channel message list is not ready. Waiting without reloading the page. Finish any verification; if the page stays blank, reload it manually or use Reconnect."
                         else:
                             detail = failure_detail(exc, provider="Discord", phase="channel observation")
-                        status(channel, "login_required" if state == "login_required" else "reconnecting", detail)
+                        status(channel, "login_required" if state == "login_required" else "reconnecting", diagnostics.detail(detail))
                         if state == "login_required":
                             break
                         continue
@@ -548,8 +574,11 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                     for message in events:
                         message["browser_connection_epoch"] = snapshot.get("connection_epoch", "")
                         await on_message(message)
+                if all_channels_ready and await manual_auth_page(context) is None:
+                    diagnostics.clear()
                 await asyncio.sleep(poll_seconds)
         finally:
+            await diagnostics.close()
             if discovery_task is not None:
                 discovery_task.cancel()
                 await asyncio.gather(discovery_task, return_exceptions=True)

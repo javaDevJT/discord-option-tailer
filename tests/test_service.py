@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from relay.browser import AUTH_REQUIRED_JS, monitor, session_state
+from relay.discovery import EXTRACT_GUILDS_JS
 from relay.core import Engine, Hold, Store, load_config
 from relay.ingest import normalize
 from relay.service import RuntimeStatus, observe, run_until_change, serve, signature, watch_changes
@@ -231,6 +232,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             async def goto(self, url, **kwargs):
                 self.url = url
             async def evaluate(self, expression, channel_id=None):
+                if expression == EXTRACT_GUILDS_JS:
+                    return {"sidebar_present": True, "login_required": False, "guilds": [{"id": "3000000000000000010"}]}
                 if expression == AUTH_REQUIRED_JS:
                     return False
                 numbers = [1] if self.index else [1] + ([2] if step[0] >= 1 else []) + ([3] if step[0] >= 4 else [])

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from relay.browser import AUTH_REQUIRED_JS, EXTRACT_MESSAGES_JS, SnapshotTracker, login, monitor
+from relay.discovery import EXTRACT_GUILDS_JS
 
 
 CHANNEL = "1000000000000000001"
@@ -35,7 +36,7 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_reports_success_while_browser_remains_open(self):
         with tempfile.TemporaryDirectory() as directory:
             statuses = []
-            page = SimpleNamespace(url="https://discord.com/login", is_closed=lambda: False)
+            page = SimpleNamespace(url="https://discord.com/login", sidebar_ready=False, guilds=[], is_closed=lambda: False)
             page.goto = AsyncMock()
             context = SimpleNamespace(pages=[page], close=AsyncMock())
 
@@ -48,6 +49,8 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     return False
 
             async def evaluate(expression):
+                if expression == EXTRACT_GUILDS_JS:
+                    return {"sidebar_present": page.sidebar_ready, "login_required": False, "guilds": page.guilds}
                 self.assertEqual(expression, AUTH_REQUIRED_JS)
                 return False
 
@@ -56,6 +59,12 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             async def sign_in_then_stop(seconds):
                 if page.url.endswith("/login"):
                     page.url = "https://discord.com/channels/@me"
+                elif not page.sidebar_ready:
+                    self.assertNotIn("connected", [row["state"] for row in statuses])
+                    page.sidebar_ready = True
+                elif not page.guilds:
+                    self.assertNotIn("connected", [row["state"] for row in statuses])
+                    page.guilds = [{"id": "3000000000000000010"}]
                 else:
                     raise RuntimeError("fixture complete")
 
@@ -64,7 +73,7 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "fixture complete"):
                     await login(directory, keep_open=True, on_status=statuses.append)
-            self.assertEqual([row["state"] for row in statuses], ["starting", "login_required", "connected"])
+            self.assertEqual([row["state"] for row in statuses], ["starting", "login_required", "reconnecting", "reconnecting", "connected"])
             self.assertIn("sign-in detected", statuses[-1]["detail"])
             self.assertIn("Return to Setup", statuses[-1]["detail"])
             page.goto.assert_not_awaited()
@@ -82,6 +91,8 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
             context = SimpleNamespace(pages=[page], close=AsyncMock())
 
             async def evaluate(expression):
+                if expression == EXTRACT_GUILDS_JS:
+                    return {"sidebar_present": True, "login_required": False, "guilds": [{"id": "3000000000000000010"}]}
                 self.assertEqual(expression, AUTH_REQUIRED_JS)
                 return page.auth_required
 
@@ -121,6 +132,8 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     self.index = index
                     self.url = spec.get("url", "about:blank")
                     self.auth_required = spec.get("auth_required", snapshot.get("auth_required", False))
+                    self.sidebar_ready = spec.get("sidebar_ready", True)
+                    self.snapshot = spec.get("snapshot", snapshot)
                     self.closed = False
 
                 def is_closed(self):
@@ -131,10 +144,12 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     self.url = url
 
                 async def evaluate(self, expression, channel_id=None):
+                    if expression == EXTRACT_GUILDS_JS:
+                        return {"sidebar_present": self.sidebar_ready, "login_required": False, "guilds": [{"id": "3000000000000000010"}]}
                     if expression == AUTH_REQUIRED_JS:
                         return self.auth_required
                     if expression == EXTRACT_MESSAGES_JS:
-                        result = snapshot | {"url": self.url}
+                        result = self.snapshot | {"url": self.url}
                         if result.get("messages") and channel_id is not None:
                             result["messages"] = [
                                 message | {"channel_id": str(channel_id)}
@@ -263,6 +278,88 @@ class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(message["ingestion"] == "baseline" for message in events))
         self.assertEqual(goto_calls, [])
         self.assertTrue(closed)
+
+    async def test_loading_account_ui_then_captcha_pauses_navigation_and_keeps_error(self):
+        snapshot = {
+            "ready": True, "messages": [_message(1, "2026-09-16T12:00:00Z")],
+            "at_bottom": True, "connection_epoch": "fixture",
+        }
+        sleeps = 0
+        diagnostic = SimpleNamespace(
+            failure="", detail=lambda fallback: diagnostic.failure or fallback,
+            close=AsyncMock(),
+        )
+
+        def clear():
+            diagnostic.failure = ""
+
+        diagnostic.clear = clear
+
+        async def progress(context, seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 1:
+                self.assertEqual(context.pages[0].url, "https://discord.com/channels/@me")
+                context.pages[0].auth_required = True
+                diagnostic.failure = "Discord CAPTCHA rejected [captcha_rejected]; HTTP 400."
+            elif sleeps == 2:
+                # Discord returns to login; the last response must remain visible.
+                context.pages[0].url = "https://discord.com/login"
+                context.pages[0].auth_required = False
+            elif sleeps == 3:
+                context.pages[0].url = "https://discord.com/channels/@me"
+                context.pages[0].sidebar_ready = True
+            elif sleeps >= 5:
+                raise RuntimeError("fixture complete")
+
+        with patch("relay.browser.DiscordLoginDiagnostics", return_value=diagnostic):
+            statuses, events, goto_calls, closed = await self._monitor_fixture(
+                snapshot,
+                page_specs=[{"url": "https://discord.com/channels/@me", "sidebar_ready": False}, {}],
+                sleep_hook=progress,
+            )
+        self.assertEqual([row["state"] for row in statuses[:6]],
+                         ["reconnecting"] * 2 + ["login_required"] * 4)
+        self.assertTrue(all("captcha_rejected" in row["detail"] for row in statuses[2:6]))
+        self.assertEqual(len(goto_calls), 2)
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(message["ingestion"] == "baseline" for message in events))
+        self.assertEqual(statuses[-1]["state"], "connected")
+        self.assertNotIn("captcha_rejected", statuses[-1]["detail"])
+        diagnostic.close.assert_awaited_once()
+        self.assertTrue(closed)
+
+    async def test_healthy_channel_does_not_clear_other_channels_login_diagnostic(self):
+        snapshot = {"ready": True, "empty_ready": True, "messages": [], "at_bottom": True}
+        failure = "Discord CAPTCHA rejected [captcha_rejected]; HTTP 400."
+        diagnostic = SimpleNamespace(failure=failure, close=AsyncMock())
+        diagnostic.detail = lambda fallback: diagnostic.failure or fallback
+        diagnostic.clear = lambda: setattr(diagnostic, "failure", "")
+        sleeps = 0
+
+        async def recover_then_stop(context, seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 1:
+                self.assertEqual(diagnostic.failure, failure)
+                context.pages[1].snapshot = snapshot
+            else:
+                self.assertEqual(diagnostic.failure, "")
+                raise RuntimeError("fixture complete")
+
+        with patch("relay.browser.DiscordLoginDiagnostics", return_value=diagnostic):
+            statuses, _, _, _ = await self._monitor_fixture(
+                snapshot,
+                page_specs=[
+                    {"url": "https://discord.com/channels/3000000000000000010/1000000000000000001"},
+                    {"url": "https://discord.com/channels/3000000000000000010/1000000000000000002",
+                     "snapshot": snapshot | {"ready": False}},
+                ],
+                sleep_hook=recover_then_stop,
+            )
+        self.assertEqual(statuses[1]["state"], "reconnecting")
+        self.assertEqual(statuses[1]["detail"], failure)
+        diagnostic.close.assert_awaited_once()
 
     def test_tracker_accepts_confirmed_empty_start_without_replaying_delayed_rows(self):
         cutoff = [datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)]
