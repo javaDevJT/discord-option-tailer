@@ -48,7 +48,7 @@ The advanced channel URL field is a fallback when a channel is not visible in th
 
 Fresh Docker volumes select Gateway. Existing volumes and configurations without a transport keep Browser mode, so an upgrade preserves the saved session. Switch an existing installation explicitly in Setup. Revoked Gateway credentials require a replacement in Setup; the service waits for correction instead of repeatedly retrying an invalid token. It cannot refresh a revoked user token automatically.
 
-Gateway uses `discord.py-self==2.1.0`, keeps subscriptions needed for messages, and disables bulk startup member chunking. History is limited to one page of at most 100 messages per configured channel, fetched sequentially for context. Guild/channel discovery reads the cache; available author suggestions may be incomplete, and author restrictions remain optional.
+Gateway uses `discord.py-self==2.1.0`, keeps subscriptions needed for messages, and disables bulk startup member chunking. History is limited to one page of at most 100 messages per configured channel, fetched sequentially for context. Discovery reads cached servers first, then all readable channels for the selected server. Available author suggestions may be incomplete, and author restrictions remain optional.
 
 Application-controlled Discord polling, browser recovery, discovery waits, and history pacing use random delays between 80% and 120% of their base interval. Library reconnect backoff stays under the library's control. Protocol heartbeats, provider rate-limit minimums, navigation deadlines, and trading freshness windows are unchanged. Jitter and the library do not guarantee avoiding Discord restrictions; this implementation adds no proxies, fingerprint spoofing, or CAPTCHA solving.
 
@@ -126,6 +126,8 @@ Model, reasoning, Fast/Standard service, and chase can be saved in **Setup → S
 Evaluation retries once for transient failures and invalid structured output or evidence; auth, quota, and configuration failures are not retried. Broker submissions are never retried by this mechanism. Failed evaluations include sanitized diagnostics in Messages and Audit. Codex or Robinhood authentication rejection updates Setup and triggers the configured Discord webhook once per incident. Reauthentication failures remain visible across restarts until the affected provider succeeds.
 
 ## Monitor and operate
+
+Gateway status checks the library's heartbeat acknowledgements locally every 16–24 seconds, even when neither channel has new messages. The detail shows the acknowledgement age. Missing or stale acknowledgements report reconnection and block live source verification; a process heartbeat alone is not proof that Discord is connected. This check does not send extra Discord requests or change protocol heartbeat timing.
 
 Discord's initial navigation has a 60-second network timeout. A slow page keeps the browser open and reports loading or recovery guidance; completing manual sign-in or MFA has no time limit. Use **Back to setup** to leave the browser view without ending the saved session. If the page stays blank, reload it in the embedded browser; use **Reconnect** if the browser worker has stopped.
 

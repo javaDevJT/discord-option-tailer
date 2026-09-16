@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -107,6 +108,7 @@ class FakeClient:
     async def start(self, token, reconnect=True):
         self.token = token
         self.reconnect = reconnect
+        await self.callbacks["on_socket_raw_receive"]({"op": 11})
         await self.callbacks["on_ready"]()
         self.started.set()
         await self.release.wait()
@@ -114,6 +116,12 @@ class FakeClient:
     async def close(self):
         self.closed = True
         self.release.set()
+
+    def is_ready(self):
+        return self.started.is_set()
+
+    def is_closed(self):
+        return self.closed
 
 
 class FakeIntents:
@@ -188,6 +196,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.discord_patch.start()
         self.session_module = ModuleType("relay.discord_session")
         self.session_module.read_token = lambda config: "personal-token"
+        self.session_module.credential_configured = lambda config: True
         self.session_patch = patch.dict(sys.modules, {"relay.discord_session": self.session_module})
         self.session_patch.start()
 
@@ -198,6 +207,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_raw_edit_and_bulk_delete_invalidate_retained_alerts(self):
         runtime = gateway._GatewayRuntime(_config(), None, None, None)
         runtime.healthy, runtime.epoch = True, "gateway:fixture"
+        runtime.client = FakeClient()
+        runtime.client.started.set()
+        runtime.last_gateway_ack = time.monotonic()
         channel = FakeChannel(CHANNEL_SIGNALS)
         await runtime.observe(FakeMessage("500000000000000041", channel))
         original = await runtime.queue.get()
@@ -259,9 +271,79 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["guilds"][0]["id"], GUILD)
 
+    async def test_initial_ready_without_ack_never_reports_connected_or_emits_live(self):
+        events = []
+        runtime = gateway._GatewayRuntime(_config(), None, None, events.append)
+        runtime.client = _make_client_for_discovery()
+        runtime.client.started.set()
+        await runtime.start_session()
+        self.assertFalse(any(e["state"] == "connected" for e in events))
+        await runtime.observe(FakeMessage("500000000000000060", FakeChannel(CHANNEL_SIGNALS)))
+        message = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(message["ingestion"], "baseline")
+        self.assertFalse(await runtime.verify(message))
+
+    async def test_quiet_connection_requires_recent_ack_and_preserves_auth_failures(self):
+        import tempfile
+        from pathlib import Path
+        from relay.service import RuntimeStatus
+        from relay.dashboard import _safe_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config()
+            status = RuntimeStatus(Path(directory) / "runtime.json", config["channels"])
+            status.ready = True
+            runtime = gateway._GatewayRuntime(config, None, None, status.event)
+            runtime.client = FakeClient()
+            runtime.client.started.set()
+            runtime.healthy, runtime.epoch = True, "gateway:fixture"
+            runtime.bind_events()
+            with patch("relay.service.timestamp", return_value="2020-01-01T00:00:00+00:00"):
+                status.write()
+            status.write(heartbeat=True)
+            self.assertTrue(_safe_runtime(config, status.path)["stale"])
+            with patch("relay.gateway.time.monotonic", return_value=1000):
+                await runtime.client.callbacks["on_socket_raw_receive"]({"op": 11, "private": "never retain"})
+                await runtime.observe(FakeMessage("500000000000000050", FakeChannel(CHANNEL_SIGNALS)))
+                message = await runtime.queue.get()
+                runtime.queue.task_done()
+            with patch("relay.gateway.time.monotonic", return_value=1020):
+                await runtime.report_health()
+                view = _safe_runtime(config, status.path)
+                self.assertFalse(view["stale"])
+                self.assertEqual(view["discord"]["state"], "connected")
+                self.assertTrue(await runtime.verify(message))
+                self.assertTrue(all("20s ago" in c["detail"] for c in view["discord"]["channels"]))
+                self.assertNotIn("never retain", status.path.read_text())
+            with patch("relay.gateway.time.monotonic", return_value=1100):
+                await runtime.report_health()
+                self.assertEqual(_safe_runtime(config, status.path)["discord"]["state"], "reconnecting")
+                self.assertFalse(await runtime.verify(message))
+                await runtime.client.callbacks["on_socket_raw_receive"]({"op": 0})
+                self.assertEqual(runtime.last_gateway_ack, 1000)
+                await runtime.client.callbacks["on_socket_raw_receive"]({"op": 11})
+                await runtime.report_health()
+                self.assertTrue(await runtime.verify(message))
+                await runtime.client.callbacks["on_disconnect"]()
+                await runtime.report_health()
+                self.assertEqual(_safe_runtime(config, status.path)["discord"]["state"], "reconnecting")
+                self.assertFalse(await runtime.verify(message))
+            runtime.auth_rejected = True
+            await runtime.status("login_required", "Credential rejected; update Discord setup.")
+            await runtime.client.callbacks["on_disconnect"]()
+            await runtime.client.callbacks["on_resumed"]()
+            await runtime.report_health()
+            self.assertEqual(_safe_runtime(config, status.path)["discord"]["state"], "login_required")
+            self.assertFalse(runtime.healthy)
+            self.assertFalse(await runtime.verify(message))
+
     async def test_history_floor_rejects_delayed_equal_and_older_gateway_events(self):
         runtime = gateway._GatewayRuntime(_config(), None, None, None)
         runtime.epoch = "gateway:fixture"
+        runtime.client = FakeClient()
+        runtime.client.started.set()
+        runtime.last_gateway_ack = time.monotonic()
         channel = FakeChannel(CHANNEL_SIGNALS)
         await runtime.observe(FakeMessage("500000000000000002", channel), kind="baseline", reason="baseline")
         runtime.healthy = True
@@ -454,6 +536,51 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["channels"][0]["url"], f"https://discord.com/channels/{GUILD}/{CHANNEL_SIGNALS}")
         self.assertEqual(result["authors"], [{"id": AUTHOR, "name": "Analyst"}])
 
+    async def test_directory_lists_servers_then_all_selected_server_channels(self):
+        import tempfile
+        from pathlib import Path
+        from relay.discovery import discovery_status, request_discovery
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config()
+            config["runtime_status_file"] = str(Path(directory) / "runtime.json")
+            runtime = gateway._GatewayRuntime(config, None, None, None)
+            runtime.client = _make_client_for_discovery()
+            runtime.healthy = True
+            runtime.client.guilds = []
+            for index in range(10):
+                guild = FakeGuild([FakeChannel(str(200000000000000000 + index * 500 + i))
+                                   for i in range(500)])
+                guild.id = str(100000000000000000 + index)
+                for channel in guild.channels:
+                    channel.guild_id = guild.id
+                runtime.client.guilds.append(guild)
+            worker = asyncio.create_task(runtime._serve_discovery())
+            try:
+                for payload, expected_channels in (({}, 0), ({"guild_id": GUILD}, 500)):
+                    request_discovery(config["runtime_status_file"], payload)
+                    for _ in range(100):
+                        await asyncio.sleep(.01)
+                        if worker.done():
+                            await worker
+                        result = discovery_status(config["runtime_status_file"])
+                        if result["state"] != "waiting":
+                            break
+                    self.assertEqual(result["state"], "ready")
+                    self.assertEqual(len(result["guilds"]), 1 if payload else 10)
+                    self.assertEqual(len(result["channels"]), expected_channels)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_discovery_failure_propagates_instead_of_silently_stalling(self):
+        config = _config()
+        config["runtime_status_file"] = "unused-by-mocked-discovery.json"
+        with patch.object(gateway._GatewayRuntime, "_serve_discovery",
+                          side_effect=RuntimeError("discovery fixture failure")):
+            with self.assertRaisesRegex(RuntimeError, "discovery fixture failure"):
+                await asyncio.wait_for(gateway.monitor(config, lambda _message: None), timeout=1)
+
 def _make_client_for_discovery():
     client = FakeClient()
     signal_channel = FakeChannel(CHANNEL_SIGNALS)
@@ -473,6 +600,7 @@ class InstalledGatewayAPITests(unittest.IsolatedAsyncioTestCase):
         client = gateway._make_client(discord)
         try:
             self.assertFalse(client._connection._chunk_guilds)
+            self.assertTrue(client._enable_debug_events)
         finally:
             await client.close()
 

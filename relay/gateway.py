@@ -15,6 +15,7 @@ import inspect
 import logging
 import math
 import re
+import time
 import uuid
 from typing import Any
 
@@ -31,6 +32,8 @@ _DEFAULT_CACHE_SIZE = 2048
 _MAX_HISTORY = 100
 _DEFAULT_HISTORY_SECONDS = 1.0
 _DISCOVERY_MAX_AUTHORS = 100
+_STATUS_SECONDS = 20.0
+_ACK_MAX_AGE_SECONDS = 90.0
 
 
 class GatewayLoginRequired(RuntimeError):
@@ -287,6 +290,7 @@ def _make_client(discord_module: Any) -> Any:
     return discord_module.Client(
         chunk_guilds_at_startup=False, guild_subscriptions=True,
         max_messages=1000, member_cache_flags=discord_module.MemberCacheFlags.none(),
+        enable_debug_events=True,
     )
 
 
@@ -341,6 +345,7 @@ class _GatewayRuntime:
         )
         self.client: Any | None = None
         self.delivery_task: asyncio.Task[Any] | None = None
+        self.health_task: asyncio.Task[Any] | None = None
         self.discovery_task: asyncio.Task[Any] | None = None
         self.fatal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self.session_lock = asyncio.Lock()
@@ -350,6 +355,10 @@ class _GatewayRuntime:
         self.initializing = False
         self.closed = False
         self.auth_rejected = False
+        self.auth_detail = "Discord gateway credential needs attention; update it in Setup."
+        self.last_gateway_ack: float | None = None
+        self.channel_status: dict[str, tuple[str, str]] = {}
+        self.connection_status = ("starting", "Discord gateway is connecting.")
         self.load_history = True
         self.latest: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self.invalidated: OrderedDict[tuple[str, str], None] = OrderedDict()
@@ -357,6 +366,14 @@ class _GatewayRuntime:
         self.history_floor: dict[str, dict[str, Any]] = {}
 
     async def status(self, state: str, detail: str, *, channel_id: str | None = None) -> None:
+        if state == "login_required":
+            self.auth_detail = detail
+        elif self.auth_rejected:
+            state, detail = "login_required", self.auth_detail
+        if channel_id:
+            self.channel_status[str(channel_id)] = (state, detail)
+        else:
+            self.connection_status = (state, detail)
         if self.on_status is None:
             return
         event: dict[str, Any] = {
@@ -395,6 +412,7 @@ class _GatewayRuntime:
 
         async def on_disconnect() -> None:
             self.generation += 1
+            self.last_gateway_ack = None
             self.healthy = False
             self.initializing = False
             detail = "Discord gateway disconnected; waiting for library reconnect."
@@ -404,6 +422,12 @@ class _GatewayRuntime:
 
         async def on_message(message: Any) -> None:
             await self._guard(lambda: self.observe(message, kind="live", reason="live"))
+
+        async def on_socket_raw_receive(payload: Any) -> None:
+            # Observe only the protocol acknowledgement. Never retain or log
+            # Gateway payloads, and leave heartbeat scheduling to the library.
+            if isinstance(payload, dict) and payload.get("op") == 11:
+                self.last_gateway_ack = time.monotonic()
 
         async def on_message_edit(before: Any, after: Any) -> None:
             del before
@@ -434,6 +458,7 @@ class _GatewayRuntime:
             ("on_resumed", on_resumed),
             ("on_disconnect", on_disconnect),
             ("on_message", on_message),
+            ("on_socket_raw_receive", on_socket_raw_receive),
             ("on_message_edit", on_message_edit),
             ("on_message_delete", on_message_delete),
             ("on_raw_message_edit", on_raw_message_edit),
@@ -539,7 +564,7 @@ class _GatewayRuntime:
         normalized["browser_connection_epoch"] = self.epoch
 
         floor = self.history_floor.get(str(payload["channel_id"]))
-        if kind == "live" and (not self.healthy or self.initializing
+        if kind == "live" and (not self.healthy or self.initializing or not self.connection_fresh()
                                or (floor is not None and not _newer(normalized, floor))):
             kind = "baseline"
             reason = "baseline"
@@ -697,7 +722,7 @@ class _GatewayRuntime:
 
     async def start_session(self) -> None:
         async with self.session_lock:
-            if self.fatal.done():
+            if self.fatal.done() or self.auth_rejected:
                 return
             self.healthy = False
             self.initializing = True
@@ -741,9 +766,12 @@ class _GatewayRuntime:
                     return
                 self.initializing = False
                 self.healthy = all_channels_ready
-                state = "connected" if all_channels_ready else "reconnecting"
+                current = all_channels_ready and self.connection_fresh()
+                state = "connected" if current else "reconnecting"
                 detail = (
                     "Discord gateway observing configured channels."
+                    if current
+                    else "Waiting for a current Discord gateway heartbeat acknowledgement."
                     if all_channels_ready
                     else "Discord gateway is waiting for configured channels in its cache."
                 )
@@ -796,6 +824,10 @@ class _GatewayRuntime:
             ):
                 continue
             guilds.append({"id": guild_id, "name": str(_value(guild, "name", default="") or "")})
+            # The picker requests channels after a server is selected. Returning
+            # every server's channels here can overflow the discovery IPC file.
+            if requested_guild is None and requested_channel is None:
+                continue
             selected_guild_obj = guild
             for channel in guild_channels:
                 channel_id = _snowflake(_value(channel, "id"))
@@ -837,6 +869,8 @@ class _GatewayRuntime:
     async def verify(self, message: dict[str, Any]) -> bool:
         if not self.healthy or not self.epoch or not isinstance(message, dict):
             return False
+        if not self.connection_fresh():
+            return False
         if message.get("source") != "gateway" or message.get("ingestion") != "live":
             return False
         if str(message.get("browser_connection_epoch", "")) != self.epoch:
@@ -855,6 +889,38 @@ class _GatewayRuntime:
             return False
         return True
 
+    def connection_fresh(self) -> bool:
+        return bool(not self.auth_rejected and self.client is not None and self.client.is_ready() and not self.client.is_closed()
+                    and self.last_gateway_ack is not None
+                    and 0 <= time.monotonic() - self.last_gateway_ack <= _ACK_MAX_AGE_SECONDS)
+
+    async def report_health(self) -> None:
+        if self.auth_rejected:
+            state, detail = self.connection_status
+            await self.status(state, detail)
+            return
+        if self.healthy and not self.initializing:
+            if self.connection_fresh():
+                age = int(time.monotonic() - self.last_gateway_ack)
+                state = "connected"
+                detail = f"Discord gateway connected; heartbeat acknowledged {age}s ago."
+            else:
+                state = "reconnecting"
+                detail = "Waiting for a current Discord gateway heartbeat acknowledgement."
+            await self.status(state, detail)
+            for channel in self.channels[:2] if self.load_history else []:
+                await self.status(state, detail, channel_id=str(channel["id"]))
+        else:
+            state, detail = self.connection_status
+            await self.status(state, detail)
+            for channel_id, (state, detail) in list(self.channel_status.items()):
+                await self.status(state, detail, channel_id=channel_id)
+
+    async def health_loop(self) -> None:
+        while True:
+            await asyncio.sleep(discord_delay(_STATUS_SECONDS))
+            await self._guard(self.report_health)
+
     async def _serve_discovery(self) -> None:
         runtime_path = self.config.get("runtime_status_file")
         if not runtime_path:
@@ -868,7 +934,10 @@ class _GatewayRuntime:
 
         self.healthy = False
         self.initializing = False
-        await asyncio.Event().wait()
+        while True:
+            await asyncio.sleep(discord_delay(_STATUS_SECONDS))
+            state, detail = self.connection_status
+            await self.status(state, detail)
 
     async def _start_client(self, token: str) -> None:
         await self.client.start(token, reconnect=True)
@@ -910,8 +979,9 @@ class _GatewayRuntime:
             await _maybe_await(self.register_verifier, self.verify)
 
         self.delivery_task = asyncio.create_task(self.delivery_loop())
+        self.health_task = asyncio.create_task(self.health_loop())
         if self.config.get("runtime_status_file"):
-            self.discovery_task = asyncio.create_task(self._serve_discovery())
+            self.discovery_task = asyncio.create_task(self._guard(self._serve_discovery))
         client_task = asyncio.create_task(self._start_client(token))
         try:
             done, _pending = await asyncio.wait(
@@ -951,6 +1021,9 @@ class _GatewayRuntime:
             if self.discovery_task is not None:
                 self.discovery_task.cancel()
                 await asyncio.gather(self.discovery_task, return_exceptions=True)
+            if self.health_task is not None:
+                self.health_task.cancel()
+                await asyncio.gather(self.health_task, return_exceptions=True)
             if self.delivery_task is not None:
                 self.delivery_task.cancel()
                 await asyncio.gather(self.delivery_task, return_exceptions=True)

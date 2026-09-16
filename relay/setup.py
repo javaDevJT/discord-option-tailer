@@ -981,9 +981,9 @@ class SetupManager:
                     "Save a token or select Browser."
                 )
             elif mapped == "connected":
-                detail = "Discord gateway is connected."
+                detail = self._safe_discord_runtime_detail(runtime_discord.get("detail"), "Discord gateway is connected.")
             elif mapped == "starting":
-                detail = "Discord gateway worker is reconnecting."
+                detail = self._safe_discord_runtime_detail(runtime_discord.get("detail"), "Discord gateway worker is reconnecting.")
             elif mapped == "failed":
                 detail = self._safe_discord_runtime_detail(
                     runtime_discord.get("detail"),
