@@ -366,6 +366,21 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.engine.verify_current = delayed
         await self.held(reason="quote is stale")
 
+    async def test_gateway_entries_require_live_verification_and_do_not_replay_history(self):
+        from unittest.mock import AsyncMock
+        self.config["require_source_verification"] = True
+        await self.held(self.message(source="gateway"), "verified")
+        self.engine.verify_current = AsyncMock(return_value=True)
+        live = self.message(source="gateway")
+        self.assertEqual((await self.engine.handle(live))["state"], "paper_order")
+        self.assertEqual(len(self.broker.submissions), 1)
+        # Changing transports does not make an already handled message new.
+        await self.engine.handle(live | {"source": "browser"})
+        historical = self.message(source="gateway") | {"ingestion": "baseline"}
+        self.assertEqual((await self.engine.handle(historical))["state"], "context")
+        self.assertEqual((await self.engine.handle(self.message(source="export")))["state"], "context")
+        self.assertEqual(len(self.broker.submissions), 1)
+
     async def test_shadow_records_proposal_without_order_or_position_mutation(self):
         config = copy.deepcopy(self.config)
         config["mode"] = "shadow"

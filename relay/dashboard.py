@@ -918,7 +918,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         routes = {
             "/api/setup/channels", "/api/setup/pause", "/api/setup/reconnect", "/api/setup/mode", "/api/setup/notifications", "/api/setup/expiry-policy", "/api/setup/evaluation",
-            "/api/setup/discord/discover",
+            "/api/setup/discord", "/api/setup/discord/discover",
             "/api/setup/auth/codex/start", "/api/setup/auth/codex/cancel",
             "/api/setup/auth/robinhood/start", "/api/setup/auth/robinhood/cancel",
             "/api/setup/auth/robinhood/callback",
@@ -952,6 +952,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = manager.save_channels(payload)
             elif path == "/api/setup/notifications":
                 result = manager.save_notifications(payload)
+            elif path == "/api/setup/discord":
+                result = manager.save_discord(payload)
             elif path == "/api/setup/discord/discover":
                 result = manager.discover_discord(payload)
             elif path == "/api/setup/mode":

@@ -132,11 +132,11 @@ async def demo(args, config):
 
 
 async def run(config, *, observe_only=False, on_status=None):
-    from .browser import monitor
+    from .discord_source import monitor
     from .interpreter import CodexInterpreter
     if any(not str(c["guild_id"]).isdigit() for c in config["channels"]):
         raise Hold("set both guild_id values from the Discord channel URLs")
-    config["require_browser_verification"] = True
+    config["require_source_verification"] = True
     store = Store(config["database"])
     connections = AsyncExitStack()
     queue = None
@@ -259,8 +259,12 @@ async def dispatch(args, config):
     elif args.command == "demo":
         await demo(args, config)
     elif args.command == "discord-login":
-        from .browser import login
-        await login(config["browser"]["profile_dir"])
+        from .discord_source import setup, transport
+        if transport(config) == "gateway":
+            await setup(config, on_status=emit)
+        else:
+            from .browser import login
+            await login(config["browser"]["profile_dir"])
     elif args.command == "run":
         await run(config, observe_only=args.observe_only)
     elif args.command == "status":

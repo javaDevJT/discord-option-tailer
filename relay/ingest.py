@@ -71,8 +71,8 @@ def normalize(raw: dict, channel_id: str | None = None) -> dict:
     reply_to = raw.get("reply_to") or reference.get("message_id") or reference.get("messageId")
     edited = raw.get("edited_timestamp") or raw.get("timestampEdited")
     source = raw.get("source", "export")
-    if source not in ("export", "browser"):
-        raise ValueError("source must be export or browser")
+    if source not in ("export", "browser", "gateway"):
+        raise ValueError("source must be export, browser or gateway")
     message = {
         "id": _id(raw.get("id"), "id"),
         "channel_id": _id(raw.get("channel_id") or channel_id, "channel_id"),

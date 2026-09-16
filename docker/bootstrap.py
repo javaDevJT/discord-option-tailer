@@ -55,6 +55,8 @@ def fresh_config(path: Path) -> None:
     config["kill_switch"] = "/data/state/STOP"
     config["runtime_status_file"] = "/data/state/runtime-status.json"
     config.setdefault("browser", {})["profile_dir"] = "/data/discord-browser"
+    config.setdefault("discord", {})["transport"] = "gateway"
+    config["discord"]["token_store"] = "/data/state/discord-user.json"
     config.setdefault("llm", {})["executable"] = "/usr/local/bin/codex"
     broker = config.setdefault("robinhood", {})
     broker["account_number"] = None

@@ -2318,6 +2318,24 @@ h2 {
   }
 }
 
+.discord-setup-form {
+  margin-top: 0.95rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
+}
+
+.discord-gateway-fields[hidden] {
+  display: none;
+}
+
+.discord-credential-status {
+  color: var(--green, var(--muted));
+}
+
+.discord-setup-form .form-feedback {
+  margin-top: 0.35rem;
+}
+
 .account-section .section-lede {
   max-width: 42rem;
   margin: 0.55rem 0 0;

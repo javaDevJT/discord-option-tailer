@@ -1,6 +1,6 @@
 # Discord Option Tailer
 
-Discord Option Tailer watches exactly two configured Discord channels in a personal, manually signed-in browser session. It sends bounded message context to Codex through an existing ChatGPT subscription, applies deterministic option and risk checks, and records the decision trail in a mode-bound SQLite ledger.
+Discord Option Tailer watches exactly two configured Discord channels through a personal-account Gateway session (`discord.py-self`) or a manually signed-in browser. It sends bounded message context to Codex through an existing ChatGPT subscription, applies deterministic option and risk checks, and records the decision trail in a mode-bound SQLite ledger.
 
 Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker data and save proposed orders, but it never submits them. **Live** is an explicit, paused setup action that can submit real Robinhood orders. Historical and missed-message recovery is review-only and never submits a recovered trade.
 
@@ -14,14 +14,14 @@ The [account monitoring guide](docs/container.md#account-balances-and-holdings) 
 - [Broker integration](docs/robinhood-integration.md): authorization, account inspection, and execution checks.
 - [Configuration template](config.example.json): CLI and offline-rehearsal defaults.
 - [Container environment](.env.example): dashboard binding and password settings.
-- [Relay source](relay/): browser reader, interpreter, ledger, broker adapter, dashboard, and worker.
+- [Relay source](relay/): Gateway and browser readers, interpreter, ledger, broker adapter, dashboard, and worker.
 - [Synthetic checks](tests/): offline unit and fixture tests.
 
 Private account exports, browser profiles, OAuth state, databases, and local credentials are runtime data and are intentionally absent from the public source tree. The public documentation contains no account state or real message samples.
 
 ## How it works
 
-1. The embedded Chromium desktop reads the rendered DOM of two channels from the user's signed-in Discord session. It does not use a Discord bot token or post to the input channels.
+1. The Gateway reader receives live message events through `discord.py-self==2.1.0`; the browser fallback reads the rendered DOM. Both use the personal account and never post to the input channels. Configure the transport and optional private Gateway credential in **Setup → Discord input**.
 2. The relay stores normalized messages and passes a bounded chronological context window to Codex. Codex runs through the user's ChatGPT subscription; no OpenAI API key is required.
 3. Deterministic checks require a clear standard option contract, an allowed source, fresh inputs, current quotes, account-relative sizing, and a mode-specific ledger.
 4. The dashboard shows messages, interpretations, holds, recorded orders, relay-owned positions, and recovery assessments. An optional Discord webhook reports selected setup assistance and relay actions.
@@ -29,9 +29,9 @@ Private account exports, browser profiles, OAuth state, databases, and local cre
 
 ## Fresh messages and recovery
 
-The first history visible after login, reconnect, or restart is a context baseline. It is recorded for interpretation context and is never replayed as a new entry. A fresh eligible alert must still pass the normal freshness and source checks before it can reach the mode-specific order path.
+The first history observed after login, reconnect, or restart is a context baseline. It is recorded for interpretation context and is never replayed as a new entry. Gateway history is bounded to one page of at most 100 messages per configured channel, requested sequentially. A fresh eligible alert must still pass the normal freshness and source checks before it can reach the mode-specific order path.
 
-When the reader returns to the newest messages, eligible baseline alerts and alerts held because they became stale can receive a separate recovery assessment. The evaluator compares the original alert with later same-source messages and current account and quote facts. It reports a review result such as **Potentially viable**, **Invalidated**, **Uncertain**, or **Not actionable**; every result remains review-only. Recovery is bounded by messages observed by the browser and durable per-revision deduplication. It does not fetch a complete Discord history, turn an old message into a fresh trigger, or place an order.
+When the reader returns to the newest messages, eligible baseline alerts and alerts held because they became stale can receive a separate recovery assessment. The evaluator compares the original alert with later same-source messages and current account and quote facts. It reports a review result such as **Potentially viable**, **Invalidated**, **Uncertain**, or **Not actionable**; every result remains review-only. Recovery is bounded by messages observed by the selected reader and durable per-revision deduplication. It does not fetch a complete Discord history, turn an old message into a fresh trigger, or place an order.
 
 Edited alerts, manual backscroll, imported history, future timestamps, context-only rows, and unauthorized authors stay out of execution. Visible embed text and metadata are available to the interpreter; image-only instructions are held.
 
@@ -102,7 +102,7 @@ For offline work without Docker, use Python 3.11 or newer:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[browser,robinhood]'
+python -m pip install -e '.[browser,robinhood,discord]'
 python -m playwright install chromium
 python -m relay doctor
 python -m relay demo

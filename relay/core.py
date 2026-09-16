@@ -235,6 +235,19 @@ def load_config(path, *, allow_unbound=False):
     money(risk["fee_reserve_per_contract"])
     if type(risk["allow_same_day_expiry"]) is not bool:
         raise Hold("allow_same_day_expiry must be boolean")
+    discord = config.setdefault("discord", {})
+    if not isinstance(discord, dict) or discord.get("transport", "browser") not in {"browser", "gateway"}:
+        raise Hold("Discord transport must be browser or gateway")
+    if "token" in discord:
+        raise Hold("Store the Discord credential through Setup, not in configuration")
+    discord.setdefault("token_store", "state/discord-user.json")
+    discord.setdefault("token_env", "DISCORD_USER_TOKEN")
+    if (not isinstance(discord["token_store"], str) or not discord["token_store"]
+            or not isinstance(discord["token_env"], str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", discord["token_env"])):
+        raise Hold("Discord credential storage or environment setting is invalid")
+    # Keep the final credential path intact so its reader can reject symlinks.
+    discord["token_store"] = str((path.parent / discord["token_store"]).absolute())
     for section, key in ((config, "database"), (config, "kill_switch"), (config["browser"], "profile_dir"), (config["robinhood"], "token_store"), (config["paper"], "quotes_file")):
         if section.get(key):
             section[key] = str((path.parent / section[key]).resolve())
@@ -518,7 +531,7 @@ class Engine:
                         raise Hold("available account risk capacity fell during broker review")
 
         current()
-        if self.config.get("require_browser_verification"):
+        if self.config.get("require_source_verification") or self.config.get("require_browser_verification"):
             if self.verify_current is None or not await self.verify_current(message):
                 raise Hold("current Discord message could not be verified before dispatch")
         current()
@@ -563,7 +576,7 @@ class Engine:
             observed = self.store.observe(message) if _observed is None else _observed
             if observed == "same":
                 return {"message_id": message["id"], "state": "duplicate", "reason": "already observed"}
-            context_only = observed == "edit" or message.get("edited_timestamp") or message.get("ingestion") != "live" or message.get("source") != "browser" or channel["role"] != "signals"
+            context_only = observed == "edit" or message.get("edited_timestamp") or message.get("ingestion") != "live" or message.get("source") not in {"browser", "gateway"} or channel["role"] != "signals"
             if context_only and not analyze_history:
                 return self.store.record(message, "context", "baseline, import, edit, or context channel; no execution")
             if self.interpreter is None:

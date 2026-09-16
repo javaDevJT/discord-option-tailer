@@ -45,7 +45,7 @@ WORKDIR /app
 COPY pyproject.toml ./
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -c 'import tomllib; p=tomllib.load(open("pyproject.toml", "rb"))["project"]; print("\n".join(p.get("dependencies", []) + p["optional-dependencies"]["browser"] + p["optional-dependencies"]["robinhood"]))' > /tmp/relay-requirements.txt \
+    python3 -c 'import tomllib; p=tomllib.load(open("pyproject.toml", "rb"))["project"]; print("\n".join(p.get("dependencies", []) + p["optional-dependencies"]["browser"] + p["optional-dependencies"]["robinhood"] + p["optional-dependencies"]["discord"]))' > /tmp/relay-requirements.txt \
     && printf 'playwright==%s\n' "${PLAYWRIGHT_VERSION}" > /tmp/relay-constraints.txt \
     && /opt/venv/bin/pip install --timeout 120 --constraint /tmp/relay-constraints.txt -r /tmp/relay-requirements.txt \
     && /opt/venv/bin/python -m playwright install --with-deps chromium \

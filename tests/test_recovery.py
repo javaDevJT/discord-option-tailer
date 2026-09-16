@@ -108,6 +108,13 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
         self.config["channels"][0]["authors"] = ["1999999999999999999"]
         self.assertFalse(recovery.eligible(message))
 
+    async def test_gateway_baseline_recovery_is_assessment_only(self):
+        recovery = self.evaluator()
+        message = await self.pending(recovery, source="gateway")
+        result = await recovery.assess(message)
+        self.assertEqual(result["state"], "recovery_review")
+        self.assertEqual(self.broker.submissions, [])
+
     async def test_stale_live_is_queued_but_fresh_and_previously_ordered_are_not(self):
         recovery = self.evaluator()
         stale = self.message(timestamp=(NOW - timedelta(minutes=5)).isoformat())

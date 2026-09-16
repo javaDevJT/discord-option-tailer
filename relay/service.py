@@ -12,10 +12,13 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .browser import SNOWFLAKE, login, monitor
+from .browser import SNOWFLAKE, login
+from .discord_source import monitor, setup as setup_discord, transport as discord_transport
+from .discord_session import credential_configured
 from .broker import broker_credentials_state
 from .core import Store, channel_allows_author, load_config
 from .interpreter import CodexInterpreter, InterpretationError, safe_interpretation_reason
+from .pacing import discord_delay
 from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, failure_detail, previous_auth_state
 
 LOG = logging.getLogger(__name__)
@@ -129,7 +132,7 @@ async def run_until_change(operation, paths, status, *, initial_signature=None):
         done, _ = await asyncio.wait({worker, watcher}, return_when=asyncio.FIRST_COMPLETED)
         if worker in done:
             await worker
-            raise RuntimeError("browser worker stopped")
+            raise RuntimeError("Discord worker stopped")
     finally:
         worker.cancel()
         watcher.cancel()
@@ -145,6 +148,8 @@ async def serve(config_path):
             paths = [config_path, config_path.parent / "state/RECONNECT"]
             loaded_signature = signature(paths)
             config = load_config(config_path, allow_unbound=True)
+            if discord_transport(config) == "gateway":
+                paths.append(config["discord"]["token_store"])
             status = RuntimeStatus(config_path.parent / config.get("runtime_status_file", "state/runtime-status.json"), config["channels"])
             # The previous worker has finished cleanup before this acknowledgement.
             status.value.update(mode=config["mode"], mode_change_id=config.get("mode_change_id"),
@@ -169,14 +174,17 @@ async def serve(config_path):
                 detail = (f"Codex startup check: {safe_interpretation_reason(exc)}. Use Codex sign-in if authorization expired; otherwise check the configured model and container runtime."
                           if isinstance(exc, InterpretationError) else failure_detail(exc, provider="Codex", phase="startup check"))
                 status.event({"component": "codex", "state": "auth_required" if isinstance(exc, InterpretationError) and exc.code == "auth_required" else "unavailable", "detail": detail})
-            status.ready = configured_channels and broker_ready and codex_ready
+            discord_ready = discord_transport(config) != "gateway" or credential_configured(config)
+            status.ready = configured_channels and broker_ready and codex_ready and discord_ready
             status.detail = ("Monitoring configured channels; execution follows the configured mode." if status.ready else
                              "Observation only until channel IDs, Robinhood authorization and Codex subscription login are configured.")
             status.write()
             if not status.ready:
                 paths += [Path(config["robinhood"]["token_store"]),
                           Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"]
-            if not configured_channels:
+            if discord_transport(config) == "gateway" and (not configured_channels or not discord_ready):
+                operation = setup_discord(config, on_status=status.event)
+            elif not configured_channels:
                 operation = login(config["browser"]["profile_dir"], keep_open=True, on_status=status.event,
                                   discovery_runtime_path=status.path)
             elif not status.ready:
@@ -192,7 +200,8 @@ async def serve(config_path):
             raise
         except Exception as exc:
             # Do not expose OAuth responses, tokens or browser exception URLs in the dashboard.
-            LOG.warning("Worker needs attention (%s); retrying in %s seconds", type(exc).__name__, delay)
+            retry_delay = discord_delay(delay)
+            LOG.warning("Worker needs attention (%s); retrying in %.1f seconds", type(exc).__name__, retry_delay)
             status.ready = False
             pending, failures = [exc], []
             while pending and len(failures) < 4:
@@ -206,8 +215,8 @@ async def serve(config_path):
                 location = f" at {Path(failure_frame.tb_frame.f_code.co_filename).name}:{failure_frame.tb_lineno}" if failure_frame else ""
                 failures.append(f"{type(failure).__name__}{location}")
             detail = failure_detail(exc, provider="Worker", phase="startup or processing")
-            status.write(state="error", detail=f"{detail} ({'; '.join(failures)}). Automatic retry in {delay} seconds.")
-            await asyncio.sleep(delay)
+            status.write(state="error", detail=f"{detail} ({'; '.join(failures)}). Automatic retry in {retry_delay:.1f} seconds.")
+            await asyncio.sleep(retry_delay)
             delay = min(delay * 2, 60)
 
 

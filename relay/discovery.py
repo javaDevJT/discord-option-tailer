@@ -23,6 +23,8 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
+from .pacing import discord_delay
+
 
 SNOWFLAKE = re.compile(r"\d{15,22}\Z")
 REQUEST_TIMEOUT_SECONDS = 40.0
@@ -568,6 +570,8 @@ def _login_url(url: str) -> bool:
 
 
 async def _wait_briefly(page: object, milliseconds: int = 250) -> None:
+    seconds = discord_delay(milliseconds / 1000)
+    milliseconds = seconds * 1000
     waiter = getattr(page, "wait_for_timeout", None)
     if waiter is not None:
         try:
@@ -575,7 +579,7 @@ async def _wait_briefly(page: object, milliseconds: int = 250) -> None:
             return
         except Exception:
             pass
-    await asyncio.sleep(milliseconds / 1000)
+    await asyncio.sleep(seconds)
 
 
 async def _goto(page: object, url: str) -> None:
@@ -905,8 +909,8 @@ async def _prepare_and_process(context: object, page: object | None, request: di
         raise
 
 
-async def serve_discovery(context: object, runtime_path: str | os.PathLike[str], *, setup_page=None) -> None:
-    """Use the open setup tab, or own a separate tab during active monitoring.
+async def serve_discovery(context: object, runtime_path: str | os.PathLike[str], *, setup_page=None, resolver=None) -> None:
+    """Resolve through the Gateway cache, or a dedicated browser discovery tab.
 
     Discovery never navigates or closes monitoring pages. Only its dedicated
     tab is closed when the worker stops unless it needs manual verification;
@@ -940,9 +944,11 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
                 else:
                     processed_id = request["request_id"]
                     try:
-                        if await manual_auth_page(context) is not None:
+                        if resolver is not None:
+                            result = await asyncio.wait_for(resolver(request), timeout=REQUEST_TIMEOUT_SECONDS)
+                        elif await manual_auth_page(context) is not None:
                             raise _LoginRequired()
-                        if setup_page is not None:
+                        elif setup_page is not None:
                             result = await asyncio.wait_for(_process_request(setup_page, request), timeout=REQUEST_TIMEOUT_SECONDS)
                         else:
                             page, result = await asyncio.wait_for(
@@ -966,12 +972,12 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
                             "detail": "Complete Discord sign-in or verification in the browser before discovery.",
                         }
                     except Exception as exc:
-                        logging.getLogger(__name__).warning("Discord discovery failed: %s", str(exc).splitlines()[0][:240])
+                        logging.getLogger(__name__).warning("Discord discovery failed (%s)", type(exc).__name__)
                         result = {
                             "state": "failed", "request_id": request["request_id"],
                             "guild_id": request.get("guild_id"), "channel_id": request.get("channel_id"),
                             "guilds": [], "channels": [], "authors": [],
-                            "detail": "Discord discovery could not read the rendered page; retry after the browser is ready.",
+                            "detail": "Discord discovery could not read the channel directory; retry when Discord is connected.",
                         }
                     result = _persistable_result(result, completed_at=_utc_now().isoformat())
                     # A request can be replaced after timeout.  Never let a
@@ -979,7 +985,7 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
                     current = _validated_request(_json_read(request_path))
                     if current is not None and current["request_id"] == request["request_id"]:
                         _atomic_json_write(result_path, result)
-            await asyncio.sleep(DISCOVERY_POLL_SECONDS)
+            await asyncio.sleep(discord_delay(DISCOVERY_POLL_SECONDS))
     except asyncio.CancelledError:
         raise
     finally:

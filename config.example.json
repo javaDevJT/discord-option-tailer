@@ -18,6 +18,11 @@
       "source_group": "source-b"
     }
   ],
+  "discord": {
+    "transport": "browser",
+    "token_store": "state/discord-user.json",
+    "token_env": "DISCORD_USER_TOKEN"
+  },
   "browser": {
     "profile_dir": "state/discord-browser",
     "poll_seconds": 3

@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .status import AUTH_REQUIRED_STATES
+from .pacing import discord_delay
 
 
 UTC = timezone.utc
@@ -843,7 +844,7 @@ class NotificationWorker:
             if failure is not None:
                 attempts = int(row["attempts"]) + 1
                 if failure.retryable:
-                    delay = failure.delay if failure.delay is not None else min(5.0 * (2 ** min(attempts - 1, 6)), 300.0)
+                    delay = failure.delay if failure.delay is not None else discord_delay(min(5.0 * (2 ** min(attempts - 1, 6)), 300.0))
                     state = "pending"
                 else:
                     delay = failure.delay if failure.delay is not None else 3600.0
@@ -958,7 +959,7 @@ class NotificationWorker:
             if wait is None:
                 info = _config(self.config_path)
                 wait = info["interval"] if info is not None else 3.0
-            wait = max(0.2, min(float(wait), 60.0))
+            wait = discord_delay(max(0.2, min(float(wait), 60.0)))
             if stop_event is None:
                 await asyncio.sleep(wait)
             else:

@@ -1208,6 +1208,8 @@ function relayReadTimeoutSignal() {
       authors: new Map(),
       authorsByChannel: new Map(),
     },
+    discordDirty: false,
+    discordSaveInFlight: false,
   };
 
   const setupById = (id) => document.getElementById(id);
@@ -1895,6 +1897,66 @@ function relayReadTimeoutSignal() {
     setupSetText("browser-login-detail", detail);
   };
 
+  const setupDiscordTransport = (part = setupPart(setupState.status, "discord")) => {
+    const configured = setupText(part?.transport, "browser");
+    if (!setupState.discordDirty) return configured === "gateway" ? "gateway" : "browser";
+    const selected = setupText(setupById("discord-transport")?.value, configured);
+    return selected === "gateway" ? "gateway" : "browser";
+  };
+  const setupRenderDiscordTransport = (part = setupPart(setupState.status, "discord")) => {
+    const select = setupById("discord-transport");
+    const fields = setupById("discord-gateway-fields");
+    const indicator = setupById("discord-credential-status");
+    const transport = setupDiscordTransport(part);
+    if (select && !setupState.discordDirty) select.value = transport;
+    if (fields) fields.hidden = transport !== "gateway";
+    if (indicator) {
+      indicator.textContent = transport === "gateway"
+        ? part?.credential_configured === true
+          ? "A gateway credential is saved. Leave the token empty to keep it."
+          : "No saved gateway credential. Enter a token before saving."
+        : "Browser session selected.";
+    }
+    const browserAvailable = transport === "browser" || part?.browser_fallback === true;
+    document.querySelectorAll('.browser-link[data-provider="discord"], .setup-browser-link[data-provider="discord"]').forEach((link) => {
+      link.hidden = !browserAvailable;
+      if (browserAvailable) link.removeAttribute("tabindex");
+      else link.setAttribute("tabindex", "-1");
+    });
+    const frame = setupById("browser-login-frame");
+    if (frame) {
+      if (!frame.dataset.gatewayBrowserSrc) frame.dataset.gatewayBrowserSrc = frame.getAttribute("src") || "";
+      if (browserAvailable) {
+        if (!frame.getAttribute("src") && frame.dataset.gatewayBrowserSrc) frame.setAttribute("src", frame.dataset.gatewayBrowserSrc);
+      } else frame.removeAttribute("src");
+    }
+    const save = setupById("save-discord");
+    if (save) save.disabled = setupState.discordSaveInFlight;
+  };
+  const setupSaveDiscord = async () => {
+    if (setupState.discordSaveInFlight) return null;
+    const transport = setupDiscordTransport();
+    const token = setupText(setupById("discord-token")?.value, "").trim();
+    const body = { transport };
+    if (token) body.token = token;
+    setupState.discordSaveInFlight = true;
+    setupSetFeedback("discord-setup-feedback", "Saving Discord setup…");
+    setupRenderDiscordTransport();
+    try {
+      const status = await setupPost("/api/setup/discord", body, "discord-setup-feedback");
+      if (status) {
+        setupState.discordDirty = false;
+        const input = setupById("discord-token");
+        if (input) input.value = "";
+        setupSetFeedback("discord-setup-feedback", "Discord setup saved. Reconnect requested.", "success");
+      }
+      return status;
+    } finally {
+      setupState.discordSaveInFlight = false;
+      setupRenderDiscordTransport(setupPart(setupState.status, "discord"));
+      setupSchedulePoll();
+    }
+  };
   const setupRenderStatus = (status) => {
     setupState.status = status || {};
     setupState.statusError = "";
@@ -1905,6 +1967,7 @@ function relayReadTimeoutSignal() {
     if (pause) pause.textContent = paused ? "Resume relay" : "Pause relay";
     setupSetStatus("discord-setup-status", setupStatusValue(setupPart(status, "discord")), "discord");
     setupSetText("discord-setup-detail", setupDetail(setupPart(status, "discord"), "Waiting for setup status."));
+    setupRenderDiscordTransport(setupPart(status, "discord"));
     setupRenderDiscovery(setupDiscoveryPart(status));
     setupRenderCodex(setupPart(status, "codex"));
     setupRenderRobinhood(setupPart(status, "robinhood"));
@@ -1921,7 +1984,7 @@ function relayReadTimeoutSignal() {
   const setupSchedulePoll = () => {
     if (setupState.pollTimer) window.clearTimeout(setupState.pollTimer);
     const activeTrading = setupTradingStatus(setupState.status);
-    const active = setupState.authActive.codex || setupState.authActive.robinhood || setupState.modeChangeInFlight || setupState.notificationsSaveInFlight || activeTrading.pending || setupById("browser-login-dialog")?.open || setupState.discoveryRequestInFlight || setupState.discovery.state === "waiting";
+    const active = setupState.authActive.codex || setupState.authActive.robinhood || setupState.modeChangeInFlight || setupState.notificationsSaveInFlight || setupState.discordSaveInFlight || activeTrading.pending || setupById("browser-login-dialog")?.open || setupState.discoveryRequestInFlight || setupState.discovery.state === "waiting";
     setupState.pollTimer = window.setTimeout(async () => {
       await setupLoadStatus();
       setupSchedulePoll();
@@ -2106,6 +2169,8 @@ function relayReadTimeoutSignal() {
   };
   const setupOpenBrowser = (provider = "discord", trigger = null) => {
     if (provider !== "discord") return false;
+    const discord = setupPart(setupState.status, "discord");
+    if (setupDiscordTransport(discord) === "gateway" && discord?.browser_fallback !== true) return true;
     const dialog = setupById("browser-login-dialog");
     if (dialog && typeof dialog.showModal === "function") {
       if (!dialog.open) {
@@ -2256,6 +2321,21 @@ function relayReadTimeoutSignal() {
     setupById("live-mode-cancel-secondary")?.addEventListener("click", () => liveModeDialog?.close("cancel"));
     setupById("set-shadow-mode")?.addEventListener("click", () => setupSetMode("shadow"));
     setupById("set-live-mode")?.addEventListener("click", (event) => setupOpenLiveModeDialog(event.currentTarget));
+    const discordForm = setupById("discord-setup-form");
+    discordForm?.addEventListener("input", () => {
+      setupState.discordDirty = true;
+      setupRenderDiscordTransport();
+      setupSetFeedback("discord-setup-feedback", "Unsaved changes.");
+    });
+    discordForm?.addEventListener("change", () => {
+      setupState.discordDirty = true;
+      setupRenderDiscordTransport();
+      setupSetFeedback("discord-setup-feedback", "Unsaved changes.");
+    });
+    discordForm?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      setupSaveDiscord();
+    });
     const channelForm = setupById("channel-setup-form");
     channelForm?.addEventListener("input", (event) => {
       if (event.target?.dataset?.channelField === "url") setupHandleChannelFieldChange(event);

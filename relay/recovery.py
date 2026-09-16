@@ -25,7 +25,7 @@ class RecoveryEvaluator:
         channel = self.engine.channels.get(message.get("channel_id"))
         if (not channel or channel.get("role") != "signals"
                 or not channel_allows_author(channel, message.get("author_id", ""))
-                or message.get("source") != "browser" or message.get("edited_timestamp")
+                or message.get("source") not in {"browser", "gateway"} or message.get("edited_timestamp")
                 or message.get("ingestion") not in {"live", "baseline"}
                 or message.get("ingestion_reason") in {"history", "backscroll", "edit"}):
             return False

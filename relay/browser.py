@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from .core import channel_allows_author, instant
 from .discord_auth import DiscordLoginDiagnostics
 from .ingest import SNOWFLAKE, normalize
+from .pacing import discord_delay
 from .status import failure_detail, publish_status
 
 
@@ -383,7 +384,7 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
                 if state == "connected" and not keep_open:
                     LOG.info("Discord channel view reached; session saved to the dedicated profile")
                     break
-                await asyncio.sleep(3)
+                await asyncio.sleep(discord_delay(3))
             if page.is_closed():
                 publish_status(on_status, "discord", "needs_attention", detail="The Discord browser window was closed. Use Reconnect to reopen the saved session.")
         finally:
@@ -468,7 +469,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
             last_success: dict[str, float] = {}
             connection_epochs: dict[str, str] = {}
             unavailable: set[str] = set()
-            last_recovery: dict[str, float] = {}
+            next_recovery: dict[str, float] = {}
 
             while True:
                 pending = await manual_auth_page(context)
@@ -480,7 +481,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                         trackers[str(channel["id"])].reset()
                         unavailable.add(str(channel["id"]))
                         status(channel, "login_required" if auth_pending else "reconnecting", diagnostics.detail(detail))
-                    await asyncio.sleep(poll_seconds)
+                    await asyncio.sleep(discord_delay(poll_seconds))
                     continue
                 all_channels_ready = True
                 for index, channel in enumerate(channels):
@@ -511,8 +512,8 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                             if await manual_auth_page(context) is not None:
                                 all_channels_ready = False
                                 break
-                            if now - last_recovery.get(channel_id, -60) >= 30:
-                                last_recovery[channel_id] = now
+                            if now >= next_recovery.get(channel_id, -1):
+                                next_recovery[channel_id] = now + discord_delay(30)
                                 tracker.reset()
                                 await _navigate_with_progress(
                                     page,
@@ -576,7 +577,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                         await on_message(message)
                 if all_channels_ready and await manual_auth_page(context) is None:
                     diagnostics.clear()
-                await asyncio.sleep(poll_seconds)
+                await asyncio.sleep(discord_delay(poll_seconds))
         finally:
             await diagnostics.close()
             if discovery_task is not None:

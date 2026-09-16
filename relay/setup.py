@@ -32,6 +32,14 @@ from urllib.parse import parse_qs, urlsplit
 from .broker import SCHEMA_PINS, _OAuthStorage, login as broker_login
 from .cli import inspect_broker
 from .core import Hold, Store, instant, load_config, money
+from .discord_session import (
+    DEFAULT_TOKEN_ENV,
+    DEFAULT_TOKEN_STORE,
+    credential_configured,
+    normalize_token,
+    read_token,
+    write_token,
+)
 from .interpreter import CodexInterpreter
 from .status import failure_detail, is_auth_required_state
 
@@ -155,6 +163,57 @@ class SetupManager:
             candidate["notifications"] = {"enabled": payload["enabled"], "webhook_url": url}
             self._atomic_write_config_locked(candidate)
             return self._action_response_locked("notifications_saved")
+
+    def save_discord(self, payload: dict) -> dict:
+        """Save Discord transport settings and an optional gateway token.
+
+        The token is deliberately written to the private token store before
+        the response is built.  The response goes through the normal public
+        status projection, which contains only a boolean credential marker.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("Discord setup payload must be an object")
+        unknown = set(payload) - {"transport", "token"}
+        if unknown:
+            raise ValueError("Unsupported Discord setup field")
+        transport = payload.get("transport", "browser")
+        if transport not in {"browser", "gateway"}:
+            raise ValueError("Discord transport must be browser or gateway")
+        token_supplied = "token" in payload
+        token_value = ""
+        if token_supplied:
+            if not isinstance(payload["token"], str):
+                raise ValueError("Discord gateway token must be a string")
+            token_value = normalize_token(payload["token"], allow_empty=True)
+
+        with self._lock:
+            self._ensure_open_locked()
+            latest = self._read_raw_locked()
+            old_discord = self._discord_section(latest)
+            old_transport = old_discord["transport"]
+            old_config = self._resolved_discord_config(latest)
+            old_token = read_token(old_config)
+
+            candidate = copy.deepcopy(latest)
+            candidate["discord"] = {**candidate.get("discord", {}),
+                "transport": transport,
+                "token_store": old_discord["token_store"],
+                "token_env": old_discord["token_env"],
+            }
+            self._validate_candidate(candidate)
+
+            token_changed = bool(token_value) and token_value != old_token
+            if token_changed:
+                write_token(self._resolved_discord_config(candidate), token_value)
+            self._atomic_write_config_locked(candidate)
+
+            # A changed transport or token must be observed by the worker.  A
+            # blank token is intentionally a no-op so an accidental clear in
+            # the form cannot remove the saved credential.
+            if transport != old_transport or token_changed:
+                self._request_reconnect_locked()
+            return self._action_response_locked("discord_saved")
 
     def discover_discord(self, payload: dict) -> dict:
         """Ask the existing browser worker for visible servers, channels or authors."""
@@ -825,7 +884,126 @@ class SetupManager:
             thread.join(2.0)
         return bool(result and result[0] is not None)
 
+    @staticmethod
+    def _discord_section(raw: dict) -> dict:
+        value = raw.get("discord", {}) if isinstance(raw, dict) else {}
+        if not isinstance(value, dict):
+            value = {}
+        transport = value.get("transport", "browser")
+        if transport not in {"browser", "gateway"}:
+            transport = "browser"
+        token_store = value.get("token_store", DEFAULT_TOKEN_STORE)
+        if not isinstance(token_store, str) or not token_store.strip():
+            token_store = DEFAULT_TOKEN_STORE
+        token_env = value.get("token_env", DEFAULT_TOKEN_ENV)
+        if not isinstance(token_env, str) or not token_env.strip():
+            token_env = DEFAULT_TOKEN_ENV
+        return {
+            "transport": transport,
+            "token_store": token_store,
+            "token_env": token_env,
+        }
+
+    def _resolved_discord_config(self, raw: dict) -> dict:
+        section = self._discord_section(raw)
+        store = Path(section["token_store"]).expanduser()
+        if not store.is_absolute():
+            store = self.config_path.parent / store
+        # abspath normalizes the caller-relative path while preserving a final
+        # symlink so discord_session can reject it safely.
+        section["token_store"] = os.path.abspath(str(store))
+        return {"discord": section}
+
+    def _request_reconnect_locked(self) -> None:
+        reconnect_path = self.config_path.parent / "state" / "RECONNECT"
+        reconnect_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if reconnect_path.is_symlink():
+            raise RuntimeError("RECONNECT path must not be a symlink")
+        reconnect_path.touch(mode=0o600, exist_ok=True)
+        reconnect_path.chmod(0o600)
+
+    @staticmethod
+    def _safe_discord_runtime_detail(value: object, fallback: str) -> str:
+        if not isinstance(value, str):
+            return fallback
+        detail = value.strip()
+        if not 1 <= len(detail) <= 400:
+            return fallback
+        if any(ord(char) < 32 or ord(char) == 127 for char in detail):
+            return fallback
+        lowered = detail.lower()
+        if "http://" in lowered or "https://" in lowered:
+            return fallback
+        if any(marker in lowered for marker in ("token=", "token:", "authorization:", "password=")):
+            return fallback
+        return detail
+
     def _public_discord(self, raw: dict) -> dict:
+        section = self._discord_section(raw)
+        if section["transport"] == "gateway":
+            from .dashboard import _safe_runtime
+            from .discovery import discovery_status
+
+            runtime_path = self._configured_path(
+                raw,
+                "runtime_status_file",
+                self.config_path.parent / "state" / "runtime-status.json",
+            )
+            runtime = _safe_runtime(raw, runtime_path)
+            runtime_discord = runtime.get("discord", {}) if isinstance(runtime, dict) else {}
+            if not isinstance(runtime_discord, dict):
+                runtime_discord = {}
+            credential = False
+            try:
+                credential = credential_configured(self._resolved_discord_config(raw))
+            except (OSError, RuntimeError, ValueError, TypeError):
+                credential = False
+            source_state = str(runtime_discord.get("state", "not_connected"))
+            if runtime.get("stale"):
+                source_state = "unavailable"
+            mapped = {
+                "connected": "connected",
+                "ready": "connected",
+                "starting": "starting",
+                "connecting": "starting",
+                "reconnecting": "starting",
+                "login_required": "not_connected",
+                "not_configured": "not_connected",
+                "needs_attention": "failed",
+                "error": "failed",
+                "failed": "failed",
+                "unavailable": "unknown",
+            }.get(source_state, "not_connected")
+            if not credential:
+                mapped = "not_connected"
+                detail = (
+                    "Discord gateway token is not configured [gateway_token_missing]. "
+                    "Save a token or select Browser."
+                )
+            elif mapped == "connected":
+                detail = "Discord gateway is connected."
+            elif mapped == "starting":
+                detail = "Discord gateway worker is reconnecting."
+            elif mapped == "failed":
+                detail = self._safe_discord_runtime_detail(
+                    runtime_discord.get("detail"),
+                    "Discord gateway worker needs attention.",
+                )
+            elif mapped == "unknown":
+                detail = "Discord gateway status is unavailable. Reconnect to retry."
+            else:
+                detail = self._safe_discord_runtime_detail(
+                    runtime_discord.get("detail"),
+                    "Discord gateway is configured; reconnect to start it.",
+                )
+            return {
+                "state": mapped,
+                "detail": detail,
+                "transport": "gateway",
+                "credential_configured": credential,
+                "discovery": discovery_status(runtime_path),
+            }
+
         from .dashboard import _safe_runtime
         from .discovery import discovery_status
         runtime_path = self._configured_path(raw, "runtime_status_file", self.config_path.parent / "state/runtime-status.json")
@@ -867,9 +1045,16 @@ class SetupManager:
                 detail += " Save both channel URLs to start monitoring."
             elif not section.get("channels"):
                 detail += " Waiting for channel monitoring to start."
+        credential = False
+        try:
+            credential = credential_configured(self._resolved_discord_config(raw))
+        except (OSError, RuntimeError, ValueError, TypeError):
+            credential = False
         return {
             "state": mapped,
             "detail": detail,
+            "transport": "browser",
+            "credential_configured": credential,
             "browser_url": PUBLIC_BROWSER_URL,
             "discovery": discovery_status(runtime_path),
         }

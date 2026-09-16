@@ -216,11 +216,21 @@
             <div class="setup-stack">
               <article class="setup-card" aria-labelledby="discord-auth-title">
                 <div class="setup-card-heading">
-                  <div><p class="eyebrow">BROWSER</p><h3 id="discord-auth-title">Discord login</h3></div>
+                  <div><p class="eyebrow">DISCORD CONNECTION</p><h3 id="discord-auth-title">Discord connection</h3></div>
                   <span class="status-pill is-context" id="discord-setup-status">Not connected</span>
                 </div>
-                <p class="setup-help">Use the internal browser to sign in. The relay keeps the browser session; it never asks for a Discord token.</p>
+                <p class="setup-help">Choose a browser session or Gateway (discord.py-self). Browser login keeps its session on the relay; gateway login uses your personal token.</p>
                 <a class="button button-quiet setup-browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify">Open Browser login <span aria-hidden="true">↗</span></a>
+                <form id="discord-setup-form" class="discord-setup-form" autocomplete="off" novalidate>
+                  <label class="field" for="discord-transport"><span class="field-label">Connection</span><select id="discord-transport" name="transport"><option value="browser">Browser session</option><option value="gateway">Gateway (discord.py-self)</option></select></label>
+                  <div id="discord-gateway-fields" class="discord-gateway-fields" hidden>
+                    <label class="field" for="discord-token"><span class="field-label">Personal token</span><input id="discord-token" name="token" type="password" maxlength="4096" autocomplete="off" spellcheck="false" aria-describedby="discord-token-help"></label>
+                    <p class="setup-help setup-help-small" id="discord-token-help">Your personal token is saved securely on this relay and never shown again.</p>
+                    <p class="setup-help setup-help-small discord-credential-status" id="discord-credential-status" role="status" aria-live="polite">No saved gateway credential.</p>
+                  </div>
+                  <div class="auth-actions"><button class="button button-filter" id="save-discord" type="submit">Save Discord setup</button></div>
+                  <p class="form-feedback" id="discord-setup-feedback" role="status" aria-live="polite"></p>
+                </form>
                 <p class="setup-card-detail" id="discord-setup-detail">Waiting for setup status.</p>
               </article>
 

@@ -12,7 +12,7 @@ This container packages the relay worker, a visible Chromium desktop for Discord
 - A Discord account and channels you are authorized to read, a ChatGPT subscription that can use Codex, and a Robinhood account eligible for the broker integration.
 - A private `.env` file. Do not commit it or replace an existing one without preserving its settings.
 
-No OpenAI API key is needed. Discord input uses the rendered personal browser session, and Robinhood setup uses normal browser OAuth.
+No OpenAI API key is needed. Discord input uses the personal account through Gateway or Browser mode; Robinhood setup uses normal browser OAuth.
 
 ## Start the container
 
@@ -39,12 +39,18 @@ All provider setup is available from the authenticated **Setup** section. No `do
 
 ### Discord input
 
-1. Open **Browser login** and sign in to the personal Discord account in the embedded Chromium desktop. Complete any verification in that browser.
-2. Select **Refresh servers**, choose a server, and choose a channel for each of the two rows. The names come from the signed-in browser's rendered sidebar.
+1. Choose **Gateway (discord.py-self)** in **Discord input**, enter your personal-account token in the password field, and save. The credential is stored privately with owner-only permissions and is never returned by the API. An empty field preserves it. For **Browser** mode, open **Browser login** and complete manual sign-in and any verification in the embedded Chromium desktop.
+2. Once connected, select **Refresh servers**, choose a server, and choose a channel for each of the two rows. Gateway uses its cached directory; Browser uses the rendered sidebar.
 3. Set each row to `Signals` when it may supply actionable alerts, or `Context` when it should provide context only. Author restrictions are optional; an unchecked restriction accepts every author in that channel.
-4. Choose a poll interval from 2–60 seconds (3 seconds by default), then select **Save channels**.
+4. Select **Save channels**. Browser polling uses a base interval of 2–60 seconds (3 seconds by default); Gateway receives live events without message polling.
 
-The advanced channel URL field is a fallback when a channel is not visible in the current directory. The worker requires exactly two distinct channel bindings. The reader does not extract a Discord token or post to the input channels.
+The advanced channel URL field is a fallback when a channel is not visible in the current directory. The worker requires exactly two distinct channel bindings. Neither reader extracts credentials or posts to the input channels.
+
+Fresh Docker volumes select Gateway. Existing volumes and configurations without a transport keep Browser mode, so an upgrade preserves the saved session. Switch an existing installation explicitly in Setup. Revoked Gateway credentials require a replacement in Setup; the service waits for correction instead of repeatedly retrying an invalid token. It cannot refresh a revoked user token automatically.
+
+Gateway uses `discord.py-self==2.1.0`, keeps subscriptions needed for messages, and disables bulk startup member chunking. History is limited to one page of at most 100 messages per configured channel, fetched sequentially for context. Guild/channel discovery reads the cache; available author suggestions may be incomplete, and author restrictions remain optional.
+
+Application-controlled Discord polling, browser recovery, discovery waits, and history pacing use random delays between 80% and 120% of their base interval. Library reconnect backoff stays under the library's control. Protocol heartbeats, provider rate-limit minimums, navigation deadlines, and trading freshness windows are unchanged. Jitter and the library do not guarantee avoiding Discord restrictions; this implementation adds no proxies, fingerprint spoofing, or CAPTCHA solving.
 
 ### Codex subscription
 
@@ -62,7 +68,7 @@ Authentication, account inspection, and order execution are separate stages. Set
 
 **Setup → Discord output webhook** is an optional output destination. Paste a valid Discord webhook URL, enable notifications, and save. The URL is stored privately and stays hidden after saving; disabling notifications keeps the saved URL, while removing it clears the destination.
 
-Notifications can report authentication assistance and relay actions with a Paper, Shadow, or Live label. They are separate from the personal Discord browser used as input. Message bodies, account identifiers, OAuth codes, and credentials are omitted, and no test post is sent by setup.
+Notifications can report authentication assistance and relay actions with a Paper, Shadow, or Live label. They are separate from the personal Discord account used as input. Message bodies, account identifiers, OAuth codes, and credentials are omitted, and no test post is sent by setup.
 
 ## Choose Shadow, Paper, or Live
 
@@ -88,11 +94,11 @@ The worker requires `live` mode and the explicit live-order flag together with i
 
 ## Fresh processing and recovery review
 
-After the first login, restart, or reconnect, the visible channel history becomes a context baseline. Baseline rows are recorded for context and are never replayed as fresh entries. New dispatch still requires an eligible `Signals` row, an authorized author, an exact contract, and current source and market data.
+After the first login, restart, or reconnect, the observed channel history becomes a context baseline. Baseline rows are recorded for context and are never replayed as fresh entries. New dispatch still requires an eligible `Signals` row, an authorized author, an exact contract, and current source and market data.
 
-Eligible baseline alerts and fresh alerts held because they became stale may be queued for a recovery assessment after the browser returns to the newest messages. Recovery compares the original alert with later same-source context and current account and quote facts. The dashboard labels the result **Potentially viable**, **Invalidated**, **Uncertain**, or **Not actionable**, with timing, evidence, facts, and blockers. Every recovery result is review-only; it has no approval or order-submission path.
+Eligible baseline alerts and fresh alerts held because they became stale may be queued for a recovery assessment after the reader returns to the newest messages. Recovery compares the original alert with later same-source context and current account and quote facts. The dashboard labels the result **Potentially viable**, **Invalidated**, **Uncertain**, or **Not actionable**, with timing, evidence, facts, and blockers. Every recovery result is review-only; it has no approval or order-submission path.
 
-Recovery has no age or entry-count cutoff for an assessment, but it is bounded by messages the browser actually observed and by durable per-revision deduplication. It does not fetch every missed Discord message, reconstruct a historical price path, or convert an old alert into a fresh trigger. Edited rows, manual backscroll, imported history, future timestamps, unauthorized authors, and context-only rows are excluded.
+Recovery has no age or entry-count cutoff for an assessment, but it is bounded by messages the selected reader actually observed and by durable per-revision deduplication. It does not fetch every missed Discord message, reconstruct a historical price path, or convert an old alert into a fresh trigger. Edited rows, manual backscroll, imported history, future timestamps, unauthorized authors, and context-only rows are excluded.
 
 ## Risk guardrails
 
