@@ -1,12 +1,14 @@
 """Offline checks only: every Robinhood response is supplied by a local fake."""
 import copy
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 import importlib.util
+from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock
 
-from relay.broker import BrokerError, BrokerPreflightHold, RobinhoodBroker
+from relay.broker import BrokerError, BrokerPreflightHold, RobinhoodBroker, regular_session
 
 
 @unittest.skipUnless(importlib.util.find_spec("exchange_calendars"), "Robinhood calendar extra is not installed")
@@ -24,6 +26,10 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             "underlying_instruments": [{"symbol": "SPY", "instrument": "fixture"}], "trade_value_multiplier": "100", "can_open_position": True}
         self.quote = {"instrument_id": self.instrument["id"], "bid_price": "0.95", "ask_price": "1.00", "bid_size": 10,
             "ask_size": 10, "mark_price": "0.975", "updated_at": self.now.isoformat()}
+        self.equity_quote = {
+            "symbol": "SPY", "last_trade_price": "501.00", "venue_last_trade_time": self.now.isoformat(),
+            "has_traded": True, "state": "active",
+        }
         self.account = {"account_number": "TEST0001", "agentic_allowed": True, "state": "active", "deactivated": False,
             "permanently_deactivated": False, "option_level": "option_level_2", "type": "cash"}
         self.portfolio = {"total_value": "1000", "equity_value": "20", "options_value": "0",
@@ -53,6 +59,9 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
                 return {"instruments": [self.instrument]}
             if name == "get_option_quotes":
                 return {"results": [{"quote": self.quote}]}
+            if name == "get_equity_quotes":
+                self.assertEqual(args, {"symbols": ["SPY"]})
+                return {"results": [{"quote": self.equity_quote}]}
             if name == "search":
                 return {"results": [{"symbol": "SPY", "instrument_id": "8f92e76f-1e0e-4478-8580-16a6ffcfaef5", "name": "SPY fixture"}]}
             if name == "review_option_order":
@@ -87,6 +96,29 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.instrument["strike_price"] = "501"
         with self.assertRaisesRegex(BrokerError, "missing or ambiguous"):
             await self.broker.quote(self.contract)
+
+    async def test_underlying_quote_uses_exact_active_regular_trade(self):
+        quote = await self.broker.underlying_quote("spy")
+        self.assertEqual(quote, {"symbol": "SPY", "price": "501.00", "timestamp": self.now.isoformat()})
+        self.equity_quote["has_traded"] = False
+        with self.assertRaisesRegex(BrokerError, "inactive or has not traded"):
+            await self.broker.underlying_quote("SPY")
+
+    def test_equity_quote_schema_pin_matches_private_fixture(self):
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "robinhood-equity-quote-schema.json").read_text()
+        )
+        tool = fixture["get_equity_quotes"]["tool"]
+        self.broker.catalog["get_equity_quotes"] = tool
+        self.assertIs(self.broker._qualified("get_equity_quotes"), tool)
+
+    def test_regular_session_returns_xnys_early_close(self):
+        regular = regular_session(datetime(2026, 9, 8, 15, tzinfo=timezone.utc))
+        self.assertEqual(regular[0], datetime(2026, 9, 8, 13, 30, tzinfo=timezone.utc))
+        self.assertEqual(regular[1], datetime(2026, 9, 8, 20, tzinfo=timezone.utc))
+        early = regular_session(datetime(2026, 11, 27, 17, 5, tzinfo=timezone.utc))
+        self.assertEqual(early[1], datetime(2026, 11, 27, 18, tzinfo=timezone.utc))
+        self.assertIsNone(regular_session(datetime(2026, 11, 26, 15, tzinfo=timezone.utc)))
 
     async def test_account_overview_projects_negative_short_adjusted_and_stale(self):
         self.positions = [{

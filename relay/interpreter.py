@@ -156,8 +156,9 @@ source_group can link approved authors; matching names alone cannot link them.
 Unowned holdings are context only and cannot authorize selling or changing stops.
 For a reply, use its explicit referenced message when present and consistent.
 If multiple positions or competing theses fit, WAIT with ambiguous=true.
-REDUCE means an explicit partial exit; CLOSE means the full remaining owned
-position; UPDATE_STOP needs an explicit OPTION PREMIUM stop, not an underlying
+REDUCE means an explicit partial exit or a high-confidence contextual CURRENT
+success/closing signal on one exact relay-owned position; UPDATE_STOP needs an
+explicit OPTION PREMIUM stop, not an underlying
 support/resistance number. "BE" means the known current position's average option
 premium; unknown cost basis means WAIT. Do not invent a numeric stop. OPEN may
 include an explicit option premium stop. Prices and strikes are decimal strings.
@@ -167,6 +168,19 @@ Preserve every stated quantity and fraction exactly. Add the boolean profit_only
 field to every decision. Set profit_only=true only for a CURRENT, discretionary
 or optional profit-taking suggestion tied to the one resolved same-source,
 bot-owned contract, such as "you can trim or take profits if you'd like".
+The same REDUCE/profit_only=true interpretation is allowed without imperative
+wording when the CURRENT message uses confident success or closing language
+about one exact contract in the supplied relay-owned positions (for example,
+that exact contract is green, paid, a winner, or closing well). This requires
+an unambiguous match on source_group, symbol, expiry, strike and option_type;
+do not use a ticker mention or a recently watched contract as a match. Treat
+generic victory or gains recaps, account-wide or flat-account statements,
+unrelated pictures, uncertain or missing contracts, and future or conditional
+language as non-actionable IGNORE or WAIT context. If the message states an
+explicit quantity or fraction, preserve it; if it explicitly says all out,
+close remaining, or otherwise directs a full exit, use CLOSE with
+profit_only=false. The contextual success rule supplies only an optional
+partial REDUCE when no explicit exit size or full-exit direction is given.
 An optional explicit all-profits or full-exit suggestion is CLOSE with
 profit_only=true. An unquantified optional partial suggestion is REDUCE with
 quantity=null and fraction=null; the deterministic engine chooses its guarded

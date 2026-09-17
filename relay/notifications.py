@@ -267,6 +267,11 @@ def _projection(decision, *, fallback_action=None, fallback_contract=None, fallb
         result["quantity"] = quantity
     if price:
         result["price"] = price
+    expiry = decision.get("expiry_exit", proposal.get("expiry_exit"))
+    if isinstance(expiry, dict) and expiry.get("status") in {
+        "watching", "closing", "blocked", "unfilled", "unavailable", "market_closed"
+    }:
+        result["expiry_status"] = expiry["status"]
     evaluation = decision.get("entry_evaluation", proposal.get("entry_evaluation"))
     if isinstance(evaluation, dict):
         clean = {key: value for key in (
@@ -280,6 +285,11 @@ def _projection(decision, *, fallback_action=None, fallback_contract=None, fallb
 
 def _format_projection(projection):
     parts = []
+    expiry = projection.get("expiry_status")
+    if expiry:
+        parts.append("Expiry exercise protection")
+        if expiry in {"unfilled", "blocked", "unavailable", "market_closed"}:
+            parts.append("— remaining inventory may exercise; check broker immediately —")
     if projection.get("action"):
         parts.append(projection["action"])
     contract = projection.get("contract")

@@ -972,7 +972,9 @@ function relayReadTimeoutSignal() {
       const stateNode = node("div");
       const stateValue = firstValue(event.state, readDecision(event).state, "context");
       const recovery = recoveryAssessment(event);
-      append(stateNode, decisionPill(stateValue), node("div", "event-message-id", `Message / ${shortId(firstValue(event.message_id, event.messageId))}`));
+      const eventId = firstValue(event.message_id, event.messageId);
+      const sourceLabel = String(eventId).startsWith("expiry:") ? "Expiry policy" : "Message";
+      append(stateNode, decisionPill(stateValue), node("div", "event-message-id", `${sourceLabel} / ${shortId(eventId)}`));
       const reason = node("p", "event-reason", valueText(firstValue(recovery?.reason, event.reason, decisionReason(event), "No reason recorded.")));
       const action = node("div", "event-action", isRecoveryEvent(event)
         ? `Recovery assessment${recovery?.status ? ` · ${recoveryStatusLabel(recovery.status)}` : ""}`

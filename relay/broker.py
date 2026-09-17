@@ -10,6 +10,7 @@ import hmac
 import hashlib
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import stat
 import tempfile
 from urllib.parse import parse_qs, urlsplit
@@ -22,7 +23,7 @@ from .status import failure_detail, publish_status
 ROBINHOOD_ENDPOINT = "https://agent.robinhood.com/mcp/trading"
 READ_TOOLS = frozenset({
     "get_accounts", "get_portfolio", "get_realized_pnl", "get_pnl_trade_history",
-    "search", "get_option_chains", "get_option_instruments", "get_option_quotes",
+    "search", "get_equity_quotes", "get_option_chains", "get_option_instruments", "get_option_quotes",
     "get_option_positions", "get_option_orders", "get_option_historicals",
     "get_option_level_upgrade_info",
 })
@@ -34,6 +35,26 @@ class BrokerError(RuntimeError):
 
 class BrokerPreflightHold(BrokerError):
     """Final dispatch validation failed before any order transport began."""
+
+
+def regular_session(now=None):
+    """Return the current XNYS regular-session bounds in UTC, or ``None``."""
+    try:
+        import exchange_calendars
+
+        instant = now or datetime.now(timezone.utc)
+        if not isinstance(instant, datetime) or instant.tzinfo is None:
+            raise ValueError
+        instant = instant.astimezone(timezone.utc)
+        calendar = exchange_calendars.get_calendar("XNYS")
+        session = instant.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        if not calendar.is_session(session):
+            return None
+        opened = calendar.session_open(session).to_pydatetime().astimezone(timezone.utc)
+        closed = calendar.session_close(session).to_pydatetime().astimezone(timezone.utc)
+        return opened, closed
+    except (ImportError, ValueError, KeyError, AttributeError):
+        raise BrokerError("NYSE regular-session calendar is unavailable") from None
 
 
 _AUTHENTICATION_MARKERS = (
@@ -291,6 +312,42 @@ class PaperBroker:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             if isinstance(exc, BrokerError):
                 raise
+            raise BrokerError("Invalid or unreadable paper quote fixture") from None
+
+    async def underlying_quote(self, symbol):
+        """Read an explicit per-symbol underlying quote from the paper fixture."""
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise BrokerError("Underlying quote requires a symbol")
+        symbol = symbol.strip().upper()
+        path = self.config.get("quotes_file")
+        if not path:
+            raise BrokerError("paper.quotes_file must point to explicit quote fixtures")
+        try:
+            data = json.loads(Path(path).read_text())
+            quotes = data["quotes"] if isinstance(data, dict) else data
+            matches = []
+            for quote in quotes:
+                contract = quote.get("contract") if isinstance(quote, dict) else None
+                if not isinstance(contract, dict):
+                    continue
+                if str(contract.get("symbol", "")).upper() != symbol:
+                    continue
+                if "underlying_price" not in quote or "underlying_timestamp" not in quote:
+                    continue
+                price = _decimal(quote["underlying_price"], "underlying price")
+                timestamp = datetime.fromisoformat(
+                    str(quote["underlying_timestamp"]).replace("Z", "+00:00")
+                )
+                if price <= 0 or timestamp.tzinfo is None:
+                    raise BrokerError("Invalid paper underlying quote")
+                matches.append((price, timestamp.astimezone(timezone.utc)))
+            if not matches or len(set(matches)) != 1:
+                raise BrokerError("Paper underlying quote missing or ambiguous for symbol")
+            price, timestamp = matches[0]
+            return {"symbol": symbol, "price": str(price), "timestamp": timestamp.isoformat()}
+        except BrokerError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError):
             raise BrokerError("Invalid or unreadable paper quote fixture") from None
 
     async def submit(self, order):
@@ -666,6 +723,7 @@ SCHEMA_PINS = {
                      "4ae8734970c9dd300d627ea117b185fb5744e1af16970d6f79267e55acf97603"},
     "get_portfolio": {"b1d5f51ec0e84c8a62181dee3daa7a5d2ab93c7ece8d0c8373d482715455a2f5",
                       "a0b873691e9b5e7f8843f94f02073e56b9958f59b540fd4efac5cc3347af960a"},
+    "get_equity_quotes": {"6a64ff3f6ae5e6e3a536177b74e58e65ed538a771ff7c0cd9f23b472707d567f"},
     "get_option_chains": {"661824e1e339fdc16e61a5192a37ebb664de935fc493887f9825e16fbcc119ba"},
     "get_option_instruments": {"e27cf1cb98aeecf5940b23c6ff02dada0f07f5e90866d77e63a843b983f8d503"},
     "get_option_quotes": {"ac069476d02f1b401fc9f2f1a65d402a5d7cb352df2f4b06cff87307fb846508"},
@@ -756,15 +814,9 @@ class RobinhoodBroker(RobinhoodMCP):
             args = dict(args, cursor=cursors[0])
 
     def _market_open(self):
-        try:
-            import exchange_calendars
-            calendar = exchange_calendars.get_calendar("XNYS")
-            now = self.clock().astimezone(timezone.utc)
-            session = now.date().isoformat()
-            return bool(calendar.is_session(session) and
-                        calendar.session_open(session).to_pydatetime() <= now < calendar.session_close(session).to_pydatetime())
-        except (ImportError, ValueError, KeyError):
-            raise BrokerError("NYSE regular-session calendar is unavailable") from None
+        now = self.clock().astimezone(timezone.utc)
+        session = regular_session(now)
+        return bool(session and session[0] <= now < session[1])
 
     async def _portfolio(self):
         data = await self._data("get_portfolio", {"account_number": self.account_number})
@@ -801,6 +853,36 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Option quote is missing or ambiguous")
         _instant(matches[0]["updated_at"])
         return matches[0]
+
+    async def underlying_quote(self, symbol):
+        """Return one fresh-session equity trade for an exact underlying symbol."""
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise BrokerError("Underlying quote requires a symbol")
+        symbol = symbol.strip().upper()
+        now = self.clock().astimezone(timezone.utc)
+        session = regular_session(now)
+        if session is None or not session[0] <= now < session[1]:
+            raise BrokerError("Underlying quote requires an open regular session")
+        data = await self._data("get_equity_quotes", {"symbols": [symbol]})
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            raise BrokerError("Underlying quote results are missing")
+        matches = []
+        for result in results:
+            quote = result.get("quote") if isinstance(result, dict) else None
+            if isinstance(quote, dict) and quote.get("symbol") == symbol:
+                matches.append(quote)
+        if len(matches) != 1:
+            raise BrokerError("Underlying quote is missing or ambiguous")
+        quote = matches[0]
+        if quote.get("state") != "active" or quote.get("has_traded") is not True:
+            raise BrokerError("Underlying quote is inactive or has not traded")
+        price = _decimal(quote.get("last_trade_price"), "underlying price")
+        timestamp = _instant(quote.get("venue_last_trade_time")).astimezone(timezone.utc)
+        if price <= 0 or not session[0] <= timestamp < session[1] or timestamp > now:
+            raise BrokerError("Underlying quote is not a current regular-session trade")
+        self._check_quote_age(timestamp.isoformat(), "Underlying quote")
+        return {"symbol": symbol, "price": str(price), "timestamp": timestamp.isoformat()}
 
     async def account_overview(self):
         """Return display-only account balances and option positions.
@@ -1114,11 +1196,11 @@ class RobinhoodBroker(RobinhoodMCP):
         if stop and Path(stop).exists():
             raise BrokerError("Kill switch is present")
 
-    def _check_quote_age(self, timestamp):
+    def _check_quote_age(self, timestamp, label="Option quote"):
         age = (self.clock() - _instant(timestamp)).total_seconds()
         maximum = _decimal(self.runtime.get("risk", {}).get("max_quote_age_seconds", 15), "quote age limit")
         if maximum <= 0 or age < -2 or age > maximum:
-            raise BrokerError("Option quote is stale")
+            raise BrokerError(f"{label} is stale")
 
     def _fresh_quote(self, quote):
         self._check_quote_age(quote["timestamp"])

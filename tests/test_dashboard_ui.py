@@ -117,6 +117,11 @@ def seed_dashboard(base, template):
                 with store.db:
                     store.db.execute("UPDATE orders SET status='filled',broker_id='paper-demo',filled_quantity=1,filled_notional='50' WHERE id='demo-order'")
                     store.db.execute("INSERT INTO positions VALUES (?,?,?,?)", (channel["source_group"], json.dumps(contract), 1, "0.50"))
+        with store.db:
+            store.db.execute("""INSERT INTO events(message_id,revision,state,reason,decision,created_at)
+                VALUES (?,?,?,?,?,?)""", ("expiry:synthetic", "expiry-itm-v1:0", "held",
+                "Expiry exercise protection: unfilled exit needs broker attention",
+                json.dumps({"action": "CLOSE", "contract": contract}), now))
     finally:
         store.close()
     config_path = base / "config.json"
@@ -173,6 +178,8 @@ class DashboardUITests(unittest.TestCase):
                                      "Model evaluation not recorded · Posted → decision not recorded")
                     failed_event = page.locator("#events-shell .event-row").filter(has_text="code=invalid_output")
                     self.assertEqual(failed_event.locator(".event-action").text_content(), "Evaluation failed")
+                    expiry_event = page.locator("#events-shell .event-row").filter(has_text="Expiry exercise protection")
+                    self.assertIn("Expiry policy /", expiry_event.locator(".event-message-id").inner_text())
                     self.assertIn("SPY", page.locator("#orders-shell").inner_text())
                     self.assertIn("filled", page.locator("#orders-shell").inner_text().lower())
                     self.assertIn("Evaluated ask $0.50", page.locator("#orders-shell").inner_text())

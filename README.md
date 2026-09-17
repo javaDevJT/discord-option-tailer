@@ -21,6 +21,8 @@ Private account exports, browser profiles, OAuth state, databases, and local cre
 
 ## How it works
 
+Expiry-day monitoring closes remaining in-the-money relay-owned options independently of Discord. See [expiry exercise protection](docs/container.md#expiry-exercise-protection) for timing, restart behavior, alerts, and fill limitations.
+
 1. The Gateway reader receives live message events through `discord.py-self==2.1.0`; the browser fallback reads the rendered DOM. Both use the personal account and never post to the input channels. Configure the transport and optional private Gateway credential in **Setup → Discord input**.
 2. The relay stores normalized messages and passes a bounded chronological context window to Codex. Codex runs through the user's ChatGPT subscription; no OpenAI API key is required.
 3. Deterministic checks require a clear standard option contract, an allowed source, fresh inputs, current quotes, account-relative sizing, and a mode-specific ledger.

@@ -1,0 +1,217 @@
+{
+  "get_equity_quotes": {
+    "tool": {
+      "name": "get_equity_quotes",
+      "description": "Get real-time stock quotes and the official last-completed-session close for one or more symbols.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "symbols": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "One or more stock symbols. Above 20 symbols, quotes still return but closes is omitted with closes_error set."
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "results": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "quote": {
+                      "type": [
+                        "null",
+                        "object"
+                      ],
+                      "properties": {
+                        "symbol": {
+                          "type": "string",
+                          "description": "Ticker symbol."
+                        },
+                        "last_trade_price": {
+                          "type": "string",
+                          "description": "Most recent regular-hours trade (9:30-16:00 ET). Stays frozen at the closing print after the close until the next open; not the official settled close."
+                        },
+                        "venue_last_trade_time": {
+                          "type": "string",
+                          "description": "Timestamp of last_trade_price."
+                        },
+                        "last_non_reg_trade_price": {
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "description": "Most recent pre-market / after-hours / overnight trade. Null during regular hours or when the symbol does not trade in the current session."
+                        },
+                        "venue_last_non_reg_trade_time": {
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "description": "Timestamp of last_non_reg_trade_price. Reveals which non-regular session the trade came from."
+                        },
+                        "adjusted_previous_close": {
+                          "type": "string",
+                          "description": "Prior-day close adjusted for splits, dividends, and mergers."
+                        },
+                        "previous_close": {
+                          "type": "string",
+                          "description": "Raw prior closing print — not corporate-action adjusted and not the official settled close."
+                        },
+                        "previous_close_date": {
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "description": "YYYY-MM-DD trading date that previous_close corresponds to. Null for symbols that have never had a settled close."
+                        },
+                        "bid_price": {
+                          "type": "string",
+                          "description": "Highest current buy-order price. Zero when the book is closed or unavailable."
+                        },
+                        "venue_bid_time": {
+                          "type": "string",
+                          "description": "Timestamp of bid_price."
+                        },
+                        "ask_price": {
+                          "type": "string",
+                          "description": "Lowest current sell-order price. Zero when the book is closed or unavailable."
+                        },
+                        "venue_ask_time": {
+                          "type": "string",
+                          "description": "Timestamp of ask_price."
+                        },
+                        "has_traded": {
+                          "type": "boolean",
+                          "description": "False for instruments that have never traded; price fields are meaningless when false."
+                        },
+                        "state": {
+                          "type": "string",
+                          "description": "Instrument listing state — 'active' is normal; other values (inactive, delisted, unlisted) mean the instrument is not in normal trading state."
+                        }
+                      },
+                      "description": "Live market data for this symbol.",
+                      "required": [
+                        "symbol",
+                        "last_trade_price",
+                        "venue_last_trade_time",
+                        "last_non_reg_trade_price",
+                        "venue_last_non_reg_trade_time",
+                        "adjusted_previous_close",
+                        "previous_close",
+                        "previous_close_date",
+                        "bid_price",
+                        "venue_bid_time",
+                        "ask_price",
+                        "venue_ask_time",
+                        "has_traded",
+                        "state"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "close": {
+                      "type": [
+                        "null",
+                        "object"
+                      ],
+                      "properties": {
+                        "symbol": {
+                          "type": "string",
+                          "description": "Ticker symbol."
+                        },
+                        "date": {
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "description": "YYYY-MM-DD trading date for this close. May be earlier than the requested date when interpolated."
+                        },
+                        "price": {
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "description": "Official settled close price. Null when the upstream has no close (rare)."
+                        },
+                        "interpolated": {
+                          "type": [
+                            "null",
+                            "boolean"
+                          ],
+                          "description": "True when the requested date had no session and the price came from an earlier date."
+                        },
+                        "source": {
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "description": "Upstream provenance (e.g. 'sip-close'). Informational."
+                        }
+                      },
+                      "description": "Official settled close from the most recent completed session. Absent when closes_error is set, or when this symbol had no close in an otherwise-successful closes batch.",
+                      "required": [
+                        "symbol",
+                        "date",
+                        "price",
+                        "interpolated",
+                        "source"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "quote"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "One entry per symbol resolved from /quotes/, in upstream order, each carrying the live quote and (when available) the official prior-session close. Empty if no symbol resolved."
+              },
+              "closes_error": {
+                "type": "string",
+                "description": "Populated when the closes lookup is skipped or fails tool-wide (e.g. too many symbols, upstream timeout, no previous_close_date). Per-symbol gaps surface as a missing close on the affected result, not here."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "results"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Each entry in results pairs the live quote with the official prior-session close for the same symbol. Current price: pick whichever of quote.last_trade_price / quote.last_non_reg_trade_price has the more recent timestamp, then verify that timestamp is recent before calling it \"current\" — otherwise phrase as \"as of <time>\". Daily change uses quote.adjusted_previous_close. \"Yesterday's close\" uses results[].close.price (official settled close); when a result is missing close — either closes_error is set tool-wide, or this symbol had no close in an otherwise-successful batch — fall back to quote.previous_close and tell the user the official close lookup is unavailable. Drop bid/ask when zero. Surface has_traded=false or any non-'active' state before quoting a price."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    }
+  }
+}

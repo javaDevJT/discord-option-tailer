@@ -17,6 +17,17 @@ UTC = timezone.utc
 
 
 class NotificationTests(unittest.TestCase):
+    def test_expiry_exit_and_unfilled_risk_reach_sanitized_notifications(self):
+        decision = {"action": "CLOSE", "expiry_exit": {"status": "unfilled", "provider_response": "SECRET"}}
+        event = {"id": 1, "state": "held", "message_id": "expiry:example", "decision": json.dumps(decision)}
+        alert = notifications._event_candidate(event, mode="live", order_ids=set(), order_message_ids=set())
+        self.assertIn("Expiry exercise protection", alert.payload["content"])
+        self.assertIn("check broker immediately", alert.payload["content"])
+        self.assertNotIn("SECRET", json.dumps(alert.payload))
+        order = {"id": "order", "status": "open", "body": json.dumps(decision), "action": "CLOSE", "filled_quantity": 0}
+        alert = notifications._order_candidate(order, mode="live")
+        self.assertIn("Expiry exercise protection", alert.payload["content"])
+
     def test_chase_diagnostics_are_numeric_and_reach_hold_and_order_notifications(self):
         evaluation = {"ask": "1.16", "reference_price": "1.00", "ask_deviation_percent": "16",
                       "limit_price": "1.20", "limit_deviation_percent": "20", "max_chase_percent": "15",

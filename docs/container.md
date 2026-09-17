@@ -129,6 +129,18 @@ Evaluation retries once for transient failures and invalid structured output or 
 
 ## Monitor and operate
 
+### Expiry exercise protection
+
+While the worker runs, expiry monitoring checks every 30 seconds during the final hour of the XNYS regular session, including calendar early closes. It manages only identifiable relay-owned standard equity/ETF options expiring that New York date. A fresh Robinhood underlying trade above the strike makes a call in the money; below the strike makes a put in the money. This is independent of the option trade's profit or loss. At-the-money and out-of-the-money holdings remain under observation.
+
+An eligible in-the-money position closes all remaining owned contracts through the existing account, inventory, quote, review, and submission checks. The limit is the current option bid rounded down to its tick; the entry spread limit and profit-only test do not block expiry liquidation. Live enablement, pause/kill switch, and observe-only controls still apply. No Discord message or new model evaluation is needed. The dashboard decision trail identifies internal expiry exercise protection events, and configured webhook notifications identify expiry actions and blocked/unfilled risk.
+
+Order IDs and cumulative fills remain in the durable ledger. Restarting cannot duplicate an accepted or uncertain expiry sale. Existing pending orders are reconciled; partial fills, cancellations, broker rejections, and unknown results with remaining inventory require broker attention instead of blind replacement. A final dispatch hold that proves transport never began may retry with a new audited attempt. The monitor never cancels orders, requests exercise, or submits do-not-exercise instructions.
+
+This is best-effort sale protection, not a guarantee against exercise. The worker must be running and authorized (its existing startup readiness requires Discord, Codex, and Robinhood setup), the order must fill, and an out-of-the-money option can cross its strike late or after regular trading. Remaining inventory after close raises an assistance alert. If preventing any possible exercise is the overriding requirement, separately arrange broker-supported do-not-exercise instructions or adopt an earlier exit for every expiring option; neither is silently enabled by this ITM-only rule.
+
+The interpreter may infer a profit-only partial exit from confident, current success/closing language tied to one exact owned position and source. Generic celebration, retrospective recaps, unrelated images, ambiguous contracts, or future conditions do not qualify. Explicit percentages and full exits retain their stated meaning; an unspecified inferred trim uses the existing half-remaining quantity with fractional remainders rounded upward.
+
 Gateway status checks the library's heartbeat acknowledgements locally every 16–24 seconds, even when neither channel has new messages. The detail shows the acknowledgement age. Missing or stale acknowledgements report reconnection and block live source verification; a process heartbeat alone is not proof that Discord is connected. This check does not send extra Discord requests or change protocol heartbeat timing.
 
 Discord's initial navigation has a 60-second network timeout. A slow page keeps the browser open and reports loading or recovery guidance; completing manual sign-in or MFA has no time limit. Use **Back to setup** to leave the browser view without ending the saved session. If the page stays blank, reload it in the embedded browser; use **Reconnect** if the browser worker has stopped.

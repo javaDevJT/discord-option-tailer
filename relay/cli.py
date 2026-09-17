@@ -150,6 +150,8 @@ async def run(config, *, observe_only=False, on_status=None):
         engine = Engine(config, store, None if observe_only else CodexInterpreter(config, on_status=on_status), broker)
         from .recovery import RecoveryEvaluator
         recovery = RecoveryEvaluator(engine)
+        from .expiry import ExpiryExits
+        expiry = ExpiryExits(engine, recovery.reconcile_orders)
         queue = asyncio.Queue(maxsize=config["risk"]["max_pending_messages"])
 
         async def on_message(message):
@@ -184,6 +186,7 @@ async def run(config, *, observe_only=False, on_status=None):
         async with asyncio.TaskGroup() as tasks:
             consumer = tasks.create_task(consume())
             recovery_consumer = tasks.create_task(recovery.consume(queue, emit))
+            expiry_consumer = tasks.create_task(expiry.run(emit))
             if config["mode"] != "paper":
                 from .account import AccountCache
                 account_reader = tasks.create_task(AccountCache(store, broker).run())
@@ -196,6 +199,7 @@ async def run(config, *, observe_only=False, on_status=None):
                 finally:
                     consumer.cancel()
                     recovery_consumer.cancel()
+                    expiry_consumer.cancel()
                     if account_reader is not None:
                         account_reader.cancel()
 

@@ -362,6 +362,45 @@ class InterpreterChecks(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, SYSTEM_PROMPT)
 
+    def test_contextual_success_prompt_requires_exact_current_relay_position(self):
+        prompt = " ".join(SYSTEM_PROMPT.split())
+        for phrase in (
+            "without imperative wording",
+            "confident success or closing language",
+            "one exact contract",
+            "relay-owned positions",
+            "source_group, symbol, expiry, strike and option_type",
+            "generic victory or gains recaps",
+            "account-wide or flat-account statements",
+            "unrelated pictures",
+            "uncertain or missing contracts",
+            "future or conditional language",
+            "optional partial REDUCE",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+
+        current_success = MESSAGE | {
+            "id": "success",
+            "content": "TSLA 352.5 put is green and closing well.",
+        }
+        contextual_reduce = DECISION | {
+            "action": "REDUCE",
+            "origin_message_id": "success",
+            "quantity": None,
+            "fraction": None,
+            "profit_only": True,
+            "evidence": [{"message_id": "success", "quote": current_success["content"]}],
+        }
+        self.assertEqual(validate_decision(contextual_reduce, current_success, []), contextual_reduce)
+
+        explicit_full_exit = contextual_reduce | {
+            "action": "CLOSE",
+            "profit_only": False,
+            "reason": "Explicit full exit.",
+        }
+        self.assertEqual(validate_decision(explicit_full_exit, current_success, []), explicit_full_exit)
+
     def test_rejects_malformed_decisions(self):
         alterations = [
             {"extra": True}, {"action": "BUY"}, {"action": ["OPEN"]},

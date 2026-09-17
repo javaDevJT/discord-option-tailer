@@ -525,11 +525,19 @@ class Engine:
             raise Hold("the original action message was revised")
         return origin
 
-    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None):
+    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None):
         """Recheck intent after broker review and immediately before its placement boundary."""
-        def current():
+        async def current(*, refresh=False):
             now = self.clock()
-            if recovery_guard is None:
+            if expiry_guard is not None:
+                if decision["action"] != "CLOSE" or order["side"] != "sell":
+                    raise Hold("expiry policy may only close owned contracts")
+                await expiry_guard(refresh=refresh)
+                if refresh:
+                    with self.store.db:
+                        self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
+                                              (json.dumps(order), order["client_order_id"]))
+            elif recovery_guard is None:
                 self.fresh(message, now)
                 self.fresh(self.origin(message, decision), now)
                 self.unchanged(message)
@@ -551,7 +559,7 @@ class Engine:
                 if quote is None or canonical_contract(quote.get("contract")) != order["contract"] or quote.get("tradable") is not True:
                     raise Hold("reviewed quote no longer identifies this tradable contract")
                 bid, ask = money(quote.get("bid"), positive=True), money(quote.get("ask"), positive=True)
-                if ask < bid or (ask - bid) / ask > money(self.config["risk"]["max_spread_fraction"]):
+                if ask < bid or (expiry_guard is None and (ask - bid) / ask > money(self.config["risk"]["max_spread_fraction"])):
                     raise Hold("reviewed quote spread exceeds the configured limit")
                 if order["side"] == "buy":
                     evaluation = entry_chase_evaluation(ask, decision["alert_price"], order["limit_price"], self.config["risk"]["max_chase_fraction"])
@@ -570,15 +578,15 @@ class Engine:
                     executable_price = (bid / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
                     self.check_exit_profit(message, decision, order, executable_price)
 
-        current()
-        if recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification"):
+        await current(refresh=snapshot is not None)
+        if expiry_guard is None and (recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification")):
             options = {} if recovery_guard is None else {"recovery": True, "latest_id": recovery_guard()}
             if self.verify_current is None or not await self.verify_current(message, **options):
                 raise RetryHold("current Discord message could not be verified before dispatch")
             origin = self.origin(message, decision)
             if recovery_guard is not None and origin["id"] != message["id"] and not await self.verify_current(origin, **options):
                 raise RetryHold("original Discord exit could not be verified before dispatch")
-        current()
+        await current()
 
     async def resolve_expiry(self, message, decision):
         contract = decision.get("contract")
@@ -661,28 +669,33 @@ class Engine:
                     ), decision)
                 return self.store.record(message, "error", "internal execution failure; no retry submitted", decision)
 
-    async def execute_decision(self, message, decision, *, recovery_guard=None):
+    async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None):
         def reason(label):
+            if expiry_guard is not None:
+                facts = decision["expiry_exit"]
+                label = f"Expiry exercise protection: {label}; underlying ${facts['underlying_price']}; close {facts['close_at']}"
             evaluation = decision.get("exit_evaluation")
             if evaluation:
                 return (f"{label}; sell {evaluation['sell_quantity']} of {evaluation['owned_quantity']} contracts; "
                         f"evaluated sell ${evaluation['evaluated_sell_price']}; "
                         f"estimated net profit ${evaluation['estimated_net_profit']} after fee reserves")
             return entry_chase_reason(label, decision.get("entry_evaluation"))
-        origin = self.origin(message, decision)
-        if recovery_guard is None:
+        origin = self.origin(message, decision) if expiry_guard is None else message
+        if expiry_guard is not None:
+            await expiry_guard()
+        elif recovery_guard is None:
             self.fresh(origin, self.clock())
         else:
             recovery_guard()
-        order = await self.plan(message, decision, recovery_guard=recovery_guard)
-        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard)
+        order = await self.plan(message, decision, recovery_guard=recovery_guard, expiry_guard=expiry_guard)
+        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard, expiry_guard=expiry_guard)
         if self.mode == "shadow":
             return self.store.record(message, "shadow_order", reason("account-sized proposal; no order submitted"),
                                      decision | {"order_proposal": order})
         self.store.reserve(message, decision, order, self.clock())
         try:
             if self.mode == "live":
-                result = await self.broker.submit(order, before_submit=lambda snapshot, quote: self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard))
+                result = await self.broker.submit(order, before_submit=lambda snapshot, quote: self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard, expiry_guard=expiry_guard))
             else:
                 result = await self.broker.submit(order)
             self.store.apply_result(order["client_order_id"], result)
@@ -702,7 +715,7 @@ class Engine:
             label = "missed exit catch-up; " + label
         return self.store.record(message, state, reason(label + result["status"]), decision | {"order_proposal": order})
 
-    async def plan(self, message, decision, *, recovery_guard=None):
+    async def plan(self, message, decision, *, recovery_guard=None, expiry_guard=None):
         risk = self.config["risk"]
         self.check_execution_mode()
         if type(decision.get("ambiguous")) is not bool or decision["ambiguous"]:
@@ -715,7 +728,11 @@ class Engine:
         contract = canonical_contract(decision.get("contract"))
         key = contract_key(contract)
         now = self.clock()
-        if recovery_guard is None:
+        if expiry_guard is not None:
+            if action != "CLOSE":
+                raise Hold("expiry policy may only close owned contracts")
+            await expiry_guard()
+        elif recovery_guard is None:
             self.fresh(message, now)
         elif action in {"REDUCE", "CLOSE"}:
             recovery_guard()
@@ -734,7 +751,7 @@ class Engine:
             quantity=decision.get("quantity"), fraction=decision.get("fraction"), alert_price=decision.get("alert_price")),
             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         last = self.store.db.execute("SELECT body,created_at FROM orders WHERE source_group=? AND contract=? ORDER BY rowid DESC LIMIT 1", (message["source_group"], key)).fetchone()
-        if last and json.loads(last["body"]).get("signal_fingerprint") == signal_fingerprint and (now - instant(last["created_at"])).total_seconds() < risk["duplicate_window_seconds"]:
+        if expiry_guard is None and last and json.loads(last["body"]).get("signal_fingerprint") == signal_fingerprint and (now - instant(last["created_at"])).total_seconds() < risk["duplicate_window_seconds"]:
             raise Hold("probable duplicate message content and action for this source and contract")
         owned = [p for p in self.store.positions() if p["source_group"] == message["source_group"] and contract_key(p["contract"]) == key]
         qty_owned = owned[0]["quantity"] if owned else 0
@@ -777,7 +794,7 @@ class Engine:
         self.check_quote_age(snapshot, self.clock(), "account snapshot")
         bid, ask = money(quote.get("bid"), positive=True), money(quote.get("ask"), positive=True)
         tick = money(quote.get("tick_size"), positive=True)
-        if tick > ask or ask < bid or (ask - bid) / ask > money(risk["max_spread_fraction"]):
+        if tick > ask or ask < bid or (expiry_guard is None and (ask - bid) / ask > money(risk["max_spread_fraction"])):
             raise Hold("quote spread or tick size is unacceptable")
         side = "buy" if action == "OPEN" else "sell"
         price = ((ask if side == "buy" else bid) / tick).to_integral_value(rounding=ROUND_CEILING if side == "buy" else ROUND_FLOOR) * tick
@@ -803,6 +820,8 @@ class Engine:
             order["entry_evaluation"] = decision["entry_evaluation"]
         if side == "sell":
             self.check_exit_profit(message, decision, order, price)
+        if expiry_guard is not None:
+            order["expiry_exit"] = decision["expiry_exit"]
         return order
 
     def check_exit_profit(self, message, decision, order, executable_price):
