@@ -39,7 +39,7 @@ EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
-    "evaluation_timing",
+    "evaluation_timing", "profit_only", "exit_evaluation",
 )
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
@@ -302,6 +302,8 @@ def _project_recovery(value):
     if not recovery:
         return None
     result = {}
+    if recovery.get("execution") == "exit":
+        result["execution"] = "exit"
     status = _safe_text(recovery.get("status"), 64)
     if status in RECOVERY_STATUSES:
         result["status"] = status
@@ -349,6 +351,10 @@ def _project_decision(value):
             result[key] = _project_entry_evaluation(current)
         elif key == "evaluation_timing":
             result[key] = _project_evaluation_timing(current)
+        elif key == "exit_evaluation":
+            result[key] = {name: _safe_scalar(value, 128) for name, value in _json_object(current).items()
+                           if name in {"owned_quantity", "sell_quantity", "requested_fraction", "default_half", "profit_only",
+                                       "evaluated_sell_price", "average_entry_price", "round_trip_fee_reserve_per_contract", "estimated_net_profit"}}
         elif key in {"action", "origin_message_id", "reason"}:
             result[key] = _safe_text(current, 4000 if key == "reason" else 128)
         elif key in {"quantity"}:
@@ -357,7 +363,7 @@ def _project_decision(value):
         elif key in {"fraction", "confidence"}:
             if current is None or (type(current) in (int, float) and current == current and abs(current) <= 1_000_000):
                 result[key] = current
-        elif key == "ambiguous":
+        elif key in {"ambiguous", "profit_only"}:
             if type(current) is bool:
                 result[key] = current
         else:

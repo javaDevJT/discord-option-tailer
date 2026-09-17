@@ -16,7 +16,8 @@ from relay.images import ImageTransportError
 
 from relay.interpreter import (
     DECISION_SCHEMA, RECOVERY_SCHEMA, CodexInterpreter, InterpretationError,
-    _strict_json, _recovery_context, safe_interpretation_reason, validate_decision, validate_recovery,
+    SYSTEM_PROMPT, _strict_json, _recovery_context, safe_interpretation_reason,
+    validate_decision, validate_recovery,
 )
 
 
@@ -27,7 +28,7 @@ MESSAGE = {
 DECISION = {
     "action": "OPEN", "origin_message_id": "new",
     "contract": {"symbol": "TSLA", "expiry": "2026-09-04", "strike": "352.5", "option_type": "put"},
-    "quantity": None, "fraction": None, "alert_price": ".87", "stop_price": None,
+    "quantity": None, "fraction": None, "profit_only": False, "alert_price": ".87", "stop_price": None,
     "confidence": .99, "ambiguous": False, "reason": "Explicit entry with complete contract.",
     "evidence": [{"message_id": "new", "quote": MESSAGE["content"]}],
 }
@@ -179,6 +180,8 @@ class InterpreterChecks(unittest.TestCase):
         async def scenario():
             with patch.object(interpreter, "_interpret", side_effect=model):
                 direct = await interpreter.interpret(MESSAGE, [], [])
+                direct["entry_evaluation"] = {"ask": "0.80", "ask_deviation_percent": "0"}
+                direct["exit_evaluation"] = {"sell_quantity": 1, "evaluated_sell_price": "0.90"}
                 recovery = await interpreter.assess_recovery(MESSAGE, [LATER], [], direct, RECOVERY_FACTS)
             return direct, recovery
 
@@ -186,8 +189,38 @@ class InterpreterChecks(unittest.TestCase):
         self.assertIn("evaluation_timing", direct)
         self.assertEqual(len(captured_decisions), 1)
         self.assertNotIn("evaluation_timing", captured_decisions[0])
+        self.assertNotIn("entry_evaluation", captured_decisions[0])
+        self.assertNotIn("exit_evaluation", captured_decisions[0])
+        self.assertFalse(captured_decisions[0]["profit_only"])
         self.assertEqual(recovery["status"], "uncertain")
         self.assertEqual(recovery["evaluation_timing"]["path"], "recovery")
+
+    def test_recovery_defaults_legacy_profit_only_without_allowing_extra_fields(self):
+        assessment = {
+            "status": "uncertain", "confidence": .9, "reason": "Fixture assessment",
+            "evidence": DECISION["evidence"],
+        }
+        legacy = {key: value for key, value in DECISION.items() if key != "profit_only"}
+        captured = []
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+
+        def model(data, **_options):
+            captured.append(copy.deepcopy(data["decision"]))
+            return assessment
+
+        with patch.object(interpreter, "_interpret", side_effect=model):
+            result = asyncio.run(interpreter.assess_recovery(MESSAGE, [LATER], [], legacy, RECOVERY_FACTS))
+        self.assertEqual(without_evaluation_timing(result), assessment)
+        self.assertFalse(captured[0]["profit_only"])
+
+        with patch.object(interpreter, "_interpret", side_effect=model) as run:
+            with self.assertRaises(InterpretationError):
+                asyncio.run(
+                    interpreter.assess_recovery(
+                        MESSAGE, [LATER], [], legacy | {"unexpected": True}, RECOVERY_FACTS,
+                    )
+                )
+        run.assert_not_called()
 
     def test_retry_exhaustion_has_safe_code_and_attempt_count(self):
         invalid = DECISION | {"evidence": [{"message_id": "invented", "quote": "private-token"}]}
@@ -291,6 +324,43 @@ class InterpreterChecks(unittest.TestCase):
         self.assertEqual(validate_decision(copy.deepcopy(DECISION), MESSAGE, []), DECISION)
         message = {"id": "new", "content": "", "embeds": [{"title": MESSAGE["content"]}]}
         self.assertEqual(validate_decision(copy.deepcopy(DECISION), message, []), DECISION)
+
+    def test_profit_only_is_boolean_and_exit_only(self):
+        for change in (
+            {"profit_only": "true"},
+            {"profit_only": 1},
+            {"action": "OPEN", "profit_only": True},
+            {"action": "WAIT", "origin_message_id": None, "profit_only": True},
+        ):
+            with self.subTest(change=change), self.assertRaises(InterpretationError):
+                validate_decision(DECISION | change, MESSAGE, [])
+        optional = DECISION | {"action": "REDUCE", "quantity": None, "fraction": None, "profit_only": True}
+        self.assertEqual(validate_decision(optional, MESSAGE, []), optional)
+        optional_close = DECISION | {"action": "CLOSE", "quantity": None, "fraction": None, "profit_only": True}
+        self.assertEqual(validate_decision(optional_close, MESSAGE, []), optional_close)
+        explicit_close = optional_close | {"profit_only": False}
+        self.assertEqual(validate_decision(explicit_close, MESSAGE, []), explicit_close)
+
+    def test_exit_quantity_and_fraction_are_preserved_exactly(self):
+        for quantity, fraction in ((None, .5), (2, None), (None, .25), (1, .5)):
+            with self.subTest(quantity=quantity, fraction=fraction):
+                decision = DECISION | {
+                    "action": "REDUCE", "quantity": quantity, "fraction": fraction, "profit_only": False,
+                }
+                validated = validate_decision(decision, MESSAGE, [])
+                self.assertEqual(validated["quantity"], quantity)
+                self.assertEqual(validated["fraction"], fraction)
+
+    def test_profit_taking_prompt_distinguishes_optional_suggestions_and_action_reports(self):
+        for phrase in (
+            "profit_only=true",
+            "you can trim or take profits if you'd like",
+            "took 50% here",
+            "sold the rest",
+            "close remaining",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, SYSTEM_PROMPT)
 
     def test_rejects_malformed_decisions(self):
         alterations = [

@@ -274,11 +274,34 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.interpreter.decision["contract"] = CONTRACT | {"expiry": "2026-09-08"}
         self.assertEqual((await self.engine.handle(self.message()))["state"], "paper_order")
 
-    async def test_trim_one_contract_is_held_without_rounding_up(self):
-        self.owned()
-        self.interpreter.decision.update(action="REDUCE", fraction=.5)
-        await self.held(reason="fractional")
-        self.assertEqual(self.store.positions()[0]["quantity"], 1)
+    async def test_partial_exits_round_only_the_fractional_remainder_up(self):
+        for owned, fraction, expected in [(1, .5, 1), (2, .5, 1), (3, .5, 2), (4, .25, 1), (3, 1, 3)]:
+            with self.subTest(owned=owned, fraction=fraction):
+                self.owned(owned)
+                self.interpreter.decision.update(action="REDUCE", fraction=fraction)
+                result = await self.engine.handle(self.message(content=f"Exit {fraction} of holding {owned}"))
+                self.assertEqual(result["state"], "paper_order", result)
+                self.assertEqual(self.broker.submissions[-1]["quantity"], expected)
+                remaining = sum(p["quantity"] for p in self.store.positions())
+                self.assertEqual(remaining, owned - expected)
+
+    async def test_optional_trim_defaults_half_and_requires_net_profit(self):
+        self.owned(3)
+        self.interpreter.decision.update(action="REDUCE", fraction=None, profit_only=True)
+        await self.held(reason="round-trip fee reserve")
+        self.broker.quotes.update(bid="1.00", ask="1.03")
+        result = await self.engine.handle(self.message(content="You can trim here if you'd like"))
+        self.assertEqual(result["state"], "paper_order", result)
+        self.assertEqual(self.broker.submissions[-1]["quantity"], 2)
+
+    async def test_explicit_exits_are_not_blocked_when_profit_has_faded(self):
+        self.owned(2)
+        self.interpreter.decision.update(action="REDUCE", fraction=.5, profit_only=False)
+        self.assertEqual((await self.engine.handle(self.message(content="Took 50% here")))["state"], "paper_order")
+        self.assertEqual(self.broker.submissions[-1]["quantity"], 1)
+        self.interpreter.decision.update(action="CLOSE", fraction=None)
+        self.assertEqual((await self.engine.handle(self.message(content="Sold the rest")))["state"], "paper_order")
+        self.assertEqual(self.store.positions(), [])
 
     async def test_close_only_owned_source_and_preserve_other_holdings(self):
         self.owned(2, "source-a")

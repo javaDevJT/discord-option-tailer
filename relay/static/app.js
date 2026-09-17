@@ -337,7 +337,8 @@ function relayReadTimeoutSignal() {
 
   function isRecoveryEvent(event) {
     const stateName = normalized(firstValue(event?.state, readDecision(event).state));
-    return stateName.startsWith("recovery_") || Boolean(recoveryAssessment(event));
+    const recovery = recoveryAssessment(event);
+    return stateName.startsWith("recovery_") || Boolean(recovery && recovery.execution !== "exit");
   }
 
   function recoveryStatusLabel(value) {

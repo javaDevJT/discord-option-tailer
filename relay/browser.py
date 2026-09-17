@@ -146,14 +146,43 @@ def _channel_url_matches(url: str, channel: dict) -> bool:
             and parsed.path.rstrip("/") == f"/channels/{channel['guild_id']}/{channel['id']}")
 
 
-def snapshot_matches(snapshot: dict, message: dict, channel: dict) -> bool:
+def _numeric_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
+
+
+def snapshot_matches(
+    snapshot: dict,
+    message: dict,
+    channel: dict,
+    *,
+    recovery: bool = False,
+    latest_id: object | None = None,
+) -> bool:
     """Require the exact still-visible, unsuperseded alert in the current channel."""
+    watermark = _numeric_id(latest_id) if recovery else None
+    if recovery and watermark is None:
+        return False
+    if recovery:
+        if message.get("ingestion") not in {"baseline", "live"}:
+            return False
+    elif message.get("ingestion") != "live":
+        return False
     if (not snapshot.get("ready") or not snapshot.get("at_bottom") or snapshot.get("foreign_rows")
             or not _channel_url_matches(snapshot.get("url", ""), channel)
-            or message.get("source") != "browser" or message.get("ingestion") != "live"
+            or message.get("source") != "browser"
             or str(message.get("channel_id")) != str(channel["id"])
-            or not message.get("browser_connection_epoch")
-            or snapshot.get("connection_epoch") != message.get("browser_connection_epoch")):
+            or not message.get("browser_connection_epoch")):
+        return False
+    if recovery:
+        if not snapshot.get("connection_epoch"):
+            return False
+    elif snapshot.get("connection_epoch") != message.get("browser_connection_epoch"):
         return False
     if not channel_allows_author(channel, message.get("author_id")):
         return False
@@ -165,6 +194,15 @@ def snapshot_matches(snapshot: dict, message: dict, channel: dict) -> bool:
         if (target is None or target["revision"] != message["revision"]
                 or target["author_id"] != message["author_id"]):
             return False
+        if recovery:
+            target_id = _numeric_id(target["id"])
+            if target_id is None or target_id > watermark:
+                return False
+            return not any(
+                channel_allows_author(channel, row["author_id"])
+                and (_numeric_id(row["id"]) or -1) > watermark
+                for row in rows
+            )
         return not any(channel_allows_author(channel, row["author_id"]) and int(row["id"]) > int(message["id"])
                        for row in rows)
     except (TypeError, ValueError, KeyError):
@@ -448,7 +486,12 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                     LOG.warning("Discord navigation unavailable; the browser will reconnect")
                     status(channel, "reconnecting", failure_detail(exc, provider="Discord", phase="channel navigation"))
 
-            async def verify(message: dict) -> bool:
+            async def verify(
+                message: dict,
+                *,
+                recovery: bool = False,
+                latest_id: object | None = None,
+            ) -> bool:
                 try:
                     index = next(i for i, channel in enumerate(channels)
                                  if str(channel["id"]) == str(message.get("channel_id")))
@@ -457,7 +500,13 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
                         return False
                     snapshot = await page.evaluate(EXTRACT_MESSAGES_JS, str(channel["id"]))
                     return (_channel_url_matches(page.url, channel)
-                            and snapshot_matches(snapshot, message, channel))
+                            and snapshot_matches(
+                                snapshot,
+                                message,
+                                channel,
+                                recovery=recovery,
+                                latest_id=latest_id,
+                            ))
                 except Exception:
                     return False
 

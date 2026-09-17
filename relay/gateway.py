@@ -190,6 +190,16 @@ def _message_key(message: dict[str, Any]) -> tuple[str, str]:
     return str(message.get("channel_id", "")), str(message.get("id", ""))
 
 
+def _numeric_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
+
+
 def _message_order(message: dict[str, Any]) -> tuple[int, str, str]:
     identifier = str(message.get("id", ""))
     try:
@@ -875,14 +885,28 @@ class _GatewayRuntime:
             "detail": detail,
         }
 
-    async def verify(self, message: dict[str, Any]) -> bool:
+    async def verify(
+        self,
+        message: dict[str, Any],
+        *,
+        recovery: bool = False,
+        latest_id: object | None = None,
+    ) -> bool:
         if not self.healthy or not self.epoch or not isinstance(message, dict):
             return False
         if not self.connection_fresh():
             return False
-        if message.get("source") != "gateway" or message.get("ingestion") != "live":
+        if message.get("source") != "gateway":
             return False
-        if str(message.get("browser_connection_epoch", "")) != self.epoch:
+        watermark = _numeric_id(latest_id) if recovery else None
+        if recovery:
+            if watermark is None or message.get("ingestion") not in {"baseline", "live"}:
+                return False
+            if not message.get("browser_connection_epoch"):
+                return False
+        elif message.get("ingestion") != "live":
+            return False
+        if not recovery and str(message.get("browser_connection_epoch", "")) != self.epoch:
             return False
         channel = self._channel_config(message.get("channel_id"))
         if not self._allowed(message, channel):
@@ -893,6 +917,25 @@ class _GatewayRuntime:
         current = self.latest.get(key)
         if current is None or current.get("revision") != message.get("revision"):
             return False
+        if recovery:
+            if (
+                current.get("source") != "gateway"
+                or current.get("ingestion") not in {"baseline", "live"}
+                or str(current.get("channel_id")) != str(message.get("channel_id"))
+                or current.get("id") != message.get("id")
+                or current.get("author_id") != message.get("author_id")
+                or current.get("browser_connection_epoch") != self.epoch
+                or not channel_allows_author(channel, current.get("author_id", ""))
+            ):
+                return False
+            current_id = _numeric_id(current.get("id"))
+            if current_id is None or current_id > watermark:
+                return False
+            latest = self.latest_by_group.get(str(channel.get("source_group", "")))
+            latest_id_value = _numeric_id(latest.get("id")) if latest is not None else None
+            if latest_id_value is None or latest_id_value > watermark:
+                return False
+            return True
         latest = self.latest_by_group.get(str(channel.get("source_group", "")))
         if latest is not None and _newer(latest, message):
             return False

@@ -122,7 +122,7 @@ async def demo(args, config):
             edited = dict(entry, content="CANCEL that entry", edited_timestamp=now.isoformat(), revision="changed")
             results.append(await engine.handle(edited))
             states = [r["state"] for r in results]
-            if states != ["paper_order", "duplicate", "held", "held", "paper_order", "held", "context"] or store.positions():
+            if states != ["paper_order", "duplicate", "held", "paper_order", "held", "held", "context"] or store.positions():
                 raise Hold("synthetic rehearsal failed its expected safety outcomes")
             report = {"scenario": "synthetic scripted decisions and fixture quotes; no LLM, live market, Discord, or Robinhood calls", "passed": True, "results": results, "state": store.report(), "live_orders": 0}
             private_json(args.output, report)

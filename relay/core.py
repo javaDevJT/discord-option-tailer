@@ -24,6 +24,10 @@ class Hold(ValueError):
     """A deterministic control prevented an order."""
 
 
+class RetryHold(Hold):
+    """A readiness check failed before any submission was attempted."""
+
+
 def channel_allows_author(channel, author_id):
     """Return whether a message author is allowed by a configured channel."""
     if not isinstance(channel, dict):
@@ -521,13 +525,18 @@ class Engine:
             raise Hold("the original action message was revised")
         return origin
 
-    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None):
+    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None):
         """Recheck intent after broker review and immediately before its placement boundary."""
         def current():
             now = self.clock()
-            self.fresh(message, now)
-            self.fresh(self.origin(message, decision), now)
-            self.unchanged(message)
+            if recovery_guard is None:
+                self.fresh(message, now)
+                self.fresh(self.origin(message, decision), now)
+                self.unchanged(message)
+            else:
+                if decision["action"] not in {"REDUCE", "CLOSE"} or order["side"] != "sell":
+                    raise Hold("recovery execution is restricted to closing owned contracts")
+                recovery_guard()
             self.check_execution_mode()
             if Path(self.config["kill_switch"]).exists():
                 raise Hold("kill switch is present")
@@ -556,11 +565,19 @@ class Engine:
                     quantity, _ = entry_size(self.config["risk"], snapshot, order["contract"], decision["confidence"], order["limit_price"], message["source_group"])
                     if quantity < order["quantity"]:
                         raise Hold("available account risk capacity fell during broker review")
+                else:
+                    tick = money(quote.get("tick_size"), positive=True)
+                    executable_price = (bid / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                    self.check_exit_profit(message, decision, order, executable_price)
 
         current()
-        if self.config.get("require_source_verification") or self.config.get("require_browser_verification"):
-            if self.verify_current is None or not await self.verify_current(message):
-                raise Hold("current Discord message could not be verified before dispatch")
+        if recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification"):
+            options = {} if recovery_guard is None else {"recovery": True, "latest_id": recovery_guard()}
+            if self.verify_current is None or not await self.verify_current(message, **options):
+                raise RetryHold("current Discord message could not be verified before dispatch")
+            origin = self.origin(message, decision)
+            if recovery_guard is not None and origin["id"] != message["id"] and not await self.verify_current(origin, **options):
+                raise RetryHold("original Discord exit could not be verified before dispatch")
         current()
 
     async def resolve_expiry(self, message, decision):
@@ -625,33 +642,7 @@ class Engine:
                     raise Hold("historical, baseline, or revised message; analysis only")
                 if decision["action"] == "UPDATE_STOP":
                     raise Hold("stop changes require broker-native order support and review; no software stop was installed")
-                origin = self.origin(message, decision)
-                self.fresh(origin, self.clock())
-                order = await self.plan(message, decision)
-                await self.verify_dispatch(message, decision, order)
-                if self.mode == "shadow":
-                    return self.store.record(message, "shadow_order", entry_chase_reason("account-sized proposal; no order submitted", decision.get("entry_evaluation")),
-                                             decision | {"order_proposal": order})
-                self.store.reserve(message, decision, order, self.clock())
-                try:
-                    if self.mode == "live":
-                        result = await self.broker.submit(order, before_submit=lambda snapshot, quote: self.verify_dispatch(message, decision, order, snapshot, quote))
-                    else:
-                        result = await self.broker.submit(order)
-                    self.store.apply_result(order["client_order_id"], result)
-                except BrokerPreflightHold as exc:
-                    self.store.reject_before_submission(order["client_order_id"])
-                    evaluation = decision.get("entry_evaluation")
-                    reason = "no order submitted: " + str(exc)
-                    if evaluation and not entry_chase_within_cap(evaluation):
-                        reason = "no order submitted: current ask or rounded limit exceeds permitted chase during broker review"
-                    return self.store.record(message, "held", entry_chase_reason(reason, evaluation), decision | {"order_proposal": order})
-                except Exception:
-                    self.store.mark_unknown(order["client_order_id"])
-                    return self.store.record(message, "unknown", "submission or fill result is uncertain; all new orders are blocked pending reconciliation", decision)
-                state = "paper_order" if self.mode == "paper" else "broker_order"
-                label = "simulated order: " if self.mode == "paper" else "broker order: "
-                return self.store.record(message, state, entry_chase_reason(label + result["status"], decision.get("entry_evaluation")), decision | {"order_proposal": order})
+                return await self.execute_decision(message, decision)
             except Hold as exc:
                 return self.store.record(message, "held", str(exc), decision)
             except InterpretationError as exc:
@@ -670,7 +661,48 @@ class Engine:
                     ), decision)
                 return self.store.record(message, "error", "internal execution failure; no retry submitted", decision)
 
-    async def plan(self, message, decision):
+    async def execute_decision(self, message, decision, *, recovery_guard=None):
+        def reason(label):
+            evaluation = decision.get("exit_evaluation")
+            if evaluation:
+                return (f"{label}; sell {evaluation['sell_quantity']} of {evaluation['owned_quantity']} contracts; "
+                        f"evaluated sell ${evaluation['evaluated_sell_price']}; "
+                        f"estimated net profit ${evaluation['estimated_net_profit']} after fee reserves")
+            return entry_chase_reason(label, decision.get("entry_evaluation"))
+        origin = self.origin(message, decision)
+        if recovery_guard is None:
+            self.fresh(origin, self.clock())
+        else:
+            recovery_guard()
+        order = await self.plan(message, decision, recovery_guard=recovery_guard)
+        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard)
+        if self.mode == "shadow":
+            return self.store.record(message, "shadow_order", reason("account-sized proposal; no order submitted"),
+                                     decision | {"order_proposal": order})
+        self.store.reserve(message, decision, order, self.clock())
+        try:
+            if self.mode == "live":
+                result = await self.broker.submit(order, before_submit=lambda snapshot, quote: self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard))
+            else:
+                result = await self.broker.submit(order)
+            self.store.apply_result(order["client_order_id"], result)
+        except BrokerPreflightHold as exc:
+            self.store.reject_before_submission(order["client_order_id"])
+            evaluation = decision.get("entry_evaluation")
+            detail = "no order submitted: " + str(exc)
+            if evaluation and not entry_chase_within_cap(evaluation):
+                detail = "no order submitted: current ask or rounded limit exceeds permitted chase during broker review"
+            return self.store.record(message, "held", reason(detail), decision | {"order_proposal": order})
+        except Exception:
+            self.store.mark_unknown(order["client_order_id"])
+            return self.store.record(message, "unknown", "submission or fill result is uncertain; all new orders are blocked pending reconciliation", decision)
+        state = "paper_order" if self.mode == "paper" else "broker_order"
+        label = "simulated order: " if self.mode == "paper" else "broker order: "
+        if recovery_guard is not None:
+            label = "missed exit catch-up; " + label
+        return self.store.record(message, state, reason(label + result["status"]), decision | {"order_proposal": order})
+
+    async def plan(self, message, decision, *, recovery_guard=None):
         risk = self.config["risk"]
         self.check_execution_mode()
         if type(decision.get("ambiguous")) is not bool or decision["ambiguous"]:
@@ -683,7 +715,12 @@ class Engine:
         contract = canonical_contract(decision.get("contract"))
         key = contract_key(contract)
         now = self.clock()
-        self.fresh(message, now)
+        if recovery_guard is None:
+            self.fresh(message, now)
+        elif action in {"REDUCE", "CLOSE"}:
+            recovery_guard()
+        else:
+            raise Hold("recovery execution is restricted to closing owned contracts")
         expiry = datetime.strptime(contract["expiry"], "%Y-%m-%d").date()
         today = now.astimezone(EASTERN).date()
         if expiry < today:
@@ -691,7 +728,7 @@ class Engine:
         if action == "OPEN" and expiry == today and not risk["allow_same_day_expiry"]:
             raise Hold("same-day expiry entries are disabled")
         if self.store.unresolved():
-            raise Hold("an unresolved order blocks further orders")
+            raise RetryHold("an unresolved order blocks further orders")
         signal_fingerprint = hashlib.sha256(json.dumps(dict(
             action=action, contract=contract, content=message.get("content"), embeds=message.get("embeds"),
             quantity=decision.get("quantity"), fraction=decision.get("fraction"), alert_price=decision.get("alert_price")),
@@ -712,14 +749,16 @@ class Engine:
                 qty = qty_owned
             elif decision.get("quantity") is not None:
                 qty = decision["quantity"]
-            elif decision.get("fraction") is not None and 0 < money(decision["fraction"]) < 1:
-                qty = int(Decimal(qty_owned) * money(decision["fraction"]))
+            elif decision.get("fraction") is not None and 0 < money(decision["fraction"]) <= 1:
+                qty = int((Decimal(qty_owned) * money(decision["fraction"])).to_integral_value(rounding=ROUND_CEILING))
+            elif decision.get("profit_only") is True:
+                qty = int((Decimal(qty_owned) / 2).to_integral_value(rounding=ROUND_CEILING))
             else:
                 raise Hold("a trim needs an explicit quantity or fraction")
             if qty > qty_owned:
                 raise Hold("sell quantity exceeds the owned position")
         if action != "OPEN" and (type(qty) is not int or qty <= 0):
-            raise Hold("quantity must be a positive whole contract; fractional trims are held")
+            raise Hold("quantity must be a positive whole contract")
         snapshot = await self.broker.snapshot()
         if self.mode != "paper" and snapshot.get("account_id") != self.account:
             raise Hold("broker snapshot does not match the bound account")
@@ -727,7 +766,7 @@ class Engine:
         if not isinstance(restrictions, list) or restrictions:
             raise Hold("broker account restrictions prevent this action; inspect the account snapshot")
         if snapshot.get("market_open") is not True:
-            raise Hold("broker has not confirmed an open options session")
+            raise RetryHold("broker has not confirmed an open options session")
         self.check_quote_age(snapshot, self.clock(), "account snapshot")
         quote = await self.broker.quote(contract)
         if canonical_contract(quote.get("contract")) != contract or quote.get("tradable") is not True:
@@ -756,14 +795,41 @@ class Engine:
         identity = message["id"] + ":" + message["revision"]
         order = dict(contract=contract, side=side, quantity=qty, limit_price=str(price), position_effect="open" if side == "buy" else "close",
                      client_order_id=hashlib.sha256(identity.encode()).hexdigest(),
+                     origin_message_id=decision.get("origin_message_id"),
                      quote_timestamp=quote["timestamp"], account_timestamp=snapshot["timestamp"],
                      signal_fingerprint=signal_fingerprint)
         if sizing:
             order["sizing"] = sizing
             order["entry_evaluation"] = decision["entry_evaluation"]
+        if side == "sell":
+            self.check_exit_profit(message, decision, order, price)
         return order
+
+    def check_exit_profit(self, message, decision, order, executable_price):
+        owned = next((p for p in self.store.positions()
+                      if p["source_group"] == message["source_group"]
+                      and canonical_contract(p["contract"]) == order["contract"]), None)
+        if owned is None or owned["quantity"] < order["quantity"]:
+            raise Hold("sell quantity exceeds the remaining relay-owned position")
+        if type(decision.get("profit_only", False)) is not bool:
+            raise Hold("profit-only exit policy must be boolean")
+        cost = money(owned["average_price"], positive=True)
+        price = min(money(executable_price, positive=True), money(order["limit_price"], positive=True))
+        fees = money(self.config["risk"]["fee_reserve_per_contract"]) * 2
+        net = (price - cost) * 100 - fees
+        decision["exit_evaluation"] = {
+            "owned_quantity": owned["quantity"], "sell_quantity": order["quantity"],
+            "requested_fraction": decision.get("fraction"),
+            "default_half": decision["action"] == "REDUCE" and decision.get("fraction") is None and decision.get("quantity") is None,
+            "profit_only": decision.get("profit_only", False),
+            "evaluated_sell_price": str(price), "average_entry_price": str(cost),
+            "round_trip_fee_reserve_per_contract": str(fees),
+            "estimated_net_profit": str(net * order["quantity"]),
+        }
+        if decision.get("profit_only") is True and net <= 0:
+            raise Hold("optional profit-taking requires a current sell price above entry cost plus the round-trip fee reserve")
 
     def check_quote_age(self, quote, now, label="option quote"):
         age = (now - instant(quote.get("timestamp"))).total_seconds()
         if age < -5 or age > self.config["risk"]["max_quote_age_seconds"]:
-            raise Hold(label + " is stale or future-dated")
+            raise RetryHold(label + " is stale or future-dated")

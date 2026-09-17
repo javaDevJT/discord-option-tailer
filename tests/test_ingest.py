@@ -181,6 +181,42 @@ class IngestTests(unittest.TestCase):
         snapshot["messages"].append(message(20, author={"id": "999999999999999999"}, source="browser"))
         self.assertFalse(snapshot_matches(snapshot, target, channel))
 
+    def test_recovery_snapshot_accepts_only_current_bounded_baseline(self):
+        channel = {"id": CHANNEL, "guild_id": "111111111111111111", "authors": [AUTHOR]}
+        original = message(source="browser")
+        target = normalize(original)
+        target.update(ingestion="baseline", browser_connection_epoch="epoch-old")
+        snapshot = {
+            "ready": True,
+            "at_bottom": True,
+            "foreign_rows": 0,
+            "url": f"https://discord.com/channels/{channel['guild_id']}/{CHANNEL}",
+            "connection_epoch": "epoch-current",
+            "messages": [original],
+        }
+
+        self.assertFalse(snapshot_matches(snapshot, target, channel))
+        self.assertFalse(snapshot_matches(snapshot, target, channel, recovery=True))
+        self.assertTrue(snapshot_matches(snapshot, target, channel, recovery=True, latest_id=target["id"]))
+        self.assertFalse(snapshot_matches(snapshot, target, channel, recovery=True,
+                                          latest_id=str(int(target["id"]) - 1)))
+        self.assertFalse(snapshot_matches(snapshot, target, channel, recovery=True, latest_id="not-numeric"))
+
+        edited = message(content="edited", source="browser")
+        self.assertFalse(snapshot_matches(snapshot | {"messages": [edited]}, target, channel,
+                                          recovery=True, latest_id=target["id"]))
+        self.assertFalse(snapshot_matches(snapshot | {"messages": []}, target, channel,
+                                          recovery=True, latest_id=target["id"]))
+        unknown = dict(target, id=str(int(target["id"]) + 99))
+        self.assertFalse(snapshot_matches(snapshot, unknown, channel, recovery=True, latest_id=unknown["id"]))
+        self.assertFalse(snapshot_matches(snapshot | {"at_bottom": False}, target, channel,
+                                          recovery=True, latest_id=target["id"]))
+
+        newer = message(20, source="browser")
+        bounded = snapshot | {"messages": [original, newer]}
+        self.assertFalse(snapshot_matches(bounded, target, channel, recovery=True, latest_id=target["id"]))
+        self.assertTrue(snapshot_matches(bounded, target, channel, recovery=True, latest_id=newer["id"]))
+
     @unittest.skipUnless(NODE_RUNTIME and PLAYWRIGHT_MODULE, "Install the browser extra to run the offline DOM fixture")
     def test_visible_dom_fixture(self):
         first, second = message(10)["id"], message(20)["id"]

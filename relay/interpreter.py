@@ -36,7 +36,7 @@ DECISION_SCHEMA = {
     "additionalProperties": False,
     "required": [
         "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
-        "confidence", "ambiguous", "reason", "evidence",
+        "confidence", "ambiguous", "reason", "evidence", "profit_only",
     ],
     "properties": {
         "action": {"type": "string", "enum": list(ACTIONS)},
@@ -58,6 +58,7 @@ DECISION_SCHEMA = {
         },
         "quantity": {"type": ["integer", "null"]},
         "fraction": {"type": ["number", "null"]},
+        "profit_only": {"type": "boolean"},
         "alert_price": {"type": ["string", "null"]},
         "stop_price": {"type": ["string", "null"]},
         "confidence": {"type": "number"},
@@ -162,6 +163,20 @@ premium; unknown cost basis means WAIT. Do not invent a numeric stop. OPEN may
 include an explicit option premium stop. Prices and strikes are decimal strings.
 Quantity is the user's explicit contract count when stated, otherwise null;
 fraction is a stated partial-exit fraction (0 < fraction <= 1), otherwise null.
+Preserve every stated quantity and fraction exactly. Add the boolean profit_only
+field to every decision. Set profit_only=true only for a CURRENT, discretionary
+or optional profit-taking suggestion tied to the one resolved same-source,
+bot-owned contract, such as "you can trim or take profits if you'd like".
+An optional explicit all-profits or full-exit suggestion is CLOSE with
+profit_only=true. An unquantified optional partial suggestion is REDUCE with
+quantity=null and fraction=null; the deterministic engine chooses its guarded
+default. Explicit sell, trim, "all out", "sold the rest" or "close remaining"
+directions are profit_only=false, including current author action reports such
+as "took 50% here"; preserve their exact stated fraction or count. Do not turn
+an explicit full exit into a discretionary profit-only exit. General gains
+bragging, performance recaps, historical action descriptions and unfulfilled
+future price triggers remain IGNORE or WAIT. A current action report is not a
+recap merely because it uses past tense.
 Never copy an alert author's position size as the user's risk budget. Use null
 for unprovided prices and fields; alert_price is an explicit option premium.
 
@@ -491,6 +506,11 @@ def validate_decision(decision, message, context):
     action = decision["action"]
     if not isinstance(action, str) or action not in ACTIONS:
         raise InterpretationError("Unknown action")
+    profit_only = decision["profit_only"]
+    if type(profit_only) is not bool:
+        raise InterpretationError("profit_only must be boolean")
+    if profit_only and action not in {"REDUCE", "CLOSE"}:
+        raise InterpretationError("profit_only applies only to exits")
     origin = decision["origin_message_id"]
     if origin is not None and (not isinstance(origin, str) or not origin.strip() or len(origin) > 128):
         raise InterpretationError("origin_message_id must be a bounded string ID or null")
@@ -570,7 +590,12 @@ def _decision_for_recovery(decision):
     """Keep interpreter metadata out of strict validation and recovery prompts."""
     if not isinstance(decision, dict):
         return decision
-    return {key: value for key, value in decision.items() if key != "evaluation_timing"}
+    normalized = {key: value for key, value in decision.items()
+                  if key not in {"evaluation_timing", "entry_evaluation", "exit_evaluation"}}
+    # Decisions persisted before profit_only was added remain recoverable.  Keep
+    # all other keys so validate_decision still rejects arbitrary extra fields.
+    normalized.setdefault("profit_only", False)
+    return normalized
 
 
 def _parse_timestamp(value):

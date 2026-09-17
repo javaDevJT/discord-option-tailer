@@ -45,7 +45,7 @@ The default allocation reference increases from 5% of equity at 0.80 interpretat
 
 Above the one-contract fallback, quantity is the whole-contract floor of the reference budget, including the configured per-contract fee reserve. Optional calibrated quarter-Kelly sizing can reduce the reference; a nonpositive calibrated edge still blocks entry. Interpretation confidence is not a measured probability of profitable trading. There is no fixed contract-count or daily entry-count limit.
 
-Missed-signal recovery produces timestamped assessments only. It does not bypass the fresh-message execution gate or submit historical orders. See [container operation](container.md) for recovery and monitoring behavior.
+Missed entries remain timestamped assessments only. Verified missed reduce/close instructions can close existing relay-owned contracts through the normal mode-specific broker path, with current source, position-lifetime, duplicate, inventory, quote and account checks. Fractional exits round up; exact whole quantities stay exact, and full exits use all remaining relay-owned contracts. Optional profit suggestions require a positive current estimated net profit after round-trip fee reserves; explicit exits do not. See [container operation](container.md) for recovery, retry and monitoring boundaries.
 
 ## Optional command-line inspection
 

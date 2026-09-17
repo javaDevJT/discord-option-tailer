@@ -1,12 +1,14 @@
-"""Read-only reassessment of missed alerts; this module never creates orders."""
+"""Reassess missed alerts and catch up exits for currently relay-owned positions."""
 from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
+import time
 from decimal import ROUND_CEILING
 from pathlib import Path
 
-from .core import EASTERN, Hold, canonical_contract, channel_allows_author, entry_size, instant, money, entry_chase_evaluation, entry_chase_reason, entry_chase_within_cap
+from .core import EASTERN, Hold, RetryHold, canonical_contract, contract_key, channel_allows_author, entry_size, instant, money, entry_chase_evaluation, entry_chase_reason, entry_chase_within_cap
 from .interpreter import safe_interpretation_reason
 
 
@@ -18,6 +20,11 @@ class RecoveryEvaluator:
         self.store = engine.store
         self.scan_cursor = 0
         self.scan_complete = False
+        self.exit_scan_cursor = 0
+        self.exit_scan_complete = False
+        self.next_reconcile = 0
+        self.retry_due = {}
+        self.deferred_exits = {}
         with self.store.db:
             self.store.db.execute("UPDATE events SET state='recovery_pending', reason='Recovery assessment interrupted; awaiting evaluation' WHERE state='recovery_evaluating'")
 
@@ -47,7 +54,7 @@ class RecoveryEvaluator:
         if (self.store.db.execute("SELECT 1 FROM orders WHERE message_id=?", (message["id"],)).fetchone()
                 or self.store.db.execute("SELECT 1 FROM events WHERE message_id=? AND revision!=?", (message["id"], message["revision"])).fetchone()):
             return None
-        return self.store.record(message, "recovery_pending", "Missed alert queued for a current viability assessment; no order will be submitted")
+        return self.store.record(message, "recovery_pending", "Missed alert queued for assessment; entries are review-only, verified owned exits may execute")
 
     def recover_saved(self):
         """Walk interrupted observations in bounded batches, including rows no longer in the DOM."""
@@ -65,6 +72,100 @@ class RecoveryEvaluator:
                 self.store.record(message, "held", "Worker stopped before interpretation completed; recovery assessment only")
             self.enqueue(message, "same")
         self.scan_complete = len(rows) < 100
+
+    def current_entries(self, group):
+        """Latest filled entry identifies each currently owned position's lifetime."""
+        rows = self.store.db.execute("""SELECT o.* FROM orders o JOIN positions p
+            ON p.source_group=o.source_group AND p.contract=o.contract
+            WHERE o.source_group=? AND o.action='OPEN' AND o.filled_quantity>0 AND p.quantity>0
+            ORDER BY julianday(o.created_at) DESC, o.rowid DESC""", (group,)).fetchall()
+        entries = {}
+        for row in rows:
+            entries.setdefault(row["contract"], dict(row))
+        return entries
+
+    def recover_position_context(self):
+        if self.exit_scan_complete or self.engine.interpreter is None:
+            return
+        rows = self.store.db.execute("""SELECT e.id,e.state,m.body FROM events e JOIN messages m
+            ON m.id=e.message_id AND m.revision=e.revision WHERE e.id>?
+            AND EXISTS (SELECT 1 FROM positions p WHERE p.source_group=m.source_group AND p.quantity>0)
+            AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.message_id=m.id)
+            AND NOT EXISTS (SELECT 1 FROM events x WHERE x.message_id=m.id AND x.revision!=m.revision)
+            ORDER BY e.id LIMIT 100""", (self.exit_scan_cursor,)).fetchall()
+        for row in rows:
+            self.exit_scan_cursor = row["id"]
+            message = json.loads(row["body"])
+            if not self.eligible(message) or row["state"] in {"recovery_pending", "recovery_evaluating"}:
+                continue
+            group = self.engine.channels[message["channel_id"]]["source_group"]
+            if any(instant(entry["created_at"]) <= instant(message["timestamp"])
+                   for entry in self.current_entries(group).values()):
+                self.store.record(message, "recovery_pending", "Checking owned positions for a missed exit; historical entries remain review-only")
+        self.exit_scan_complete = len(rows) < 100
+
+    async def reconcile_orders(self):
+        if time.monotonic() < self.next_reconcile:
+            return
+        self.next_reconcile = time.monotonic() + 30
+        rows = self.store.db.execute("""SELECT id,broker_id FROM orders
+            WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
+        for row in rows:
+            try:
+                options = {} if self.engine.mode == "paper" else {"broker_order_id": row["broker_id"]}
+                result = await self.engine.broker.order_status(row["id"], **options)
+                self.store.apply_result(row["id"], result)
+            except Exception:
+                # An uncertain submission keeps the existing unresolved-order gate.
+                continue
+
+    def exit_guard(self, message, decision, context, positions):
+        engine = self.engine
+        key = contract_key(decision["contract"])
+        group = message["source_group"]
+        entry = self.current_entries(group).get(key)
+        if entry is None:
+            raise Hold("missed exit has no identifiable currently owned entry")
+        origin = engine.origin(message, decision)
+        if instant(origin["timestamp"]) < instant(entry["created_at"]):
+            raise Hold("missed exit predates the current position")
+        signature = self.signature(context)
+        latest_id = max(int(m["id"]) for m in [*context, message])
+        order_id = hashlib.sha256((message["id"] + ":" + message["revision"]).encode()).hexdigest()
+
+        def guard():
+            if decision["action"] not in {"REDUCE", "CLOSE"} or not self.eligible(message):
+                raise Hold("only verified missed exits can use catch-up execution")
+            if Path(engine.config["kill_switch"]).exists():
+                raise Hold("kill switch is present")
+            current, truncated = self.context(message, engine.clock())
+            if truncated or self.signature(current) != signature:
+                raise Hold("source context changed or is incomplete during exit catch-up")
+            if engine.source_latest.get(group, latest_id) > latest_id:
+                raise Hold("a newer source message must be considered before this exit")
+            row = self.store.db.execute("SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()
+            if row is None or row[0] != message["revision"] or engine.origin(message, decision)["revision"] != origin["revision"]:
+                raise Hold("missed exit source was changed or removed")
+            if self.current_entries(group).get(key, {}).get("id") != entry["id"]:
+                raise Hold("the owned position changed during exit catch-up")
+            current_positions = [p for p in self.store.positions() if p["source_group"] == group]
+            if current_positions != positions:
+                raise Hold("owned quantities changed during exit catch-up")
+            for previous in self.store.db.execute("""SELECT o.*,m.timestamp FROM orders o
+                LEFT JOIN messages m ON m.id=o.message_id WHERE o.source_group=? AND o.contract=?
+                AND o.action IN ('REDUCE','CLOSE') AND julianday(o.created_at)>=julianday(?)""",
+                (group, key, entry["created_at"])).fetchall():
+                if previous["id"] == order_id and previous["status"] == "submitting":
+                    continue
+                body = json.loads(previous["body"])
+                if (body.get("origin_message_id", previous["message_id"]) == origin["id"]
+                        or previous["message_id"] == message["id"]
+                        or (previous["timestamp"] and instant(previous["timestamp"]) >= instant(origin["timestamp"]))):
+                    raise Hold("this exit or a later exit already has an order; it will not be replayed")
+            return str(latest_id)
+
+        guard()
+        return guard
 
     def context(self, message, cutoff):
         channel = self.engine.channels[message["channel_id"]]
@@ -91,6 +192,21 @@ class RecoveryEvaluator:
     @staticmethod
     def signature(context):
         return [(m["id"], m["revision"]) for m in context]
+
+    def defer(self, message, decision, reason, delay=30):
+        self.retry_due[message["id"]] = time.monotonic() + delay
+        return self.store.record(message, "recovery_pending", f"Missed exit waiting: {reason}; retry in {delay}s", decision)
+
+    async def execute_exit(self, message, decision, context, positions):
+        async with self.engine.lock:
+            guard = self.exit_guard(message, decision, context, positions)
+            decision["recovery"]["execution"] = "exit"
+            try:
+                return await self.engine.execute_decision(message, decision, recovery_guard=guard)
+            except RetryHold as exc:
+                # Reuse the semantic assessment only while the captured source and position stay identical.
+                self.deferred_exits[message["id"]] = (decision, context, positions)
+                return self.defer(message, decision, str(exc))
 
     async def facts(self, message, decision):
         engine = self.engine
@@ -160,10 +276,17 @@ class RecoveryEvaluator:
         try:
             if not self.eligible(message):
                 return self.store.record(message, "context", "No longer an eligible recovery source or timestamp; no execution")
+            if self.store.db.execute("SELECT 1 FROM orders WHERE message_id=?", (message["id"],)).fetchone():
+                return {"message_id": message["id"], "state": "duplicate", "reason": "an order already exists for this message"}
             message = dict(message, source_group=engine.channels[message["channel_id"]]["source_group"])
             if self.store.db.execute("SELECT 1 FROM events WHERE message_id=? AND revision!=?", (message["id"], message["revision"])).fetchone():
                 return self.store.record(message, "context", "A revised alert remains context only; no execution")
-            self.store.record(message, "recovery_evaluating", "Evaluating missed alert against current conditions; no order will be submitted")
+            deferred = self.deferred_exits.pop(message["id"], None)
+            self.retry_due.pop(message["id"], None)
+            if deferred is not None:
+                decision, context, positions = deferred
+                return await self.execute_exit(message, decision, context, positions)
+            self.store.record(message, "recovery_evaluating", "Evaluating missed alert against current conditions; only verified owned exits may execute")
             older, _ = self.context(message, instant(message["timestamp"]))
             all_positions = self.store.positions()
             positions = [p for p in all_positions if p["source_group"] == message["source_group"]]
@@ -184,6 +307,12 @@ class RecoveryEvaluator:
                 facts = await self.facts(message, decision)
                 context, truncated = self.context(message, engine.clock())
                 facts["context_truncated"] = truncated
+                if (decision["action"] in {"REDUCE", "CLOSE"} and not truncated
+                        and facts["blockers"] and "The original option contract has expired" not in facts["blockers"]):
+                    # Check ownership/replay before retaining a delayed exit during a market/provider outage.
+                    self.exit_guard(message, decision, context, positions)
+                    decision["recovery"] = dict(status="uncertain", reason="; ".join(facts["blockers"]), facts=facts)
+                    return self.defer(message, decision, decision["recovery"]["reason"], delay=300)
                 assessment = await engine.interpreter.assess_recovery(message, context, positions, decision, facts)
                 decision["recovery"] = assessment
                 current, _ = self.context(message, engine.clock())
@@ -207,10 +336,19 @@ class RecoveryEvaluator:
                     assessment["status"] = "uncertain"
             facts["evaluated_at"] = engine.clock().isoformat()
             recovery = assessment | {key: facts[key] for key in ("evaluated_at", "original_timestamp", "signal_age_seconds")} | {"facts": facts}
+            decision["recovery"] = recovery
+            if (decision["action"] in {"REDUCE", "CLOSE"} and assessment["status"] == "viable"
+                    and assessment["confidence"] >= engine.config["risk"]["min_confidence"]
+                    and not facts.get("blockers") and not facts.get("context_truncated")):
+                return await self.execute_exit(message, decision, context, positions)
             return self.store.record(message, "recovery_review", "Recovery assessment only; no order submitted", decision | {"recovery": recovery})
         except asyncio.CancelledError:
             self.store.record(message, "recovery_pending", "Recovery assessment interrupted; awaiting evaluation")
             raise
+        except Hold as exc:
+            if decision and isinstance(decision.get("recovery"), dict):
+                decision["recovery"].update(status="uncertain", reason=str(exc))
+            return self.store.record(message, "recovery_review", "Missed exit held: " + str(exc), decision)
         except Exception as exc:
             timing = getattr(exc, "evaluation_timing", None)
             if isinstance(timing, dict):
@@ -223,13 +361,17 @@ class RecoveryEvaluator:
 
     async def consume(self, fresh_queue, emit):
         while True:
-            # An in-flight read-only assessment can finish alongside fresh interpretation.
-            # It never holds Engine.lock or makes the fresh consumer wait for the backlog.
+            # Assessments run alongside fresh interpretation; only final exit dispatch takes the lock.
             await asyncio.sleep(1)
             if not fresh_queue.empty() or self.engine.lock.locked() or Path(self.engine.config["kill_switch"]).exists():
                 continue
+            async with self.engine.lock:
+                await self.reconcile_orders()
             self.recover_saved()
-            row = self.store.db.execute("""SELECT m.body FROM events e JOIN messages m ON m.id=e.message_id AND m.revision=e.revision
-                WHERE e.state='recovery_pending' ORDER BY julianday(m.timestamp) DESC, e.id DESC LIMIT 1""").fetchone()
-            if row:
-                emit(await self.assess(json.loads(row[0])))
+            self.recover_position_context()
+            rows = self.store.db.execute("""SELECT m.id,m.body FROM events e JOIN messages m ON m.id=e.message_id AND m.revision=e.revision
+                WHERE e.state='recovery_pending' ORDER BY julianday(m.timestamp), e.id LIMIT 100""").fetchall()
+            for row in rows:
+                if self.retry_due.get(row["id"], 0) <= time.monotonic():
+                    emit(await self.assess(json.loads(row["body"])))
+                    break

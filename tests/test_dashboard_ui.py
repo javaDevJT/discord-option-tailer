@@ -40,6 +40,7 @@ def seed_dashboard(base, template):
             ("DEMO: missed signal is being evaluated", "OPEN", "recovery_evaluating", "Recovery assessment in progress; no order submitted."),
             ("DEMO: missed signal recovery failed", "OPEN", "recovery_error", "Recovery assessment failed; no order submitted."),
             ("DEMO: evaluation failed before a decision", None, "error", "evaluation failed: code=invalid_output; attempts=2; no order submitted"),
+            ("DEMO: caught up missed full exit", "CLOSE", "paper_order", "missed exit catch-up; simulated order: filled; sell 1 of 1 contracts; evaluated sell $0.80"),
         ]):
             channel = config["channels"][index % 2]
             timestamp = recovery_timestamp if state.startswith("recovery_") else now
@@ -54,7 +55,7 @@ def seed_dashboard(base, template):
                                       "description": "<img src=x onerror=alert(1)>"},
                                  ] if index == 2 else []})
             message["source_group"] = channel["source_group"]
-            decision = dict(action=action, contract=contract if action == "OPEN" else None, confidence=.9,
+            decision = dict(action=action, contract=contract if action in {"OPEN", "CLOSE"} else None, confidence=.9,
                             reason=reason, evidence=[{"message_id": message["id"], "quote": content}])
             decision["evaluation_timing"] = {
                 "model_duration_seconds": .8,
@@ -99,6 +100,11 @@ def seed_dashboard(base, template):
                     "path": "recovery",
                     "delayed": True,
                 }
+            if action == "CLOSE":
+                decision.update(profit_only=False, exit_evaluation={
+                    "owned_quantity": 1, "sell_quantity": 1, "evaluated_sell_price": "0.80",
+                    "estimated_net_profit": "28.00", "provider_secret": "must be omitted",
+                }, recovery={"status": "viable", "execution": "exit"})
             store.observe(message)
             store.record(message, state, reason, decision if action else None)
             if action == "OPEN" and not state.startswith("recovery_"):
@@ -150,6 +156,11 @@ class DashboardUITests(unittest.TestCase):
                     self.assertIn("posted → decision 2.1h", recovery_text)
                     self.assertIn("recovered", recovery_text)
                     self.assertIn("3 attempts", recovery_text)
+                    caught_up = page.locator("#messages-shell .message-card").filter(has_text="DEMO: caught up missed full exit")
+                    self.assertIn("missed exit catch-up", caught_up.inner_text())
+                    self.assertIn("sell 1 of 1", caught_up.inner_text())
+                    self.assertNotIn("Assessment only", caught_up.inner_text())
+                    self.assertEqual(caught_up.locator(".decision-action").inner_text(), "CLOSE")
                     self.assertIn("recovery pending", page.locator("#messages-shell").inner_text().lower())
                     self.assertIn("recovery evaluating", page.locator("#messages-shell").inner_text().lower())
                     pending_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: missed signal queued for recovery")

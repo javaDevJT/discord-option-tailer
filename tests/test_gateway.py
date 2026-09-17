@@ -362,6 +362,53 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                               kind="baseline", reason="baseline")
         self.assertFalse(await runtime.verify(runtime.latest[(CHANNEL_SIGNALS, "500000000000000003")]))
 
+    async def test_recovery_verification_is_opt_in_and_bounded_to_current_cache(self):
+        async def prepared(identifier="500000000000000002"):
+            runtime = gateway._GatewayRuntime(_config(), None, None, None)
+            runtime.epoch = "gateway:current"
+            runtime.client = FakeClient()
+            runtime.client.started.set()
+            runtime.last_gateway_ack = time.monotonic()
+            channel = FakeChannel(CHANNEL_SIGNALS)
+            await runtime.observe(FakeMessage(identifier, channel), kind="baseline", reason="baseline")
+            row = await runtime.queue.get()
+            runtime.queue.task_done()
+            runtime.healthy = True
+            return runtime, channel, row
+
+        runtime, _channel, baseline = await prepared()
+        persisted = dict(baseline, browser_connection_epoch="gateway:old")
+        self.assertFalse(await runtime.verify(persisted))
+        self.assertFalse(await runtime.verify(persisted, recovery=True))
+        self.assertFalse(await runtime.verify(persisted, recovery=True, latest_id="not-numeric"))
+        self.assertTrue(await runtime.verify(persisted, recovery=True, latest_id=baseline["id"]))
+
+        stale = runtime.latest[(CHANNEL_SIGNALS, baseline["id"])]
+        stale["browser_connection_epoch"] = "gateway:stale"
+        self.assertFalse(await runtime.verify(persisted, recovery=True, latest_id=baseline["id"]))
+
+        runtime, channel, baseline = await prepared()
+        await runtime.observe(FakeMessage(baseline["id"], channel, content="edited"), kind="edit", reason="edit", edited=True)
+        edited = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertFalse(await runtime.verify(baseline, recovery=True, latest_id=baseline["id"]))
+        self.assertNotEqual(edited["revision"], baseline["revision"])
+
+        runtime, channel, baseline = await prepared()
+        await runtime.delete(FakeMessage(baseline["id"], channel))
+        self.assertFalse(await runtime.verify(baseline, recovery=True, latest_id=baseline["id"]))
+
+        runtime, _channel, baseline = await prepared()
+        unknown = dict(baseline, id="5000000000000000999")
+        self.assertFalse(await runtime.verify(unknown, recovery=True, latest_id=unknown["id"]))
+
+        runtime, channel, baseline = await prepared()
+        await runtime.observe(FakeMessage("500000000000000003", channel), kind="live", reason="live")
+        newer = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertFalse(await runtime.verify(baseline, recovery=True, latest_id=baseline["id"]))
+        self.assertEqual(newer["id"], "500000000000000003")
+
     async def test_initial_history_is_bounded_baseline_and_live_delivery_is_serialized(self):
         config = _config()
         signal_channel = FakeChannel(CHANNEL_SIGNALS)

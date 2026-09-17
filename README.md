@@ -2,7 +2,7 @@
 
 Discord Option Tailer watches exactly two configured Discord channels through a personal-account Gateway session (`discord.py-self`) or a manually signed-in browser. It sends bounded message context to Codex through an existing ChatGPT subscription, applies deterministic option and risk checks, and records the decision trail in a mode-bound SQLite ledger.
 
-Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker data and save proposed orders, but it never submits them. **Live** is an explicit, paused setup action that can submit real Robinhood orders. Historical and missed-message recovery is review-only and never submits a recovered trade.
+Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker data and save proposed orders, but it never submits them. **Live** is an explicit, paused setup action that can submit real Robinhood orders. Missed entries remain review-only; verified missed exits can close existing relay-owned contracts in Live.
 
 ## Project index
 
@@ -31,11 +31,15 @@ Private account exports, browser profiles, OAuth state, databases, and local cre
 
 The first history observed after login, reconnect, or restart is a context baseline. It is recorded for interpretation context and is never replayed as a new entry. Gateway history is bounded to one page of at most 100 messages per configured channel, requested sequentially. A fresh eligible alert must still pass the normal freshness and source checks before it can reach the mode-specific order path.
 
-When the reader returns to the newest messages, eligible baseline alerts and alerts held because they became stale can receive a separate recovery assessment. The evaluator compares the original alert with later same-source messages and current account and quote facts. It reports a review result such as **Potentially viable**, **Invalidated**, **Uncertain**, or **Not actionable**; every result remains review-only. Recovery is bounded by messages observed by the selected reader and durable per-revision deduplication. It does not fetch a complete Discord history, turn an old message into a fresh trigger, or place an order.
+When the reader returns to the newest messages, eligible baseline alerts and alerts held because they became stale receive a separate recovery assessment. Startup also checks saved context after the current relay-owned entry for previously missed exits. Historical entries remain review-only. A viable exit can use the normal mode-specific order path only after checking current source content, later context, the exact position lifetime, remaining ownership, current quotes/account data and the absence of a consumed or later exit. The dashboard identifies executed catch-up exits separately from review-only assessments.
 
-Edited alerts, manual backscroll, imported history, future timestamps, context-only rows, and unauthorized authors stay out of execution. Visible embed text and metadata are available to the interpreter; image-only instructions are held.
+Recovery is bounded by the saved messages and current reader cache; it does not fetch complete Discord history. A temporarily unavailable source keeps a viable exit pending with a 30-second retry and no repeated model evaluation while its context and position remain unchanged. Unavailable account/market facts defer assessment for five minutes. Expired contracts, changed context, ownership mismatches and already-consumed exits cannot be replayed. Uncertain submissions are reconciled without resubmitting; canceled or rejected orders are not automatically replaced.
+
+Edited alerts, manual backscroll, imported history, future timestamps, channels configured only for context, and unauthorized authors stay out of execution. Visible embed text and metadata are available to the interpreter; image-only instructions are held.
 
 ## Supported actions and limits
+
+Fractional exits round up only the fractional remainder: **50% of 1 → sell 1; 50% of 2 → sell 1; 50% of 3 → sell 2**. Explicit full exits sell all remaining relay-owned contracts. Optional current language such as “you can trim/take profits if you'd like” is actionable only when the current tick-rounded sell price exceeds the recorded entry cost plus twice the configured per-contract fee reserve. An unspecified optional trim sells half remaining, rounded up. Explicit exits such as “took 50% here” or “all out” retain their stated size and do not require a profit. Future conditions and performance recaps are not immediate sale instructions.
 
 The trading path supports single-leg, long, standard USD equity or ETF options: buy to open, reduce, and sell to close. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, shorts, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
 
