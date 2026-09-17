@@ -119,6 +119,7 @@ class ExitRecoveryChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_referenced_context_only_exit_cannot_authorize_a_sale(self):
         recovery = await self.open_position()
+        self.config["channels"][1].update(role="context", source_group=self.config["channels"][0]["source_group"])
         context_message = await self.missed(channel=1, content="All out in a context-only channel")
         message = await self.missed(content="Follow-up referencing that older message")
         decision = self.interpreter.decision | {
