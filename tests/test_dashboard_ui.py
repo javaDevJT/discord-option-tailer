@@ -56,6 +56,14 @@ def seed_dashboard(base, template):
             message["source_group"] = channel["source_group"]
             decision = dict(action=action, contract=contract if action == "OPEN" else None, confidence=.9,
                             reason=reason, evidence=[{"message_id": message["id"], "quote": content}])
+            decision["evaluation_timing"] = {
+                "model_duration_seconds": .8,
+                "posted_to_decision_seconds": 4.2,
+                "attempts": 2 if state == "error" else 1,
+                "decision_at": now,
+                "path": "direct",
+                "delayed": True,
+            }
             if state == "recovery_review":
                 decision["recovery"] = {
                     "status": "viable",
@@ -82,6 +90,14 @@ def seed_dashboard(base, template):
                         "account_number": "999999999999999999", "provider_payload": {"secret": "omit"},
                     },
                     "account_number": "999999999999999999",
+                }
+                decision["recovery"]["evaluation_timing"] = {
+                    "model_duration_seconds": 1.4,
+                    "posted_to_decision_seconds": 7381,
+                    "attempts": 2,
+                    "decision_at": now,
+                    "path": "recovery",
+                    "delayed": True,
                 }
             store.observe(message)
             store.record(message, state, reason, decision if action else None)
@@ -130,10 +146,20 @@ class DashboardUITests(unittest.TestCase):
                     self.assertIn("assessment only · no order submitted.", recovery_text)
                     self.assertIn("quote at assessment", recovery_text)
                     self.assertIn("market / open", recovery_text)
+                    self.assertIn("model evaluation 2.2s", recovery_text)
+                    self.assertIn("posted → decision 2.1h", recovery_text)
+                    self.assertIn("recovered", recovery_text)
+                    self.assertIn("3 attempts", recovery_text)
                     self.assertIn("recovery pending", page.locator("#messages-shell").inner_text().lower())
                     self.assertIn("recovery evaluating", page.locator("#messages-shell").inner_text().lower())
+                    pending_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: missed signal queued for recovery")
+                    self.assertEqual(pending_card.locator(".evaluation-timing").count(), 0)
+                    failed_recovery_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: missed signal recovery failed")
+                    self.assertIn("1 stage recorded", failed_recovery_card.locator(".evaluation-timing").inner_text())
                     failed_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: evaluation failed before a decision")
                     self.assertEqual(failed_card.locator(".decision-action").text_content(), "Evaluation failed")
+                    self.assertEqual(failed_card.locator(".evaluation-timing").inner_text(),
+                                     "Model evaluation not recorded · Posted → decision not recorded")
                     failed_event = page.locator("#events-shell .event-row").filter(has_text="code=invalid_output")
                     self.assertEqual(failed_event.locator(".event-action").text_content(), "Evaluation failed")
                     self.assertIn("SPY", page.locator("#orders-shell").inner_text())

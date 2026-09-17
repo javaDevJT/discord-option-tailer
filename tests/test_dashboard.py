@@ -163,6 +163,27 @@ class DashboardTests(unittest.TestCase):
         proposal = _project_order_proposal({"entry_evaluation": evaluation | {"ask": "NaN"}})
         self.assertNotIn("ask", proposal["entry_evaluation"])
 
+    def test_evaluation_timing_projection_keeps_valid_durations_and_recovery_path(self):
+        from relay.dashboard import _project_decision
+        timing = {
+            "model_duration_seconds": 1.25,
+            "posted_to_decision_seconds": 12.5,
+            "attempts": 2,
+            "decision_at": "2026-09-17T12:00:00+00:00",
+            "path": "direct",
+            "delayed": True,
+            "provider_response": "SECRET",
+            "negative": -1,
+        }
+        recovery_timing = timing | {"path": "recovery", "model_duration_seconds": 2.5}
+        decision = _project_decision({"evaluation_timing": timing, "recovery": {"evaluation_timing": recovery_timing}})
+        self.assertEqual(decision["evaluation_timing"]["model_duration_seconds"], 1.25)
+        self.assertEqual(decision["evaluation_timing"]["attempts"], 2)
+        self.assertTrue(decision["evaluation_timing"]["delayed"])
+        self.assertEqual(decision["recovery"]["evaluation_timing"]["path"], "recovery")
+        self.assertNotIn("provider_response", json.dumps(decision))
+        self.assertNotIn("negative", json.dumps(decision))
+
     def test_status_reports_counts_and_stale_detection_without_sensitive_fields(self):
         status, headers, payload = self.request("/api/status")
         self.assertEqual(status, 200)

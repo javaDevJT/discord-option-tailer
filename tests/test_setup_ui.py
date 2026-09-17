@@ -100,10 +100,12 @@ class SetupUITests(unittest.TestCase):
             "codex": {"state": "not_connected", "detail": "No device sign-in active."},
             "robinhood": {"state": "not_connected", "detail": "No account connected."},
             "risk": {
-                "entry_risk_min_fraction": "0.05",
-                "entry_risk_max_fraction": "0.10",
-                "min_confidence": 0.8,
-                "allow_same_day_expiry": False,
+        "entry_risk_min_fraction": "0.05",
+        "entry_risk_max_fraction": "0.10",
+        "min_confidence": 0.8,
+        "max_position_fraction": "0.10",
+        "max_total_exposure_fraction": "0.20",
+        "allow_same_day_expiry": False,
             },
         }
         status.update(overrides)
@@ -280,6 +282,10 @@ class SetupUITests(unittest.TestCase):
                 expect(page.locator("#setup-state-stamp")).to_have_text("SETUP REQUIRED")
                 expect(page.locator("#risk-context-text")).to_contain_text("5–10%")
                 expect(page.locator("#risk-context-text")).to_contain_text("80%")
+                expect(page.locator("#risk-context-text")).to_contain_text("Entry sizing reference")
+                expect(page.locator("#risk-context-text")).to_contain_text("one affordable contract")
+                expect(page.locator("#risk-context-text")).to_contain_text("Same-underlying sizing reference")
+                expect(page.locator("#risk-context-text")).to_contain_text("Total option exposure sizing reference")
                 name.fill("Draft room")
                 with page.expect_response(lambda response: response.url.endswith("/api/setup/auth/codex/start")):
                     page.get_by_role("button", name="Start Codex sign-in").click()

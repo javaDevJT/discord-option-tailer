@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import math
@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import tomllib
 from zoneinfo import ZoneInfo
 
@@ -565,6 +566,13 @@ def validate_decision(decision, message, context):
     return decision
 
 
+def _decision_for_recovery(decision):
+    """Keep interpreter metadata out of strict validation and recovery prompts."""
+    if not isinstance(decision, dict):
+        return decision
+    return {key: value for key, value in decision.items() if key != "evaluation_timing"}
+
+
 def _parse_timestamp(value):
     if not isinstance(value, str):
         return None
@@ -573,6 +581,38 @@ def _parse_timestamp(value):
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def _evaluation_timing(message, started_monotonic, attempts, *, path):
+    """Return bounded timing metadata without using wall time for duration."""
+    finished_at = datetime.now(timezone.utc)
+    try:
+        duration = max(0.0, time.monotonic() - started_monotonic)
+    except (TypeError, ValueError):
+        duration = None
+    posted = _parse_timestamp(message.get("timestamp") or message.get("created_at")) if isinstance(message, dict) else None
+    posted_elapsed = None
+    delayed = None
+    if posted is not None:
+        posted_elapsed = (finished_at - posted.astimezone(timezone.utc)).total_seconds()
+        # A local clock that is ahead of Discord cannot establish a trustworthy
+        # posting-to-decision interval, so leave the value unavailable.
+        if posted_elapsed < 0:
+            posted_elapsed = None
+        elif duration is not None:
+            delayed = posted_elapsed > duration + 1.0
+    result = {
+        "decision_at": finished_at.isoformat(),
+        "attempts": attempts if type(attempts) is int and 1 <= attempts <= 2 else 1,
+        "path": path if path in {"direct", "recovery"} else "direct",
+    }
+    if duration is not None:
+        result["model_duration_seconds"] = round(duration, 6)
+    if posted_elapsed is not None:
+        result["posted_to_decision_seconds"] = round(posted_elapsed, 6)
+    if delayed is not None:
+        result["delayed"] = delayed
+    return result
 
 
 def _safe_fact_text(value, limit=500):
@@ -920,6 +960,7 @@ class CodexInterpreter:
         self.last_authentication = None
         self.last_notices = []
         self.last_attempts = 0
+        self.last_timing = None
 
     def _environment(self, runtime_home):
         env = os.environ.copy()
@@ -1008,6 +1049,8 @@ class CodexInterpreter:
         return model
 
     async def interpret(self, message: dict, context: list[dict], positions: list[dict]) -> dict:
+        evaluation_started_monotonic = time.monotonic()
+        self.last_timing = None
         if not isinstance(context, list) or not isinstance(positions, list) or len(positions) > 200:
             raise InterpretationError("Invalid message or position context")
         current = _record(message)
@@ -1039,14 +1082,17 @@ class CodexInterpreter:
             return decision
 
         options = {"validator": validate, "image_sources": image_sources}
-        return await self._request(data, **options)
+        return await self._request(data, timing_started_monotonic=evaluation_started_monotonic, **options)
 
     async def assess_recovery(self, message: dict, context: list[dict], positions: list[dict], decision: dict, facts: dict) -> dict:
+        evaluation_started_monotonic = time.monotonic()
+        self.last_timing = None
         if not isinstance(positions, list) or len(positions) > 200:
             raise InterpretationError("Invalid recovery position context")
         origin_id = decision.get("origin_message_id") if isinstance(decision, dict) else None
         current, history = _recovery_context(message, context, origin_id)
-        validate_decision(decision, current, history)
+        recovery_decision = _decision_for_recovery(decision)
+        validate_decision(recovery_decision, current, history)
         if decision["action"] not in TRADE_ACTIONS:
             raise InterpretationError("Recovery requires an actionable original decision")
         origin = current if decision["origin_message_id"] == current["id"] else next(
@@ -1062,7 +1108,7 @@ class CodexInterpreter:
             "original_message": origin,
             "context": history,
             "positions": safe_positions,
-            "decision": json.loads(json.dumps(decision, ensure_ascii=False, allow_nan=False)),
+            "decision": json.loads(json.dumps(recovery_decision, ensure_ascii=False, allow_nan=False)),
             "facts": safe_facts,
         }
         self.last_usage = self.last_authentication = self.last_model = None
@@ -1073,6 +1119,8 @@ class CodexInterpreter:
         assessment = await self._request(
             data, schema=RECOVERY_SCHEMA, system_prompt=RECOVERY_SYSTEM_PROMPT,
             validator=lambda result: self._validate_recovery_result(result, current, history, decision),
+            timing_path="recovery",
+            timing_started_monotonic=evaluation_started_monotonic,
             **({"image_sources": image_sources} if image_sources else {}),
         )
         if _recovery_expired(safe_facts, decision) or any("expired" in blocker.lower() for blocker in safe_facts["blockers"]):
@@ -1091,13 +1139,15 @@ class CodexInterpreter:
             raise InterpretationError("Recovery evidence must quote the original trigger")
         return assessment
 
-    async def _request(self, data, **options):
+    async def _request(self, data, *, timing_path="direct", timing_started_monotonic=None, **options):
         # Publish on the event loop, including failures during background recovery.
         validator = options.pop("validator", None)
         supplied_image_sources = options.get("image_sources")
         image_sources = supplied_image_sources if isinstance(supplied_image_sources, list) else list(supplied_image_sources or ())
         context_retry_used = False
         self.last_attempts = 0
+        self.last_timing = None
+        started_monotonic = time.monotonic() if timing_started_monotonic is None else timing_started_monotonic
         last_error = None
         for attempt in (1, 2):
             self.last_attempts = attempt
@@ -1105,8 +1155,12 @@ class CodexInterpreter:
                 result = await asyncio.to_thread(self._interpret, data, **options)
                 if validator is not None:
                     result = validator(result)
+                timing = _evaluation_timing(
+                    data.get("current_message", {}), started_monotonic, attempt, path=timing_path,
+                )
+                self.last_timing = timing
                 publish_status(self.on_status, "codex", "ready")
-                return result
+                return result | {"evaluation_timing": timing}
             except Exception as exc:
                 if isinstance(exc, ImageTransportError):
                     error = _image_interpretation_error(exc)
@@ -1125,6 +1179,11 @@ class CodexInterpreter:
                         _set_image_inputs(data, image_sources)
                         continue
                 if attempt >= 2 or not error.retryable:
+                    timing = _evaluation_timing(
+                        data.get("current_message", {}), started_monotonic, attempt, path=timing_path,
+                    )
+                    self.last_timing = timing
+                    error.evaluation_timing = timing
                     break
         if self.on_status and last_error is not None and not last_error.code.startswith("image_"):
             state = "auth_required" if last_error.code == "auth_required" else "unavailable"

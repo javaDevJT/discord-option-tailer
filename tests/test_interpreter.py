@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from relay.interpreter import _record
@@ -30,6 +31,10 @@ DECISION = {
     "confidence": .99, "ambiguous": False, "reason": "Explicit entry with complete contract.",
     "evidence": [{"message_id": "new", "quote": MESSAGE["content"]}],
 }
+
+
+def without_evaluation_timing(value):
+    return {key: item for key, item in value.items() if key != "evaluation_timing"}
 RECOVERY_FACTS = {
     "evaluated_at": "2026-09-04T14:00:10Z",
     "original_timestamp": MESSAGE["timestamp"],
@@ -72,7 +77,7 @@ class InterpreterChecks(unittest.TestCase):
                 raise OSError("private status path")
             interpreter = CodexInterpreter({"llm": {"executable": sys.executable}}, on_status=failed_sink)
             with patch.object(interpreter, "_interpret", return_value=DECISION):
-                self.assertEqual(await interpreter.interpret(MESSAGE, [], []), DECISION)
+                self.assertEqual(without_evaluation_timing(await interpreter.interpret(MESSAGE, [], [])), DECISION)
             original = InterpretationError("ChatGPT authentication needs attention")
             with patch.object(interpreter, "_interpret", side_effect=original):
                 with self.assertRaises(InterpretationError) as raised:
@@ -86,10 +91,103 @@ class InterpreterChecks(unittest.TestCase):
         interpreter = CodexInterpreter({"llm": {"executable": sys.executable}}, on_status=events.append)
         with patch.object(interpreter, "_interpret", side_effect=[invalid, DECISION]) as run:
             result = asyncio.run(interpreter.interpret(MESSAGE, [], []))
-        self.assertEqual(result, DECISION)
+        self.assertEqual(without_evaluation_timing(result), DECISION)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(interpreter.last_attempts, 2)
+        self.assertEqual(interpreter.last_timing["attempts"], 2)
+        self.assertGreaterEqual(interpreter.last_timing["model_duration_seconds"], 0)
+        self.assertIn("posted_to_decision_seconds", interpreter.last_timing)
         self.assertEqual(events, [{"component": "codex", "state": "ready"}])
+
+    def test_concurrent_successes_keep_their_own_timing_metadata(self):
+        messages = [
+            MESSAGE | {"id": "first", "timestamp": "2026-09-04T14:00:00Z"},
+            MESSAGE | {"id": "second", "timestamp": "2026-09-04T14:00:05Z"},
+        ]
+        decisions = {
+            message["id"]: DECISION | {
+                "origin_message_id": message["id"],
+                "evidence": [{"message_id": message["id"], "quote": message["content"]}],
+            }
+            for message in messages
+        }
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+
+        def model(data, **_options):
+            if data["current_message"]["id"] == "first":
+                time.sleep(0.05)
+            else:
+                time.sleep(0.005)
+            return decisions[data["current_message"]["id"]]
+
+        async def scenario():
+            with patch.object(interpreter, "_interpret", side_effect=model):
+                return await asyncio.gather(*(interpreter.interpret(message, [], []) for message in messages))
+
+        first, second = asyncio.run(scenario())
+        first_timing = first["evaluation_timing"]
+        second_timing = second["evaluation_timing"]
+        self.assertGreater(first_timing["model_duration_seconds"], second_timing["model_duration_seconds"])
+        self.assertGreater(first_timing["posted_to_decision_seconds"], second_timing["posted_to_decision_seconds"])
+        self.assertEqual(first_timing["path"], "direct")
+        self.assertEqual(second_timing["path"], "direct")
+
+    def test_timing_spans_retries_and_is_attached_to_final_error(self):
+        invalid = DECISION | {"evidence": [{"message_id": "invented", "quote": "not supplied"}]}
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        with patch("relay.interpreter.time.monotonic", wraps=__import__("time").monotonic), patch.object(
+            interpreter, "_interpret", side_effect=[invalid, invalid],
+        ):
+            with self.assertRaises(InterpretationError) as raised:
+                asyncio.run(interpreter.interpret(MESSAGE, [], []))
+        timing = raised.exception.evaluation_timing
+        self.assertEqual(timing, interpreter.last_timing)
+        self.assertEqual(timing["attempts"], 2)
+        self.assertGreaterEqual(timing["model_duration_seconds"], 0)
+        self.assertEqual(timing["path"], "direct")
+        self.assertTrue(timing["delayed"])
+        self.assertIsInstance(timing["decision_at"], str)
+
+    def test_recovery_timing_marks_the_assessment_path(self):
+        assessment = {
+            "status": "uncertain", "confidence": .9, "reason": "Fixture assessment",
+            "evidence": DECISION["evidence"],
+        }
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        with patch("relay.interpreter.time.monotonic", wraps=__import__("time").monotonic), patch.object(
+            interpreter, "_interpret", return_value=assessment,
+        ):
+            asyncio.run(interpreter.assess_recovery(MESSAGE, [LATER], [], DECISION, RECOVERY_FACTS))
+        self.assertEqual(interpreter.last_timing["path"], "recovery")
+        self.assertEqual(interpreter.last_timing["attempts"], 1)
+        self.assertGreaterEqual(interpreter.last_timing["model_duration_seconds"], 0)
+
+    def test_recovery_accepts_timed_direct_decision_and_hides_metadata_from_prompt(self):
+        assessment = {
+            "status": "uncertain", "confidence": .9, "reason": "Fixture assessment",
+            "evidence": DECISION["evidence"],
+        }
+        captured_decisions = []
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+
+        def model(data, **_options):
+            if "decision" in data:
+                captured_decisions.append(copy.deepcopy(data["decision"]))
+                return assessment
+            return DECISION
+
+        async def scenario():
+            with patch.object(interpreter, "_interpret", side_effect=model):
+                direct = await interpreter.interpret(MESSAGE, [], [])
+                recovery = await interpreter.assess_recovery(MESSAGE, [LATER], [], direct, RECOVERY_FACTS)
+            return direct, recovery
+
+        direct, recovery = asyncio.run(scenario())
+        self.assertIn("evaluation_timing", direct)
+        self.assertEqual(len(captured_decisions), 1)
+        self.assertNotIn("evaluation_timing", captured_decisions[0])
+        self.assertEqual(recovery["status"], "uncertain")
+        self.assertEqual(recovery["evaluation_timing"]["path"], "recovery")
 
     def test_retry_exhaustion_has_safe_code_and_attempt_count(self):
         invalid = DECISION | {"evidence": [{"message_id": "invented", "quote": "private-token"}]}
@@ -293,7 +391,7 @@ class CodexInterpreterChecks(unittest.TestCase):
                 side_effect=[ImageTransportError(code="image_network_error"), [Path(directory) / "alert.png"]],
             ) as download:
                 result = asyncio.run(interpreter.interpret(message, [], []))
-        self.assertEqual(result, DECISION)
+        self.assertEqual(without_evaluation_timing(result), DECISION)
         self.assertEqual(download.call_count, 2)
         self.assertEqual(interpreter.last_attempts, 2)
         self.assertEqual(events, [{"component": "codex", "state": "ready"}])
@@ -345,7 +443,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             interpreter = self.interpreter(directory)
             with patch.object(interpreter, "_interpret", side_effect=model) as run:
                 result = asyncio.run(interpreter.interpret(MESSAGE, context, []))
-        self.assertEqual(result, decision)
+        self.assertEqual(without_evaluation_timing(result), decision)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(interpreter.last_attempts, 2)
         self.assertEqual(observed[0][1], [])
@@ -421,7 +519,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             with patch.object(interpreter, "_run_process", side_effect=execute), patch(
                 "relay.interpreter.download_images", return_value=[current_path, origin_path],
             ):
-                self.assertEqual(asyncio.run(interpreter.interpret(message, [origin], [])), DECISION)
+                self.assertEqual(without_evaluation_timing(asyncio.run(interpreter.interpret(message, [origin], []))), DECISION)
         self.assertEqual(len(captured), 1)
         payload, image_args = captured[0]
         self.assertEqual(payload["image_inputs"], [{"message_id": "new"}, {"message_id": "origin"}])
@@ -491,7 +589,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             with patch.dict(os.environ, {"OPENAI_API_KEY": "do-not-use", "OPENAI_BASE_URL": "http://private-proxy", "CODEX_APP_TOOLS_PIPE_PATH": "/private/tool-socket", "HTTPS_PROXY": "http://transport-proxy"}), patch.object(interpreter, "_run_process", side_effect=execute):
                 result = asyncio.run(interpreter.interpret(MESSAGE, [], []))
             args, env, cwd, data = captured[1]
-            self.assertEqual(result, DECISION)
+            self.assertEqual(without_evaluation_timing(result), DECISION)
             self.assertEqual(interpreter.last_authentication, "chatgpt_subscription")
             self.assertEqual(interpreter.last_model, "user-default-model")
             self.assertEqual(interpreter.last_usage["output_tokens"], 100)
@@ -539,7 +637,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             interpreter = self.interpreter(directory)
             with patch.object(interpreter, "_run_process", side_effect=execute), patch("relay.interpreter.download_images", return_value=[Path(directory) / "image.png"]):
                 result = asyncio.run(interpreter.interpret(message, context, positions))
-        self.assertEqual(result, DECISION)
+        self.assertEqual(without_evaluation_timing(result), DECISION)
         self.assertEqual(len(payloads[0]["context"]), 60)
         self.assertEqual(len(payloads[0]["context"][0]["content"]), 6000)
         self.assertEqual(payloads[0]["current_message"]["source_group"], "approved")
@@ -568,7 +666,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             interpreter = self.interpreter(directory)
             with patch.object(interpreter, "_run_process", side_effect=execute):
                 result = asyncio.run(interpreter.assess_recovery(MESSAGE, [LATER, foreign], [], DECISION, facts))
-        self.assertEqual(result, assessment)
+        self.assertEqual(without_evaluation_timing(result), assessment)
         args, _env, _cwd, data = captured[1]
         self.assertEqual(schemas, [RECOVERY_SCHEMA])
         payload = json.loads(data)
@@ -590,7 +688,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             interpreter = self.interpreter(directory)
             with patch.object(interpreter, "_interpret", side_effect=[invalid, assessment]) as run:
                 result = asyncio.run(interpreter.assess_recovery(MESSAGE, [LATER], [], DECISION, RECOVERY_FACTS))
-        self.assertEqual(result, assessment)
+        self.assertEqual(without_evaluation_timing(result), assessment)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(interpreter.last_attempts, 2)
 
@@ -693,7 +791,7 @@ class CodexInterpreterChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             interpreter = self.interpreter(directory)
             with patch.object(interpreter, "_run_process", side_effect=lambda *args, **kwargs: self.response(*args, **kwargs, events=events)):
-                self.assertEqual(asyncio.run(interpreter.interpret(MESSAGE, [], [])), DECISION)
+                self.assertEqual(without_evaluation_timing(asyncio.run(interpreter.interpret(MESSAGE, [], []))), DECISION)
             self.assertEqual(interpreter.last_notices, ["code_mode_disabled"])
             for invalid in ([{"type": "turn.started"}, notice, {"type": "turn.completed"}], [{"type": "item.completed", "item": {"type": "error", "message": "other failure"}}, {"type": "turn.started"}, {"type": "turn.completed"}]):
                 with patch.object(interpreter, "_run_process", side_effect=lambda *args, **kwargs: self.response(*args, **kwargs, events=invalid)), self.assertRaises(InterpretationError):

@@ -41,9 +41,9 @@ Current-message and directly replied-to Discord attachment pictures are passed t
 
 Each mode has a separate ledger. Fresh Docker installations begin in Shadow with no account binding and live orders disabled. Use the frontend's pause and mode controls to change an existing installation.
 
-The default allocation ceiling increases from 5% of equity at 0.80 interpretation confidence to 10% at 1.00 confidence. Existing exposure, available funds and estimated costs can reduce that budget. The default same-underlying cap is 10%, total option exposure cap is 20%, and local cash reserve is zero. These are maximum allocations, not minimum account balances or required spending.
+The default allocation reference increases from 5% of equity at 0.80 interpretation confidence to 10% at 1.00 confidence. Existing exposure, available funds and estimated costs can reduce that budget. The default same-underlying sizing reference is 10%, total option exposure reference is 20%, and local cash reserve is zero. If the percentage budget cannot cover one whole contract, an otherwise eligible entry uses exactly one when available buying power after the configured cash reserve covers its rounded limit cost and fees. The percentage targets may be exceeded by that one-contract fallback; buying power cannot.
 
-Quantity is a whole-contract floor that includes the configured per-contract fee reserve. Optional calibrated quarter-Kelly sizing can impose a lower cap. Interpretation confidence is not a measured probability of profitable trading. There is no fixed contract-count or daily entry-count limit.
+Above the one-contract fallback, quantity is the whole-contract floor of the reference budget, including the configured per-contract fee reserve. Optional calibrated quarter-Kelly sizing can reduce the reference; a nonpositive calibrated edge still blocks entry. Interpretation confidence is not a measured probability of profitable trading. There is no fixed contract-count or daily entry-count limit.
 
 Missed-signal recovery produces timestamped assessments only. It does not bypass the fresh-message execution gate or submit historical orders. See [container operation](container.md) for recovery and monitoring behavior.
 

@@ -39,10 +39,12 @@ EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
+    "evaluation_timing",
 )
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
     "budget", "binding_limit", "premium_risk_per_contract", "allocated_premium_risk",
+    "minimum_contract_fallback", "available_buying_power",
 )
 ORDER_BODY_FIELDS = (
     "side", "quantity", "limit_price", "position_effect", "quote_timestamp", "account_timestamp", "sizing",
@@ -274,6 +276,27 @@ def _project_recovery_facts(value):
     return result
 
 
+def _project_evaluation_timing(value):
+    timing = _json_object(value)
+    result = {}
+    for key in ("model_duration_seconds", "posted_to_decision_seconds"):
+        number = timing.get(key)
+        if type(number) in (int, float) and not isinstance(number, bool) and math.isfinite(number) and 0 <= number <= 315_360_000:
+            result[key] = number
+    attempts = timing.get("attempts")
+    if type(attempts) is int and 1 <= attempts <= 2:
+        result["attempts"] = attempts
+    decision_at = _safe_timestamp(timing.get("decision_at"))
+    if decision_at is not None:
+        result["decision_at"] = decision_at
+    path = _safe_text(timing.get("path"), 32)
+    if path in {"direct", "recovery"}:
+        result["path"] = path
+    if type(timing.get("delayed")) is bool:
+        result["delayed"] = timing["delayed"]
+    return result
+
+
 def _project_recovery(value):
     recovery = _json_object(value)
     if not recovery:
@@ -300,6 +323,8 @@ def _project_recovery(value):
         result["signal_age_seconds"] = age
     if "facts" in recovery:
         result["facts"] = _project_recovery_facts(recovery["facts"])
+    if "evaluation_timing" in recovery:
+        result["evaluation_timing"] = _project_evaluation_timing(recovery["evaluation_timing"])
     return result
 
 
@@ -322,6 +347,8 @@ def _project_decision(value):
             result[key] = _project_recovery(current)
         elif key == "entry_evaluation":
             result[key] = _project_entry_evaluation(current)
+        elif key == "evaluation_timing":
+            result[key] = _project_evaluation_timing(current)
         elif key in {"action", "origin_message_id", "reason"}:
             result[key] = _safe_text(current, 4000 if key == "reason" else 128)
         elif key in {"quantity"}:

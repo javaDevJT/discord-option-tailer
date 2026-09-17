@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from relay.core import Engine
 from relay.recovery import RecoveryEvaluator
+from relay.interpreter import InterpretationError
 from tests import test_core as fixtures
 
 NOW = fixtures.NOW
@@ -221,6 +222,42 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "recovery_error")
         self.assertNotIn("SECRET", result["reason"])
         self.assertIsNone(recovery.enqueue(message, "same"))
+
+    async def test_recovery_persists_timing_for_both_stages_and_failures(self):
+        for failed_stage in (None, "interpret", "assess_recovery"):
+            with self.subTest(failed_stage=failed_stage):
+                recovery = self.evaluator()
+                message = await self.pending(recovery)
+                self.interpreter.decision["evaluation_timing"] = {
+                    "model_duration_seconds": 2.5, "attempts": 1, "path": "direct",
+                }
+                self.interpreter.interpret = fixtures.Interpreter.interpret.__get__(self.interpreter)
+                original = self.interpreter.assess_recovery
+
+                async def timed_assessment(*args):
+                    result = await original(*args)
+                    return result | {"evaluation_timing": {
+                        "model_duration_seconds": 4.5, "attempts": 2, "path": "recovery",
+                    }}
+
+                self.interpreter.assess_recovery = timed_assessment
+                if failed_stage:
+                    error = InterpretationError("private failure", code="invalid_evidence", attempts=2)
+                    error.evaluation_timing = {"model_duration_seconds": 4.5, "attempts": 2, "path": "direct"}
+                    setattr(self.interpreter, failed_stage, AsyncMock(side_effect=error))
+                result = await recovery.assess(message)
+                self.assertEqual(result["state"], "recovery_error" if failed_stage else "recovery_review")
+                row = self.store.db.execute("SELECT decision FROM events WHERE message_id=?", (message["id"],)).fetchone()
+                decision = json.loads(row[0])
+                first = decision["evaluation_timing"]
+                self.assertEqual(first["path"], "recovery")
+                self.assertIn("posted_to_decision_seconds", first)
+                if failed_stage != "interpret":
+                    second = decision["recovery"]["evaluation_timing"]
+                    self.assertEqual(first["model_duration_seconds"], 2.5)
+                    self.assertEqual(second["model_duration_seconds"], 4.5)
+                    self.assertEqual(second["decision_at"], first["decision_at"])
+                self.assertEqual(self.broker.submissions, [])
 
     async def test_runtime_routes_baseline_to_recovery_and_shuts_down_cleanly(self):
         from relay.cli import run

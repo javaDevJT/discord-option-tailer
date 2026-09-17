@@ -129,3 +129,24 @@ class ChaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("one whole contract", " ".join(facts["blockers"]))
         self.assertIsNone(facts.get("affordable_quantity"))
         self.assertEqual(self.broker.submissions, [])
+
+    async def test_affordable_minimum_contract_survives_recovery_and_final_check(self):
+        self.prices("1.43")
+        self.interpreter.decision["alert_price"] = "1.28"
+        self.config["risk"].update(buying_power_reserve_fraction="0", max_position_fraction=".10")
+        self.broker.account.update(equity="353.16450", buying_power="144")
+        message = self.message()
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        decision = await self.interpreter.interpret(message, [], [])
+        facts = await RecoveryEvaluator(self.engine).facts(message, decision)
+        self.assertEqual(facts["affordable_quantity"], 1)
+        self.assertEqual(facts["blockers"], [])
+        order = await self.engine.plan(message, decision)
+        self.assertEqual(order["quantity"], 1)
+        self.assertTrue(order["sizing"]["minimum_contract_fallback"])
+        quote = await self.broker.quote(order["contract"])
+        await self.engine.verify_dispatch(message, decision, order, self.broker.account, quote)
+        self.broker.account["buying_power"] = "143.99"
+        with self.assertRaisesRegex(Hold, "buying_power_reserve"):
+            await self.engine.verify_dispatch(message, decision, order, self.broker.account, quote)
+        self.assertEqual(self.broker.submissions, [])

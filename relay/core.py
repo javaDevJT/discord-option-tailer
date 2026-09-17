@@ -155,7 +155,8 @@ def entry_size(risk, snapshot, contract, confidence, limit_price, source_group):
             raise Hold("calibrated strategy has no positive Kelly edge")
         fraction = min(confidence_cap, edge * money(risk["fractional_kelly"], positive=True) * confidence)
         method = "fractional_kelly"
-    # These are maximum allocations, not minimum spend or estimated win probabilities.
+    # Percentage allocations size additional contracts. They do not prevent
+    # one affordable whole contract when the reference budget is smaller.
     limits = {
         "strategy_risk": equity * fraction,
         "symbol_concentration": equity * money(risk["max_position_fraction"], positive=True) - exposures.get(contract["symbol"], Decimal(0)),
@@ -165,12 +166,16 @@ def entry_size(risk, snapshot, contract, confidence, limit_price, source_group):
     binding = min(limits, key=limits.get)
     budget = limits[binding]
     per_contract = money(limit_price, positive=True) * 100 + money(risk["fee_reserve_per_contract"])
+    available = max(Decimal(0), limits["buying_power_reserve"])
+    if available < per_contract:
+        raise Hold(f"one whole contract including fee reserve ({per_contract}) exceeds buying_power_reserve maximum ({available})")
     quantity = int((max(Decimal(0), budget) / per_contract).to_integral_value(rounding=ROUND_FLOOR))
-    if not quantity:
-        raise Hold(f"one whole contract including fee reserve ({per_contract}) exceeds {binding} maximum ({max(Decimal(0), budget)})")
+    minimum_contract_fallback = quantity == 0
+    quantity = max(1, quantity)
     return quantity, dict(method=method, source_group=source_group, equity=str(equity),
                           parse_confidence=str(confidence), risk_fraction=str(fraction), confidence_cap_fraction=str(confidence_cap),
-                          budget=str(budget), binding_limit=binding,
+                          budget=str(max(Decimal(0), budget)), binding_limit=binding,
+                          minimum_contract_fallback=minimum_contract_fallback, available_buying_power=str(available),
                           premium_risk_per_contract=str(per_contract), allocated_premium_risk=str(per_contract * quantity))
 
 
@@ -337,6 +342,28 @@ class Store:
         return "edit" if old else "new"
 
     def record(self, message, state, reason, decision=None):
+        if decision and state not in {"recovery_pending", "recovery_evaluating"}:
+            # Observation time predates evaluation. Finish timing at the durable
+            # outcome, including policy checks and any broker response.
+            finished = datetime.now(UTC)
+            for stage in (decision, decision.get("recovery", {})):
+                if not isinstance(stage, dict):
+                    continue
+                timing = stage.get("evaluation_timing")
+                if not isinstance(timing, dict):
+                    continue
+                timing["decision_at"] = finished.isoformat()
+                timing.pop("posted_to_decision_seconds", None)
+                timing.pop("delayed", None)
+                try:
+                    elapsed = (finished - instant(message["timestamp"])).total_seconds()
+                except Hold:
+                    continue
+                if elapsed >= 0:
+                    timing["posted_to_decision_seconds"] = round(elapsed, 6)
+                    duration = timing.get("model_duration_seconds")
+                    if isinstance(duration, (int, float)):
+                        timing["delayed"] = elapsed > duration + 1
         with self.db:
             self.db.execute("UPDATE events SET state=?,reason=?,decision=? WHERE message_id=? AND revision=?", (
                 state, reason, json.dumps(decision) if decision else None, message["id"], message["revision"]))
@@ -631,6 +658,9 @@ class Engine:
                 # The interpreter owns provider details and retry accounting.
                 # Persist only its allowlisted diagnostic contract; no broker
                 # call occurs until a validated decision reaches plan().
+                timing = getattr(exc, "evaluation_timing", None)
+                if isinstance(timing, dict):
+                    decision = (decision or {}) | {"evaluation_timing": timing}
                 return self.store.record(message, "error", safe_interpretation_reason(exc), decision)
             except Exception as exc:
                 # Do not leak response bodies, tokens, or Discord message content.

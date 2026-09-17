@@ -1112,6 +1112,15 @@ h2 {
   line-height: 1.45;
 }
 
+.evaluation-timing {
+  margin: 0.65rem 0 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.59rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .recovery-facts {
   display: grid;
   gap: 0.35rem;

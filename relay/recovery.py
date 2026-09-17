@@ -168,6 +168,8 @@ class RecoveryEvaluator:
             all_positions = self.store.positions()
             positions = [p for p in all_positions if p["source_group"] == message["source_group"]]
             decision = await engine.interpreter.interpret(message, older, positions)
+            if isinstance(decision.get("evaluation_timing"), dict):
+                decision["evaluation_timing"]["path"] = "recovery"
             decision = await engine.resolve_expiry(message, decision)
             now = engine.clock()
             if decision["action"] in {"IGNORE", "WAIT", "UPDATE_STOP"}:
@@ -183,6 +185,7 @@ class RecoveryEvaluator:
                 context, truncated = self.context(message, engine.clock())
                 facts["context_truncated"] = truncated
                 assessment = await engine.interpreter.assess_recovery(message, context, positions, decision, facts)
+                decision["recovery"] = assessment
                 current, _ = self.context(message, engine.clock())
                 row = self.store.db.execute("SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()
                 facts["context_changed"] = self.signature(context) != self.signature(current) or row is None or row[0] != message["revision"]
@@ -209,6 +212,13 @@ class RecoveryEvaluator:
             self.store.record(message, "recovery_pending", "Recovery assessment interrupted; awaiting evaluation")
             raise
         except Exception as exc:
+            timing = getattr(exc, "evaluation_timing", None)
+            if isinstance(timing, dict):
+                timing["path"] = "recovery"
+                if decision is None:
+                    decision = {"evaluation_timing": timing}
+                else:
+                    decision = decision | {"recovery": {"evaluation_timing": timing}}
             return self.store.record(message, "recovery_error", safe_interpretation_reason(exc), decision)
 
     async def consume(self, fresh_queue, emit):

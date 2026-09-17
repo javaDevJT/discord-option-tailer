@@ -102,14 +102,14 @@ Recovery has no age or entry-count cutoff for an assessment, but it is bounded b
 
 ## Risk guardrails
 
-The default configuration keeps the confidence-based entry allocation ceiling between 5% and 10% of current equity:
+The default configuration uses a confidence-based sizing reference between 5% and 10% of current equity:
 
 | Guardrail | Default |
 | --- | --- |
 | Minimum parse confidence | `0.80` |
-| Entry ceiling | `5%` at the threshold, `7.5%` at `0.90`, `10%` at `1.00` |
-| Same-underlying exposure | `10%` of equity |
-| Total option exposure | `20%` of equity |
+| Entry sizing reference | `5%` at the threshold, `7.5%` at `0.90`, `10%` at `1.00` |
+| Same-underlying sizing reference | `10%` of equity |
+| Total option exposure sizing reference | `20%` of equity |
 | Signal freshness | `90` seconds |
 | Quote freshness | `15` seconds |
 | Maximum spread | `15%` |
@@ -117,7 +117,7 @@ The default configuration keeps the confidence-based entry allocation ceiling be
 | Same-day expiry opens | Disabled by default; configurable in Setup |
 | Fee reserve | `$1.00` per contract |
 
-These are maximum allocations, never a required spend or minimum account balance. Current buying power, existing and pending exposure, whole-contract quantity, and fees can reduce an entry to zero. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can only reduce the ceiling.
+These percentage allocations determine quantity rather than a minimum account balance. When the reference budget cannot cover one whole contract, an otherwise eligible entry uses exactly one contract if available buying power after any configured cash reserve covers the rounded limit price times 100 plus fees. For example, a $35.32 reference budget and a $144 contract cost yield one contract when at least $144 is available. When the reference budget supports multiple contracts, normal whole-contract sizing applies. Existing and pending exposure still reduce that reference budget. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can reduce the reference budget; a nonpositive calibrated edge still blocks entry. Other eligibility, chase and broker checks remain required.
 
 The execution path accepts single-leg long standard USD equity or ETF options for buy-to-open, reduce, and sell-to-close actions. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, short positions, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
 
@@ -159,6 +159,10 @@ Pausing and stopping are safe operational controls for new work. Preserve the Do
 ### Entry price diagnostics
 
 Entry diagnostics show the evaluated ask, cited alert premium, signed percentage deviation, configured chase cap, and rounded order limit. Chase uses `(price / alert premium - 1) × 100`: at a 15% setting, a $1.00 alert permits up to $1.15, including the boundary. Both the ask and the limit after tick rounding must fit the cap, and the check runs again on the final broker-review quote. Exits are not subject to entry chase limits.
+
+### Message evaluation timing
+
+Message and decision rows show **Model evaluation** and **Posted → decision**. Model time uses a monotonic clock and includes preparation, image handling, retries, and validation. Recovery totals the initial interpretation and the current-viability evaluation. Posting-to-decision uses the original Discord timestamp through the recorded outcome, including time offline or waiting, policy checks, and any broker response. It is not order-fill latency. Retry counts and recovered/delayed labels provide context; a long recovery interval does not mean the model spent that entire time running. Historical rows without measurements say **not recorded**; missing or future source timestamps cannot produce a trustworthy reaction interval.
 
 ### Account balances and holdings
 

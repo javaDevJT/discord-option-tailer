@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from relay.core import Engine, Hold, Store, canonical_contract, channel_allows_author, contract_key, entry_size, load_config
 from relay.broker import BrokerPreflightHold
@@ -179,7 +180,9 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
     async def test_failed_evaluation_persists_safe_code_and_attempts_without_broker_call(self):
         class FailedInterpreter:
             async def interpret(self, message, context, positions):
-                raise InterpretationError("private provider response", code="invalid_evidence", attempts=2)
+                error = InterpretationError("private provider response", code="invalid_evidence", attempts=2)
+                error.evaluation_timing = {"model_duration_seconds": 3.25, "attempts": 2, "path": "direct"}
+                raise error
 
         self.engine.interpreter = FailedInterpreter()
         result = await self.engine.handle(self.message())
@@ -189,7 +192,29 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private provider response", result["reason"])
         self.assertEqual(self.broker.submissions, [])
         row = self.store.db.execute("SELECT state,reason,decision FROM events WHERE message_id=?", (result["message_id"],)).fetchone()
-        self.assertEqual((row["state"], row["decision"]), ("error", None))
+        self.assertEqual(row["state"], "error")
+        timing = json.loads(row["decision"])["evaluation_timing"]
+        self.assertEqual(timing["model_duration_seconds"], 3.25)
+        self.assertEqual(timing["attempts"], 2)
+        self.assertIn("posted_to_decision_seconds", timing)
+
+    async def test_timing_finishes_at_recorded_decision_and_preserves_model_duration(self):
+        self.interpreter.decision.update(action="WAIT", evaluation_timing={
+            "model_duration_seconds": 2.5, "attempts": 1, "path": "direct",
+            "decision_at": (NOW + timedelta(seconds=3)).isoformat(),
+            "posted_to_decision_seconds": 3,
+        })
+        message = self.message()
+        with patch("relay.core.datetime") as clock:
+            clock.fromisoformat = datetime.fromisoformat
+            clock.now.return_value = NOW + timedelta(seconds=12)
+            result = await self.engine.handle(message)
+        self.assertEqual(result["state"], "wait")
+        row = self.store.db.execute("SELECT decision FROM events WHERE message_id=?", (message["id"],)).fetchone()
+        timing = json.loads(row[0])["evaluation_timing"]
+        self.assertEqual(timing["model_duration_seconds"], 2.5)
+        self.assertEqual(timing["posted_to_decision_seconds"], 12)
+        self.assertEqual(timing["decision_at"], (NOW + timedelta(seconds=12)).isoformat())
 
     async def test_stale_future_invalid_and_late_model_response(self):
         for seconds in (-91, 6):
@@ -283,9 +308,6 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         await self.held(self.message(channel=1), "exceeds")
 
     async def test_budget_chase_or_session_limits(self):
-        self.config["risk"].update(entry_risk_min_fraction=".008", entry_risk_max_fraction=".008")
-        await self.held(reason="maximum")
-        self.config["risk"].update(entry_risk_min_fraction=".01", entry_risk_max_fraction=".01")
         self.interpreter.decision["alert_price"] = ".70"
         await self.held(reason="chase")
         self.interpreter.decision["alert_price"] = ".80"
@@ -511,7 +533,7 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
             self.store.apply_result(order_id, dict(id="fixture", status="filled", filled_quantity=2, fill_price=".25"))
         self.assertEqual(self.store.positions()[0]["quantity"], 1)
 
-    async def test_partial_canceled_entry_still_consumes_concurrent_exposure(self):
+    async def test_partial_canceled_exposure_reduces_next_entry_to_one_contract(self):
         self.larger_orders(2)
         self.interpreter.decision["quantity"] = 2
         self.broker.result = dict(id="fixture", status="canceled", filled_quantity=1, fill_price=".80")
@@ -521,7 +543,11 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.broker.account["option_exposure_by_symbol"] = {"BAC": "80"}
         self.interpreter.decision["contract"] = CONTRACT | {"symbol": "V"}
         self.broker.result = None
-        await self.held(reason="total_option_exposure")
+        self.assertEqual((await self.engine.handle(self.message()))["state"], "paper_order")
+        order = self.broker.submissions[-1]
+        self.assertEqual(order["quantity"], 1)
+        self.assertEqual(order["sizing"]["binding_limit"], "total_option_exposure")
+        self.assertTrue(order["sizing"]["minimum_contract_fallback"])
 
     async def test_repeated_entries_have_no_count_or_daily_turnover_limit(self):
         # Even stale legacy limits cannot reintroduce a hidden entry-count or turnover cap.
@@ -598,9 +624,10 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         quantity, audit = entry_size(risk, self.broker.account, CONTRACT, 1, ".80", "source-a")
         self.assertEqual(quantity, 1)
         self.assertEqual(Decimal(audit["allocated_premium_risk"]), Decimal("81"))
-        with self.assertRaises(Hold):
-            entry_size(risk | {"entry_risk_min_fraction": ".00809999999999999999", "entry_risk_max_fraction": ".00809999999999999999"},
-                       self.broker.account, CONTRACT, 1, ".80", "source-a")
+        quantity, audit = entry_size(risk | {"entry_risk_min_fraction": ".00809999999999999999", "entry_risk_max_fraction": ".00809999999999999999"},
+                                    self.broker.account, CONTRACT, 1, ".80", "source-a")
+        self.assertEqual(quantity, 1)
+        self.assertTrue(audit["minimum_contract_fallback"])
         cash = self.broker.account | {"buying_power": "1081"}
         quantity, audit = entry_size(self.config["risk"], cash, CONTRACT, .99, ".80", "source-a")
         self.assertEqual(quantity, 1)
@@ -642,16 +669,48 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         quantity, audit = entry_size(risk | {"min_confidence": 1}, self.broker.account, CONTRACT, 1, ".80", "source-a")
         self.assertEqual((quantity, Decimal(audit["risk_fraction"])), (12, Decimal(".10")))
 
-    def test_small_affordable_contract_has_no_equity_floor_or_above_cap_override(self):
+    def test_small_affordable_contract_uses_one_contract_fallback(self):
         risk = self.config["risk"] | {"min_confidence": .8, "entry_risk_min_fraction": ".05",
                                       "entry_risk_max_fraction": ".10", "max_position_fraction": ".10",
                                       "buying_power_reserve_fraction": "0"}
         account = self.broker.account | {"equity": "20", "buying_power": "20"}
         quantity, audit = entry_size(risk, account, CONTRACT, 1, ".01", "source-a")
         self.assertEqual((quantity, Decimal(audit["allocated_premium_risk"])), (1, Decimal("2")))
+        self.assertFalse(audit["minimum_contract_fallback"])
         for confidence, premium in ((.8, ".01"), (1, ".02")):
-            with self.subTest(confidence=confidence, premium=premium), self.assertRaises(Hold):
-                entry_size(risk, account, CONTRACT, confidence, premium, "source-a")
+            with self.subTest(confidence=confidence, premium=premium):
+                quantity, audit = entry_size(risk, account, CONTRACT, confidence, premium, "source-a")
+                self.assertEqual(quantity, 1)
+                self.assertTrue(audit["minimum_contract_fallback"])
+
+    def test_screenshot_cost_uses_one_contract_then_normal_multi_contract_sizing(self):
+        risk = self.config["risk"] | {"entry_risk_min_fraction": ".10", "entry_risk_max_fraction": ".10",
+                                      "max_position_fraction": ".10", "buying_power_reserve_fraction": "0"}
+        account = self.broker.account | {"equity": "353.16450", "buying_power": "300"}
+        quantity, audit = entry_size(risk, account, CONTRACT, 1, "1.43", "source-a")
+        self.assertEqual(quantity, 1)  # Cash can cover two; the fallback only allows one.
+        self.assertEqual(Decimal(audit["budget"]), Decimal("35.316450"))
+        self.assertEqual(Decimal(audit["allocated_premium_risk"]), Decimal("144.00"))
+        self.assertTrue(audit["minimum_contract_fallback"])
+        for balance, expected in (("143.99", 0), ("144", 1)):
+            with self.subTest(balance=balance):
+                if expected:
+                    self.assertEqual(entry_size(risk, account | {"buying_power": balance}, CONTRACT, 1, "1.43", "source-a")[0], expected)
+                else:
+                    with self.assertRaisesRegex(Hold, "buying_power_reserve"):
+                        entry_size(risk, account | {"buying_power": balance}, CONTRACT, 1, "1.43", "source-a")
+        for equity, expected in (("2879.99", 1), ("2880", 2)):
+            quantity, audit = entry_size(risk, account | {"equity": equity}, CONTRACT, 1, "1.43", "source-a")
+            self.assertEqual(quantity, expected)
+            self.assertFalse(audit["minimum_contract_fallback"])
+
+    def test_percentage_exposure_targets_cannot_block_one_affordable_contract(self):
+        for exposures in ({"BAC": "450"}, {"V": "1990"}, {"BAC": "500"}, {"V": "2500"}):
+            with self.subTest(exposures=exposures):
+                quantity, audit = entry_size(self.config["risk"], self.broker.account | {"option_exposure_by_symbol": exposures},
+                                            CONTRACT, .99, ".80", "source-a")
+                self.assertEqual(quantity, 1)
+                self.assertTrue(audit["minimum_contract_fallback"])
 
     def test_available_buying_power_reduces_quantity_below_confidence_cap(self):
         risk = self.config["risk"] | {"entry_risk_min_fraction": ".10", "entry_risk_max_fraction": ".10",
@@ -667,9 +726,7 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         for change in ({"equity": None}, {"equity": "NaN"}, {"equity": "0"}, {"equity": True},
                        {"buying_power": "-1"}, {"option_exposure_by_symbol": None},
                        {"option_exposure_by_symbol": {"bac": "10"}},
-                       {"option_exposure_by_symbol": {"V": "-1"}},
-                       {"option_exposure_by_symbol": {"BAC": "450"}},
-                       {"option_exposure_by_symbol": {"V": "1990"}}):
+                       {"option_exposure_by_symbol": {"V": "-1"}}):
             with self.subTest(change=change), self.assertRaises(Hold):
                 entry_size(self.config["risk"], self.broker.account | change, CONTRACT, .99, ".80", "source-a")
 

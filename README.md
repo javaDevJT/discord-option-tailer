@@ -24,7 +24,7 @@ Private account exports, browser profiles, OAuth state, databases, and local cre
 1. The Gateway reader receives live message events through `discord.py-self==2.1.0`; the browser fallback reads the rendered DOM. Both use the personal account and never post to the input channels. Configure the transport and optional private Gateway credential in **Setup → Discord input**.
 2. The relay stores normalized messages and passes a bounded chronological context window to Codex. Codex runs through the user's ChatGPT subscription; no OpenAI API key is required.
 3. Deterministic checks require a clear standard option contract, an allowed source, fresh inputs, current quotes, account-relative sizing, and a mode-specific ledger.
-4. The dashboard shows messages, interpretations, holds, recorded orders, relay-owned positions, and recovery assessments. An optional Discord webhook reports selected setup assistance and relay actions.
+4. The dashboard shows messages, interpretations, holds, recorded orders, relay-owned positions, and recovery assessments. Each newly evaluated message shows model evaluation duration and elapsed time from posting to the recorded decision. An optional Discord webhook reports selected setup assistance and relay actions.
 5. Robinhood access uses its normal browser OAuth flow and a configurable callback. Passwords and MFA stay with Robinhood; setup performs account inspection before any execution mode can be selected.
 
 ## Fresh messages and recovery
@@ -39,14 +39,14 @@ Edited alerts, manual backscroll, imported history, future timestamps, context-o
 
 The trading path supports single-leg, long, standard USD equity or ETF options: buy to open, reduce, and sell to close. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, shorts, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
 
-The default risk settings are guardrails on the maximum amount allocated to an entry:
+The default sizing references and eligibility checks are:
 
 | Guardrail | Default |
 | --- | --- |
 | Minimum parse confidence | `0.80` |
-| Confidence-based entry ceiling | `5%` at the threshold, rising to `10%` at confidence `1.00` (`7.5%` at `0.90`) |
-| Same-underlying exposure ceiling | `10%` of equity |
-| Total option exposure ceiling | `20%` of equity |
+| Confidence-based entry sizing | `5%` at the threshold, rising to `10%` at confidence `1.00` (`7.5%` at `0.90`) |
+| Same-underlying sizing reference | `10%` of equity |
+| Total option exposure sizing reference | `20%` of equity |
 | Buying-power reserve | `0%` local reserve; broker restrictions still apply |
 | Signal age | At most `90` seconds for a fresh action |
 | Quote age | At most `15` seconds |
@@ -55,7 +55,7 @@ The default risk settings are guardrails on the maximum amount allocated to an e
 | Same-day expiry entries | Disabled by default; configurable in Setup |
 | Fee reserve | `$1.00` per contract in the default configuration |
 
-The 5%–10% range is a confidence-based **maximum**, never a minimum spend or minimum account balance. Actual buying power, existing and pending exposure, the fee reserve, and whole-contract sizing can reduce it to zero. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can impose an additional lower cap; they cannot raise the 5%–10% ceiling.
+The 5%–10% range and percentage exposure limits determine whole-contract quantity. If that reference budget is below one contract, an otherwise eligible entry uses **exactly one contract** when available buying power covers the rounded limit price times 100 plus the fee reserve. This fallback may exceed the percentage targets; it never exceeds buying power after any configured cash reserve. Once the reference budget supports whole contracts, normal sizing applies. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can reduce the reference budget; a nonpositive calibrated edge still blocks entry. Chase, quote freshness, signal eligibility and broker restrictions remain required.
 
 In **Setup → Signal evaluation**, select the Codex model, reasoning effort, Fast or Standard service, and maximum chase percentage. Saving pauses the relay. Settings remain editable while a paused worker needs authentication; Resume still requires the worker to load the saved settings and recover. The example configuration uses `gpt-6-astra`, medium reasoning, and Fast with the existing ChatGPT subscription; no API key is required. Chase controls the maximum entry premium above the alert price, independently of position sizing.
 

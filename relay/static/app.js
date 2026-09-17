@@ -251,6 +251,90 @@ function relayReadTimeoutSignal() {
     return recovery && typeof recovery === "object" && !Array.isArray(recovery) ? recovery : null;
   }
 
+  const EVALUATION_IN_FLIGHT_STATES = new Set([
+    "observed", "pending", "submitting", "recovery_pending", "recovery_evaluating",
+  ]);
+
+  function timingObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  }
+
+  function evaluationTimingStages(event) {
+    const decision = readDecision(event);
+    const recovery = recoveryAssessment(event);
+    const stages = [];
+    const direct = timingObject(firstValue(decision?.evaluation_timing, event?.evaluation_timing));
+    const recoveryTiming = timingObject(recovery?.evaluation_timing);
+    if (direct) stages.push({ kind: "direct", timing: direct });
+    if (recoveryTiming) stages.push({ kind: "recovery", timing: recoveryTiming });
+    return stages;
+  }
+
+  function evaluationTimingPending(event) {
+    const stateName = normalized(firstValue(event?.state, readDecision(event).state));
+    return EVALUATION_IN_FLIGHT_STATES.has(stateName);
+  }
+
+  function formatEvaluationDuration(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return "unavailable";
+    if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+    if (seconds < 60) {
+      const precision = seconds < 10 ? 1 : 0;
+      return `${Number(seconds.toFixed(precision))}s`;
+    }
+    const minutes = seconds / 60;
+    if (minutes < 60) return `${Number(minutes.toFixed(minutes < 10 ? 1 : 0))}m`;
+    const hours = minutes / 60;
+    return `${Number(hours.toFixed(hours < 10 ? 1 : 0))}h`;
+  }
+
+  function renderEvaluationTiming(parent, event) {
+    if (evaluationTimingPending(event)) return;
+    const stages = evaluationTimingStages(event);
+    const labels = [];
+    const recovery = isRecoveryEvent(event);
+    if (stages.some(({ kind, timing }) => kind === "recovery" || timing.path === "recovery")) labels.push("Recovered");
+    if (stages.some(({ timing }) => timing.delayed === true)) labels.push("Delayed");
+    if (recovery && stages.length === 1) labels.push("1 stage recorded");
+
+    const modelDurations = stages
+      .map(({ timing }) => Number(timing.model_duration_seconds))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const model = modelDurations.length
+      ? `Model evaluation ${formatEvaluationDuration(modelDurations.reduce((sum, value) => sum + value, 0))}`
+      : "Model evaluation not recorded";
+
+    const attempts = stages
+      .map(({ timing }) => Number(timing.attempts))
+      .filter((value) => Number.isInteger(value) && value >= 1 && value <= 2)
+      .reduce((sum, value) => sum + value, 0);
+    if (attempts > 1) labels.push(`${Math.min(4, attempts)} attempts`);
+
+    let latestPosted = null;
+    stages.forEach(({ timing }, index) => {
+      const posted = Number(timing.posted_to_decision_seconds);
+      if (!Number.isFinite(posted) || posted < 0) return;
+      const decisionAt = new Date(timing.decision_at || "").getTime();
+      const candidate = { posted, decisionAt: Number.isFinite(decisionAt) ? decisionAt : null, index };
+      if (!latestPosted) {
+        latestPosted = candidate;
+        return;
+      }
+      if (candidate.decisionAt !== null && latestPosted.decisionAt !== null) {
+        if (candidate.decisionAt >= latestPosted.decisionAt) latestPosted = candidate;
+      } else if (candidate.decisionAt === null && latestPosted.decisionAt === null) {
+        if (candidate.index >= latestPosted.index) latestPosted = candidate;
+      } else if (candidate.decisionAt === null || latestPosted.decisionAt === null) {
+        latestPosted = candidate;
+      }
+    });
+    const posted = latestPosted
+      ? `Posted → decision ${formatEvaluationDuration(latestPosted.posted)}`
+      : "Posted → decision not recorded";
+    append(parent, node("p", "evaluation-timing", [...labels, model, posted].join(" · ")));
+  }
+
   function isRecoveryEvent(event) {
     const stateName = normalized(firstValue(event?.state, readDecision(event).state));
     return stateName.startsWith("recovery_") || Boolean(recoveryAssessment(event));
@@ -287,6 +371,7 @@ function relayReadTimeoutSignal() {
       originalTimestamp ? `Original ${formatDate(originalTimestamp, true)}` : "Original time unavailable",
     ].join(" · ");
     append(parent, node("p", "recovery-meta", timing));
+    renderEvaluationTiming(parent, event);
 
     const details = node("div", "recovery-facts");
     const quote = facts.quote && typeof facts.quote === "object" ? facts.quote : null;
@@ -666,6 +751,7 @@ function relayReadTimeoutSignal() {
           }
           const contract = firstValue(readDecision(event).contract, event.contract);
           if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
+          renderEvaluationTiming(decisionPanel, event);
         }
       } else {
         append(decisionPanel, node("span", "no-decision", "No interpretation recorded"));
@@ -1692,10 +1778,12 @@ function relayReadTimeoutSignal() {
     const pieces = [];
     const percent = (value) => (Number(value) * 100).toLocaleString(undefined, { maximumFractionDigits: 2 });
     if (risk.entry_risk_min_fraction !== undefined && risk.entry_risk_max_fraction !== undefined) {
-      pieces.push(`Allocation maximum: ${percent(risk.entry_risk_min_fraction)}–${percent(risk.entry_risk_max_fraction)}% by confidence`);
+      pieces.push(`Entry sizing reference: ${percent(risk.entry_risk_min_fraction)}–${percent(risk.entry_risk_max_fraction)}% of equity by confidence`);
+      pieces.push("Whole-contract fallback: one affordable contract when the sizing budget is below one contract and available buying power after reserve covers it");
     }
     if (risk.min_confidence !== undefined) pieces.push(`Confidence floor: ${percent(risk.min_confidence)}%`);
-    if (risk.max_total_exposure_fraction !== undefined) pieces.push(`Total exposure maximum: ${percent(risk.max_total_exposure_fraction)}%`);
+    if (risk.max_position_fraction !== undefined) pieces.push(`Same-underlying sizing reference: ${percent(risk.max_position_fraction)}% of equity`);
+    if (risk.max_total_exposure_fraction !== undefined) pieces.push(`Total option exposure sizing reference: ${percent(risk.max_total_exposure_fraction)}% of equity`);
     if (!pieces.length) return;
     container.hidden = false;
     setupSetText("risk-context-text", `${pieces.join(" · ")}. Risk defaults shown above are read-only.`);
