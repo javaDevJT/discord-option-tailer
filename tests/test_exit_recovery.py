@@ -117,6 +117,19 @@ class ExitRecoveryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "paper_order", result)
         self.assertEqual(len(self.interpreter.calls), calls + 1)
 
+    async def test_referenced_context_only_exit_cannot_authorize_a_sale(self):
+        recovery = await self.open_position()
+        context_message = await self.missed(channel=1, content="All out in a context-only channel")
+        message = await self.missed(content="Follow-up referencing that older message")
+        decision = self.interpreter.decision | {
+            "action": "CLOSE", "origin_message_id": context_message["id"],
+            "evidence": [{"message_id": context_message["id"], "quote": context_message["content"]}],
+        }
+        context, _ = recovery.context(message, self.now)
+        with self.assertRaisesRegex(fixtures.Hold, "not an authorized signal"):
+            recovery.exit_guard(message, decision, context, self.store.positions())
+        self.assertEqual(len(self.broker.submissions), 1)
+
     async def test_restart_reconciles_pending_fill_without_resubmission(self):
         recovery = await self.open_position()
         order = self.broker.submissions[0]

@@ -131,6 +131,8 @@ class RecoveryEvaluator:
         if entry is None:
             raise Hold("missed exit has no identifiable currently owned entry")
         origin = engine.origin(message, decision)
+        if not self.eligible(origin):
+            raise Hold("missed exit origin is not an authorized signal")
         if instant(origin["timestamp"]) < instant(entry["created_at"]):
             raise Hold("missed exit predates the current position")
         signature = self.signature(context)
