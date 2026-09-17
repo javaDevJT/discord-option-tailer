@@ -108,9 +108,14 @@ class ExitRecoveryChecks(unittest.IsolatedAsyncioTestCase):
 
         self.engine.verify_current = changed
         result = await recovery.assess(message)
-        self.assertEqual(result["state"], "recovery_review")
+        self.assertEqual(result["state"], "recovery_pending")
         self.assertIn("context changed", result["reason"])
         self.assertEqual(len(self.broker.submissions), 1)
+        calls = len(self.interpreter.calls)
+        self.engine.verify_current = AsyncMock(return_value=True)
+        result = await recovery.assess(message)
+        self.assertEqual(result["state"], "paper_order", result)
+        self.assertEqual(len(self.interpreter.calls), calls + 1)
 
     async def test_restart_reconciles_pending_fill_without_resubmission(self):
         recovery = await self.open_position()

@@ -12,6 +12,10 @@ from .core import EASTERN, Hold, RetryHold, canonical_contract, contract_key, ch
 from .interpreter import safe_interpretation_reason
 
 
+class SourceContextChanged(Hold):
+    """Discard a cached assessment and consider the newly observed source context."""
+
+
 class RecoveryEvaluator:
     # ponytail: assess browser-observed alerts once per revision; full history sync is separate work.
 
@@ -139,10 +143,12 @@ class RecoveryEvaluator:
             if Path(engine.config["kill_switch"]).exists():
                 raise Hold("kill switch is present")
             current, truncated = self.context(message, engine.clock())
-            if truncated or self.signature(current) != signature:
-                raise Hold("source context changed or is incomplete during exit catch-up")
+            if truncated:
+                raise Hold("source context is incomplete during exit catch-up")
+            if self.signature(current) != signature:
+                raise SourceContextChanged("source context changed during exit catch-up")
             if engine.source_latest.get(group, latest_id) > latest_id:
-                raise Hold("a newer source message must be considered before this exit")
+                raise SourceContextChanged("a newer source message must be considered before this exit")
             row = self.store.db.execute("SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()
             if row is None or row[0] != message["revision"] or engine.origin(message, decision)["revision"] != origin["revision"]:
                 raise Hold("missed exit source was changed or removed")
@@ -321,6 +327,8 @@ class RecoveryEvaluator:
                 if facts["context_changed"]:
                     facts["blockers"].append("Source messages changed during assessment")
                     assessment["status"] = "uncertain"
+                    if decision["action"] in {"REDUCE", "CLOSE"}:
+                        raise SourceContextChanged("source context changed during exit assessment")
                 if sorted(json.dumps(p, sort_keys=True) for p in all_positions) != sorted(json.dumps(p, sort_keys=True) for p in self.store.positions()):
                     facts["blockers"].append("Relay positions changed during assessment")
                     assessment["status"] = "uncertain"
@@ -345,6 +353,9 @@ class RecoveryEvaluator:
         except asyncio.CancelledError:
             self.store.record(message, "recovery_pending", "Recovery assessment interrupted; awaiting evaluation")
             raise
+        except SourceContextChanged as exc:
+            self.deferred_exits.pop(message["id"], None)
+            return self.defer(message, decision, str(exc))
         except Hold as exc:
             if decision and isinstance(decision.get("recovery"), dict):
                 decision["recovery"].update(status="uncertain", reason=str(exc))
