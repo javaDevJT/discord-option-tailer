@@ -115,13 +115,19 @@ class JevUITests(unittest.TestCase):
                 return
             if path == "/api/setup/evaluation" and request.method == "POST":
                 body = request.post_data_json or {}
+                if "typesafe_api_key" in body:
+                    fulfill(route, {"error": {"detail": "TypeSafe API key must be nested in evaluation."}}, 400)
+                    return
                 state["evaluation_requests"].append(body)
                 state["setup"]["evaluation"].update(body)
                 if isinstance(body.get("evaluation"), dict):
-                    state["setup"]["evaluation"]["jev"] = body["evaluation"]
-                    if "direct_entries" in body["evaluation"]:
-                        state["setup"]["evaluation"]["direct_entries"] = body["evaluation"]["direct_entries"]
-                    state["setup"]["evaluation"]["jev"]["credential_configured"] = "typesafe_api_key" in body or state["setup"]["evaluation"]["jev"].get("credential_configured") is True
+                    jev = dict(body["evaluation"])
+                    credential_configured = "typesafe_api_key" in jev or state["setup"]["evaluation"]["jev"].get("credential_configured") is True
+                    jev.pop("typesafe_api_key", None)
+                    state["setup"]["evaluation"]["jev"] = jev
+                    if "direct_entries" in jev:
+                        state["setup"]["evaluation"]["direct_entries"] = jev["direct_entries"]
+                    state["setup"]["evaluation"]["jev"]["credential_configured"] = credential_configured
                 fulfill(route, state["setup"])
                 return
             if path == "/api/setup/evaluation/test" and request.method == "POST":
@@ -129,6 +135,7 @@ class JevUITests(unittest.TestCase):
                 fulfill(route, {"state": "passed", "latency_ms": 23, "detail": "Synthetic classification accepted."})
                 return
             if path == "/api/setup/pause" and request.method == "POST":
+                state.setdefault("pause_requests", []).append(request.post_data_json or {})
                 state["setup"]["paused"] = bool((request.post_data_json or {}).get("paused"))
                 fulfill(route, state["setup"])
                 return
@@ -136,13 +143,13 @@ class JevUITests(unittest.TestCase):
 
         page.route("**/api/**", handle)
 
-    def new_page(self, playwright, state):
+    def new_page(self, playwright, state, expected_mode="jev_shadow"):
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         self.route_api(page, state)
         page.goto(f"http://127.0.0.1:{self.server.server_port}/", wait_until="domcontentloaded")
         expect(page.locator("#evaluation-form")).to_be_visible()
-        expect(page.locator("#evaluation-mode")).to_have_value("jev_shadow")
+        expect(page.locator("#evaluation-mode")).to_have_value(expected_mode)
         return browser, page
 
     def test_jev_save_includes_nested_settings_and_preserves_write_only_key(self):
@@ -173,11 +180,102 @@ class JevUITests(unittest.TestCase):
                 self.assertEqual(payload["evaluation"]["min_confidence"], 0.96)
                 self.assertEqual(payload["evaluation"]["min_probability"], 0.97)
                 self.assertEqual(payload["evaluation"]["min_eligibility"], 0.99)
-                self.assertEqual(payload["typesafe_api_key"], "synthetic-typesafe-key")
+                self.assertEqual(payload["evaluation"]["typesafe_api_key"], "synthetic-typesafe-key")
+                self.assertNotIn("typesafe_api_key", payload)
                 expect(page.locator("#evaluation-typesafe-key")).to_have_value("")
                 expect(page.locator("#evaluation-mode")).to_have_value("jev")
             finally:
                 browser.close()
+
+    def test_running_live_codex_save_pauses_then_nests_synthetic_jev_key(self):
+        from relay.dashboard import DashboardApp, DashboardHTTPServer
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+            config.update(
+                mode="live",
+                database="state/relay-live.sqlite3",
+                kill_switch="state/STOP",
+                runtime_status_file="state/runtime-status.json",
+                channels=[
+                    {
+                        "id": "222222222222222222",
+                        "guild_id": "111111111111111111",
+                        "role": "signals",
+                        "authors": ["333333333333333333"],
+                        "source_group": "source-a",
+                    },
+                    {
+                        "id": "444444444444444444",
+                        "guild_id": "111111111111111111",
+                        "role": "context",
+                        "authors": ["555555555555555555"],
+                        "source_group": "source-b",
+                    },
+                ],
+            )
+            config["llm"].update(model="gpt-5.6-luna", reasoning_effort="low", service_tier="fast")
+            config["risk"]["max_chase_fraction"] = "0.15"
+            config["robinhood"].update(account_number="12345678", enable_live_orders=True)
+            config["evaluation"].update(
+                mode="codex",
+                direct_entries=True,
+                timeout_ms=1200,
+                min_confidence=0.95,
+                min_probability=0.95,
+                min_eligibility=0.98,
+            )
+            config_path = base / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            app = DashboardApp(config_path, enable_setup=True)
+            connected = {"state": "connected", "detail": "Synthetic connected."}
+            app.setup._public_codex_locked = lambda: connected
+            app.setup._public_robinhood_locked = lambda _raw: connected
+            app.setup._public_discord = lambda _raw: connected
+            server = None
+            thread = None
+            try:
+                try:
+                    server = DashboardHTTPServer(("127.0.0.1", 0), app)
+                except PermissionError:
+                    self.skipTest("network sockets are unavailable in this sandbox")
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    try:
+                        page = browser.new_page()
+                        page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="domcontentloaded")
+                        expect(page.locator("#evaluation-form")).to_be_visible()
+                        expect(page.locator("#evaluation-mode")).to_have_value("codex")
+                        self.assertTrue(page.locator("#evaluation-form").evaluate("(form) => form.checkValidity()"))
+                        expect(page.locator("#evaluation-direct-entries")).to_be_checked()
+                        expect(page.locator("#evaluation-model")).to_have_value("gpt-5.6-luna")
+                        expect(page.locator("#evaluation-effort")).to_have_value("low")
+                        expect(page.locator("#evaluation-tier")).to_have_value("fast")
+                        expect(page.locator("#evaluation-chase")).to_have_value("15")
+                        page.locator("#evaluation-typesafe-key").fill("synthetic-typesafe-key")
+                        page.locator("#save-evaluation").click()
+                        expect(page.locator("#evaluation-feedback")).to_contain_text("saved")
+                        expect(page.locator("#evaluation-typesafe-key")).to_have_value("")
+                        page.reload(wait_until="domcontentloaded")
+                        expect(page.locator("#evaluation-typesafe-key")).to_have_value("")
+                        expect(page.locator("#jev-credential-state")).to_contain_text("Credential configured")
+                    finally:
+                        browser.close()
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertTrue((base / "state/STOP").is_file())
+                self.assertEqual((base / "state/typesafe.key").read_text(encoding="utf-8"), "synthetic-typesafe-key\n")
+                self.assertNotIn("typesafe_api_key", json.dumps(saved))
+                self.assertEqual(saved["llm"]["model"], "gpt-5.6-luna")
+                self.assertEqual(saved["evaluation"]["mode"], "codex")
+            finally:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+                if thread is not None:
+                    thread.join(timeout=3)
 
     def test_direct_entries_toggle_saves_persists_and_survives_status_refresh(self):
         state = {

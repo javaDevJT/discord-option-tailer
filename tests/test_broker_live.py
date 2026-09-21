@@ -306,7 +306,7 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
                 return [chain]
             self.assertEqual(args["strike_price"], "500")
             self.assertEqual(args["type"], "call")
-            self.assertNotIn("expiration_dates", args)
+            self.assertIn(args["expiration_dates"], dates)
             return rows
         self.broker._pages = AsyncMock(side_effect=pages)
         request = self.contract | {"expiry": "2026-09-08"}

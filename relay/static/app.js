@@ -2468,33 +2468,6 @@ function relayReadTimeoutSignal() {
       setupRenderEvaluation(setupState.status?.evaluation || status.evaluation);
     }
   };
-  const setupSaveEvaluationLegacy = async () => {
-    if (setupState.evaluationInFlight || setupState.expiryPolicyInFlight) return;
-    const status = setupState.status || {};
-    if (!setupState.csrfToken) {
-      setupSetFeedback("evaluation-feedback", "Wait for setup status, then save again.", "error");
-      return;
-    }
-    const body = { model: setupById("evaluation-model").value.trim() || null,
-      reasoning_effort: setupById("evaluation-effort").value, service_tier: setupById("evaluation-tier").value,
-      max_chase_fraction: String(Number(setupById("evaluation-chase").value) / 100) };
-    setupState.evaluationInFlight = true;
-    setupSetFeedback("evaluation-feedback", "Saving…");
-    setupRenderStatus(status);
-    try {
-      if (status.paused !== true) {
-        const paused = await setupPost("/api/setup/pause", { paused: true }, "evaluation-feedback");
-        if (!paused || paused.paused !== true) return;
-      }
-      if (await setupPost("/api/setup/evaluation", body, "evaluation-feedback")) {
-        setupState.evaluationDirty = false;
-        setupSetFeedback("evaluation-feedback", "Evaluation settings saved. Resume after the worker reloads.", "success");
-      }
-    } finally {
-      setupState.evaluationInFlight = false;
-      setupRenderStatus(setupState.status || status);
-    }
-  };
   const setupSaveEvaluation = async () => {
     if (setupState.evaluationInFlight || setupState.expiryPolicyInFlight) return;
     const status = setupState.status || {};
@@ -2532,7 +2505,7 @@ function relayReadTimeoutSignal() {
     const key = setupText(setupById("evaluation-typesafe-key")?.value, "").trim();
     const currentJev = status.evaluation?.jev;
     if ((currentJev && typeof currentJev === "object") || setupState.evaluationJevDirty || key) body.evaluation = jevSettings;
-    if (key) body.typesafe_api_key = key;
+    if (key) body.evaluation.typesafe_api_key = key;
     setupState.evaluationInFlight = true;
     setupSetFeedback("evaluation-feedback", "Saving…");
     setupRenderStatus(status);

@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -31,6 +32,107 @@ class EntryExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(router.aclose)
         self.engine.interpreter = router
         return router
+
+    async def test_broker_read_scope_spans_expiry_plan_submit_and_is_discarded(self):
+        self.router()
+        active = None
+        entered = []
+        calls = []
+
+        @contextmanager
+        def execution_reads():
+            nonlocal active
+            if active is not None:
+                yield
+                return
+            active = object()
+            entered.append(active)
+            try:
+                yield
+            finally:
+                active = None
+
+        self.broker.execution_reads = execution_reads
+        original_quote = self.broker.quote
+        original_submit = self.broker.submit
+
+        async def nearest(contract):
+            self.assertIsNotNone(active)
+            calls.append(("expiry", active))
+            return dict(fixtures.CONTRACT)
+
+        async def snapshot():
+            self.assertIsNotNone(active)
+            calls.append(("snapshot", active))
+            return self.broker.account
+
+        async def quote(contract):
+            self.assertIsNotNone(active)
+            calls.append(("quote", active))
+            return await original_quote(contract)
+
+        async def submit(order, before_submit=None):
+            self.assertIsNotNone(active)
+            calls.append(("submit", active))
+            return await original_submit(order, before_submit=before_submit)
+
+        self.broker.nearest_expiry = nearest
+        self.broker.snapshot = snapshot
+        self.broker.quote = quote
+        self.broker.submit = submit
+        result = await self.engine.handle(self.entry())
+        self.assertEqual(result["state"], "paper_order", result)
+        self.assertEqual(len(entered), 1)
+        self.assertEqual({name for name, _ in calls}, {"expiry", "snapshot", "quote", "submit"})
+        self.assertTrue(all(scope is entered[0] for _, scope in calls))
+        self.assertIsNone(active)
+
+        # A later signal is held by existing ownership controls in a fresh scope.
+        message = self.entry()
+        message["id"] = str(int(message["id"]) + 1)
+        await self.engine.handle(message)
+        self.assertEqual(len(entered), 2)
+        self.assertIsNot(entered[0], entered[1])
+        self.assertIsNone(active)
+
+    async def test_broker_read_scope_cleans_up_after_cancellation(self):
+        self.router()
+        active = False
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        @contextmanager
+        def execution_reads():
+            nonlocal active
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        async def snapshot():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        async def nearest(contract):
+            await started.wait()
+            await asyncio.Event().wait()
+
+        self.broker.execution_reads = execution_reads
+        self.broker.snapshot = snapshot
+        self.broker.nearest_expiry = nearest
+        task = asyncio.create_task(self.engine.handle(self.entry()))
+        await asyncio.wait_for(started.wait(), .5)
+        self.assertTrue(active)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(stopped.is_set())
+        self.assertFalse(active)
+        self.assertFalse(self.broker.submissions)
 
     async def test_direct_entry_needs_no_model_and_overlaps_expiry_with_fresh_snapshot(self):
         router = self.router()

@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import AsyncExitStack, nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -746,7 +747,8 @@ class Engine:
             decision["evaluation_timing"] = timing
             self.store.record(message, "evaluated", "Interpretation ready; execution checks pending", decision)
             wait_started = time.monotonic()
-            async with self.lock:
+            async with self.lock, AsyncExitStack() as execution_stack:
+                execution_stack.enter_context(getattr(self.broker, "execution_reads", nullcontext)())
                 timing["execution_wait_seconds"] = round(time.monotonic() - wait_started, 6)
                 message["_execution_started"] = time.monotonic()
                 if asyncio.current_task().cancelling():
@@ -811,6 +813,11 @@ class Engine:
             timing[stage] = round(timing.get(stage, 0) + time.monotonic() - started, 6)
 
     async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
+        with getattr(self.broker, "execution_reads", nullcontext)():
+            return await self._execute_decision(message, decision, recovery_guard=recovery_guard,
+                                                expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+
+    async def _execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         def reason(label):
             if expiry_guard is not None:
                 facts = decision["expiry_exit"]

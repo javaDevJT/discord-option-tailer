@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+import contextvars
+import copy
+from contextlib import AsyncExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import functools
 import json
 import hmac
 import hashlib
@@ -13,6 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import stat
 import tempfile
+import time
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 import uuid
@@ -27,7 +31,8 @@ READ_TOOLS = frozenset({
     "get_option_positions", "get_option_orders", "get_option_historicals",
     "get_option_level_upgrade_info",
 })
-_SNAPSHOT_READ_CONCURRENCY = 4
+_BROKER_READ_CONCURRENCY = 4
+_EXECUTION_READ_REUSE_SECONDS = 1.0
 
 
 class BrokerError(RuntimeError):
@@ -36,6 +41,32 @@ class BrokerError(RuntimeError):
 
 class BrokerPreflightHold(BrokerError):
     """Final dispatch validation failed before any order transport began."""
+
+
+class _ExecutionReadScope:
+    def __init__(self):
+        self.active = True
+        self.handoffs = {}
+        self.snapshot = None
+        self.quotes = {}
+
+    def deactivate(self):
+        self.active = False
+        self.handoffs.clear()
+        self.snapshot = None
+        self.quotes.clear()
+
+
+def _scope_operation(method):
+    @functools.wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except BaseException:
+            self._invalidate_execution_scope()
+            raise
+
+    return wrapped
 
 
 def regular_session(now=None):
@@ -755,6 +786,137 @@ def _contracts(value):
 class RobinhoodBroker(RobinhoodMCP):
     """Normalized Agentic account reads and explicitly enabled single-leg limit orders."""
 
+    def _init_execution_scope(self):
+        self._execution_scope_var = contextvars.ContextVar(
+            f"robinhood_execution_reads_{id(self)}", default=None
+        )
+
+    def _active_execution_scope(self):
+        scope = self._execution_scope_var.get()
+        return scope if scope is not None and scope.active else None
+
+    def _invalidate_execution_scope(self):
+        scope = self._execution_scope_var.get()
+        if scope is not None:
+            scope.deactivate()
+
+    @contextmanager
+    def execution_reads(self):
+        current = self._execution_scope_var.get()
+        if current is not None and current.active:
+            try:
+                yield current
+            except BaseException:
+                current.deactivate()
+                raise
+            return
+
+        scope = _ExecutionReadScope()
+        token = self._execution_scope_var.set(scope)
+        try:
+            yield scope
+        except BaseException:
+            scope.deactivate()
+            raise
+        finally:
+            scope.deactivate()
+            self._execution_scope_var.reset(token)
+
+    def _remember_execution_handoff(self, contract, chain, instrument):
+        scope = self._active_execution_scope()
+        if scope is not None:
+            scope.handoffs[_contract_key(contract)] = (
+                time.monotonic(), copy.deepcopy(chain), copy.deepcopy(instrument)
+            )
+
+    def _take_execution_handoff(self, target):
+        scope = self._active_execution_scope()
+        if scope is None:
+            return None
+        if self.account_changed.is_set():
+            scope.handoffs.pop(target, None)
+            return None
+        entry = scope.handoffs.pop(target, None)
+        if entry is None:
+            return None
+        created_at, chain, instrument = entry
+        if time.monotonic() - created_at > _EXECUTION_READ_REUSE_SECONDS:
+            return None
+        return chain, instrument
+
+    def _remember_execution_snapshot(self, snapshot):
+        scope = self._active_execution_scope()
+        if scope is not None:
+            scope.snapshot = (time.monotonic(), copy.deepcopy(snapshot))
+
+    def _execution_snapshot(self):
+        scope = self._active_execution_scope()
+        if scope is None or scope.snapshot is None:
+            return None
+        completed_at, snapshot = scope.snapshot
+        if self.account_changed.is_set() or time.monotonic() - completed_at > _EXECUTION_READ_REUSE_SECONDS:
+            scope.snapshot = None
+            return None
+        try:
+            self._check_quote_age(snapshot["timestamp"], "Account snapshot")
+            for position in snapshot.get("positions", []):
+                self._check_quote_age(position["quote_timestamp"])
+        except (BrokerError, KeyError, TypeError):
+            scope.snapshot = None
+            return None
+        return copy.deepcopy(snapshot)
+
+    def _remember_execution_quote(self, target, quote):
+        scope = self._active_execution_scope()
+        if scope is None:
+            return
+        try:
+            self._fresh_quote(quote)
+        except (BrokerError, KeyError, TypeError):
+            return
+        scope.quotes[target] = (time.monotonic(), copy.deepcopy(quote))
+
+    def _execution_quote(self, target):
+        scope = self._active_execution_scope()
+        if scope is None:
+            return None
+        entry = scope.quotes.get(target)
+        if entry is None:
+            return None
+        completed_at, quote = entry
+        if (self.account_changed.is_set()
+                or target not in self.contracts
+                or time.monotonic() - completed_at > _EXECUTION_READ_REUSE_SECONDS):
+            scope.quotes.pop(target, None)
+            return None
+        try:
+            if _contract_key(quote["contract"]) != target:
+                raise BrokerError("Execution quote contract changed")
+            self._fresh_quote(quote)
+        except (BrokerError, KeyError, TypeError):
+            scope.quotes.pop(target, None)
+            return None
+        return copy.deepcopy(quote)
+
+    async def _bounded_reads(self, reader, values):
+        semaphore = asyncio.Semaphore(_BROKER_READ_CONCURRENCY)
+        tasks = []
+
+        async def read(value):
+            async with semaphore:
+                return await reader(value)
+
+        try:
+            for value in values:
+                tasks.append(asyncio.create_task(read(value)))
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     async def _snapshot_position_data(self, positions):
         option_ids = []
         seen = set()
@@ -772,31 +934,14 @@ class RobinhoodBroker(RobinhoodMCP):
         if not option_ids:
             return {}
 
-        async def bounded_reads(reader):
-            semaphore = asyncio.Semaphore(_SNAPSHOT_READ_CONCURRENCY)
-            tasks = []
-
-            async def read(option_id):
-                async with semaphore:
-                    return await reader(option_id)
-
-            try:
-                tasks = [asyncio.create_task(read(option_id)) for option_id in option_ids]
-                return await asyncio.gather(*tasks)
-            except BaseException:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
-
-        instruments = dict(zip(option_ids, await bounded_reads(self._instrument)))
+        instruments = dict(zip(option_ids, await self._bounded_reads(self._instrument, option_ids)))
         contracts = {option_id: self._instrument_contract(instrument) for option_id, instrument in instruments.items()}
-        quotes = dict(zip(option_ids, await bounded_reads(self._raw_quote)))
+        quotes = dict(zip(option_ids, await self._bounded_reads(self._raw_quote, option_ids)))
         return {option_id: (contracts[option_id], quotes[option_id]) for option_id in option_ids}
 
     def __init__(self, config, *, interactive=False, clock=None, on_status=None):
         super().__init__(config, interactive=interactive, on_status=on_status)
+        self._init_execution_scope()
         self.runtime = config
         self.account_number = self.config.get("account_number")
         if not isinstance(self.account_number, str) or not self.account_number.strip():
@@ -809,11 +954,17 @@ class RobinhoodBroker(RobinhoodMCP):
         self.order_results = {}
         self.attempted = set()
         self.account_changed = asyncio.Event()
+        self._portfolio_task = None
+        self._portfolio_waiters = 0
 
     async def __aenter__(self):
+        self._invalidate_execution_scope()
         self.contracts.clear()
         self.instruments.clear()
         self.currency = None
+        self._portfolio_task = None
+        self._portfolio_waiters = 0
+        await asyncio.to_thread(regular_session, self.clock())
         return await super().__aenter__()
 
     def _qualified(self, name):
@@ -866,7 +1017,7 @@ class RobinhoodBroker(RobinhoodMCP):
         session = regular_session(now)
         return bool(session and session[0] <= now < session[1])
 
-    async def _portfolio(self):
+    async def _fetch_portfolio(self):
         data = await self._data("get_portfolio", {"account_number": self.account_number})
         power = data.get("buying_power")
         if not isinstance(power, dict) or data.get("currency") != "USD" or power.get("display_currency") != "USD":
@@ -874,6 +1025,28 @@ class RobinhoodBroker(RobinhoodMCP):
         self.currency = data["currency"]
         return data, min(_decimal(power["buying_power"], "buying power"),
                          _decimal(power["unleveraged_buying_power"], "unleveraged buying power"))
+
+    async def _portfolio(self):
+        task = self._portfolio_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._fetch_portfolio())
+            self._portfolio_task = task
+
+            def clear(completed):
+                if self._portfolio_task is completed:
+                    self._portfolio_task = None
+
+            task.add_done_callback(clear)
+        self._portfolio_waiters += 1
+        try:
+            return await asyncio.shield(task)
+        finally:
+            self._portfolio_waiters -= 1
+            if self._portfolio_waiters == 0 and not task.done():
+                if self._portfolio_task is task:
+                    self._portfolio_task = None
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def _instrument(self, option_id):
         if option_id not in self.instruments:
@@ -1068,7 +1241,11 @@ class RobinhoodBroker(RobinhoodMCP):
             "scope": "option_positions",
         }
 
+    @_scope_operation
     async def snapshot(self):
+        cached = self._execution_snapshot()
+        if cached is not None:
+            return cached
         observed_at = self.clock()
         account_data, portfolio_result, positions, orders = await asyncio.gather(
             self._data("get_accounts", {}), self._portfolio(),
@@ -1150,7 +1327,7 @@ class RobinhoodBroker(RobinhoodMCP):
             restrictions.append("long options approval is missing")
         for position in normalized:
             self._check_quote_age(position["quote_timestamp"])
-        return {"account_id": self.account_number, "equity": str(_decimal(portfolio["total_value"], "total equity")),
+        result = {"account_id": self.account_number, "equity": str(_decimal(portfolio["total_value"], "total equity")),
                 "buying_power": str(power), "reported_buying_power": portfolio["buying_power"]["buying_power"],
                 "currency": self.currency, "positions": normalized,
                 "option_exposure_by_symbol": {symbol: str(value) for symbol, value in exposure.items()},
@@ -1160,33 +1337,71 @@ class RobinhoodBroker(RobinhoodMCP):
                 "agentic_allowed": account.get("agentic_allowed") is True, "option_level": account.get("option_level"),
                 "account_type": account["type"], "account_state": account["state"], "restrictions": restrictions,
                 "simulated": False, "sandbox_status": "not_reported", "source": "Robinhood Agentic MCP"}
+        self._remember_execution_snapshot(result)
+        return result
 
+    @_scope_operation
     async def nearest_expiry(self, contract):
         """Choose the first listed standard contract at the requested strike/type."""
         target = _contract_key(contract)
         chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
-        expiries = []
-        for chain in chains:
-            if chain["symbol"] != target[0] or _decimal(chain["trade_value_multiplier"], "chain multiplier") != 100 or len(chain["underlying_instruments"] or []) != 1 or (chain["cash_component"] is not None and _decimal(chain["cash_component"], "cash component") != 0):
-                continue
-            rows = await self._pages("get_option_instruments", {
-                "chain_id": chain["id"], "strike_price": format(Decimal(target[2]), "f"),
-                "type": target[3], "state": "active", "tradability": "tradable",
-            }, "instruments")
-            for instrument in rows:
-                if instrument["chain_id"] != chain["id"] or instrument.get("state") != "active" or instrument.get("tradability") != "tradable" or instrument["underlying_type"] != "equity" or _decimal(instrument["trade_value_multiplier"], "multiplier") != 100:
-                    continue
-                key = _contract_key(self._instrument_contract(instrument))
-                if key[0] == target[0] and key[2:] == target[2:] and key[1] >= target[1] and key[1] in (chain["expiration_dates"] or []):
-                    expiries.append(key[1])
-        if not expiries:
-            raise BrokerError("No listed expiration for the requested option")
-        return dict(contract, expiry=min(expiries))
+        eligible_chains = [
+            chain for chain in chains
+            if chain["symbol"] == target[0]
+            and _decimal(chain["trade_value_multiplier"], "chain multiplier") == 100
+            and len(chain["underlying_instruments"] or []) == 1
+            and (chain["cash_component"] is None or _decimal(chain["cash_component"], "cash component") == 0)
+        ]
 
+        expiries = sorted({
+            expiry for chain in eligible_chains
+            for expiry in (chain["expiration_dates"] or [])
+            if expiry >= target[1]
+        })
+        for expiry in expiries:
+            matching_chains = [
+                chain for chain in eligible_chains
+                if expiry in (chain["expiration_dates"] or [])
+            ]
+
+            async def read_instruments(chain):
+                return await self._pages("get_option_instruments", {
+                    "chain_id": chain["id"], "expiration_dates": expiry,
+                    "strike_price": format(Decimal(target[2]), "f"),
+                    "type": target[3], "state": "active", "tradability": "tradable",
+                }, "instruments")
+
+            rows_by_chain = await self._bounded_reads(read_instruments, matching_chains)
+            candidates = []
+            for chain, rows in zip(matching_chains, rows_by_chain):
+                for instrument in rows:
+                    if (instrument["chain_id"] != chain["id"]
+                            or instrument.get("state") != "active"
+                            or instrument.get("tradability") != "tradable"
+                            or instrument["underlying_type"] != "equity"
+                            or _decimal(instrument["trade_value_multiplier"], "multiplier") != 100):
+                        continue
+                    key = _contract_key(self._instrument_contract(instrument))
+                    if (key[0] == target[0] and key[1] == expiry and key[2:] == target[2:]
+                            and key[1] in (chain["expiration_dates"] or [])):
+                        candidates.append((chain, instrument))
+            if len(candidates) > 1:
+                raise BrokerError("Option expiration is ambiguous across chains")
+            if candidates:
+                resolved = dict(contract, expiry=expiry)
+                self._remember_execution_handoff(resolved, *candidates[0])
+                return resolved
+        raise BrokerError("No listed expiration for the requested option")
+
+    @_scope_operation
     async def quote(self, contract):
         target = _contract_key(contract)
-        candidates = []
-        cached = self.contracts.get(target)
+        cached_quote = self._execution_quote(target)
+        if cached_quote is not None:
+            return cached_quote
+        handoff = self._take_execution_handoff(target)
+        candidates = [handoff] if handoff is not None else []
+        cached = None if handoff is not None else self.contracts.get(target)
         if cached is not None:
             # Cache identity only. Refresh execution authority and raw prices every time.
             reads = await asyncio.gather(
@@ -1211,11 +1426,20 @@ class RobinhoodBroker(RobinhoodMCP):
                 candidates = []
         if not candidates:
             chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
-            for chain in chains:
-                if chain["symbol"] != target[0] or target[1] not in (chain["expiration_dates"] or []):
-                    continue
-                rows = await self._pages("get_option_instruments", {"chain_id": chain["id"], "expiration_dates": target[1],
-                    "strike_price": format(Decimal(target[2]), "f"), "type": target[3], "state": "active", "tradability": "tradable"}, "instruments")
+            matching_chains = [
+                chain for chain in chains
+                if chain["symbol"] == target[0] and target[1] in (chain["expiration_dates"] or [])
+            ]
+
+            async def read_instruments(chain):
+                return await self._pages("get_option_instruments", {
+                    "chain_id": chain["id"], "expiration_dates": target[1],
+                    "strike_price": format(Decimal(target[2]), "f"), "type": target[3],
+                    "state": "active", "tradability": "tradable",
+                }, "instruments")
+
+            rows_by_chain = await self._bounded_reads(read_instruments, matching_chains)
+            for chain, rows in zip(matching_chains, rows_by_chain):
                 for instrument in rows:
                     if instrument["chain_id"] == chain["id"] and _contract_key(self._instrument_contract(instrument)) == target:
                         candidates.append((chain, instrument))
@@ -1256,13 +1480,15 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Option tick is invalid")
         if self.currency is None:
             await self._portfolio()
-        return {"contract": self._instrument_contract(instrument), "option_id": instrument["id"], "chain_id": chain["id"],
+        result = {"contract": self._instrument_contract(instrument), "option_id": instrument["id"], "chain_id": chain["id"],
                 "bid": str(bid), "ask": str(ask), "tick_size": str(tick), "min_ticks": ticks,
                 "bid_size": raw["bid_size"], "ask_size": raw["ask_size"], "mark": raw["mark_price"],
                 "timestamp": raw["updated_at"], "currency": self.currency, "multiplier": 100,
                 "tradable": instrument["state"] == "active" and instrument["tradability"] == "tradable" and ask > 0 and bid > 0 and raw["ask_size"] > 0 and raw["bid_size"] > 0,
                 "can_open_position": chain["can_open_position"], "asset_type": "equity_option",
                 "sellout_datetime": instrument.get("sellout_datetime"), "source": "Robinhood Agentic MCP"}
+        self._remember_execution_quote(target, result)
+        return result
 
     def _live_enabled(self):
         if self.runtime.get("mode") != "live" or self.config.get("enable_live_orders") is not True:
@@ -1329,12 +1555,14 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Robinhood review fee is invalid") from None
         return review, fee
 
+    @_scope_operation
     async def review(self, order):
         self._live_enabled()
         args, quote = await self._order_args(order)
         review, _ = await self._review_args(args, quote)
         return review
 
+    @_scope_operation
     async def submit(self, order, before_submit=None):
         self._live_enabled()
         client_id = order.get("client_order_id")
@@ -1397,6 +1625,7 @@ class RobinhoodBroker(RobinhoodMCP):
             result = await self._data("place_option_order", dict(args, ref_id=ref_id))
         finally:
             self.account_changed.set()
+            self._invalidate_execution_scope()
         normalized = self._order_result(result.get("order"), client_id, args)
         normalized["ref_id"] = ref_id
         self.order_results[client_id] = normalized
@@ -1447,4 +1676,5 @@ class RobinhoodBroker(RobinhoodMCP):
             or result["status"] != previous.get("status")
         ):
             self.account_changed.set()
+            self._invalidate_execution_scope()
         return result

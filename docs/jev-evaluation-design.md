@@ -1,6 +1,6 @@
 # Fast entry rules, JEV, and Codex fallback
 
-Local verification completed on September 21, 2026. The 471-test regression suite passed with one optional dependency check skipped; that check then passed separately after installing the pinned Discord extra from the local cache. Tests did not use a live trade or model-provider call. Local parsing results do not establish live submission latency.
+Local verification completed on September 21, 2026. The regression suite passed all 484 tests, including the real HTTP key-save flow and broker read-scope checks. A subsequent focused run passed 39 checks, including an added off-thread startup-calendar regression. Tests did not use a live trade or model-provider call. Local parsing results and simulated broker delays do not establish live submission latency.
 
 ## Routing boundaries
 
@@ -39,7 +39,13 @@ flowchart LR
     I --> J[Submit limit order]
 ```
 
-The direct route does not wait for the Codex lock. A fresh account snapshot starts alongside missing-expiry discovery and is reused only within that attempt. Snapshot position metadata and quotes are read in bounded parallel waves; current quotes and execution authority are still refreshed.
+The direct route does not wait for the Codex lock. A fresh account snapshot starts alongside missing-expiry discovery. Expiry lookup requests the earliest eligible listed date first, advancing only if the exact strike/type is unavailable; it checks all matching chains and rejects ambiguity. It does not fetch every later expiry before selecting the nearest one.
+
+Broker reads have a task-local scope covering one serialized decision. Just-resolved contract metadata passes to its first quote lookup. Successful account and quote reads may be reused for at most one second after completion within that scope, subject to their original timestamp checks; the cache does not reset their age. This removes repeated planning-to-submission reads without retaining completed prices or balances for later decisions. Failures, cancellation, completion, or a broker mutation invalidate the scope. Reads outside that scope retain their existing behavior. Position reads and chain lookups use bounded concurrency, and overlapping portfolio requests share only the currently running fetch.
+
+The exchange calendar is initialized in a background thread during broker startup, before signal processing. Market-session checks still run at decision and submission time. A local cold calendar call took 1.057 seconds versus 0.000115 seconds once initialized; those are CPU measurements, not broker-response measurements.
+
+An offline comparison of the same nearest-expiry entry through a fixture broker reduced the request count from 18 to 9. With a simulated 150 ms delay per request and calendars initialized for both versions, elapsed time through the simulated submission fell from 1.372 to 0.758 seconds. This excludes Discord source verification and real provider variability; it is a request-graph regression check, not a live latency claim.
 
 Live execution performs its authoritative source verification at the final pre-submit boundary after broker review, with local checks before and after. A changed source, kill switch, stale quote, account restriction, reduced affordability, excessive chase, or uncertain previous order still prevents placement. Cancellation drains pending reads. The existing order ledger and idempotency rules remain authoritative.
 
