@@ -9,6 +9,7 @@ function relayReadTimeoutSignal() {
 
   const API = Object.freeze({
     status: "/api/status",
+    evaluationMetrics: "/api/evaluation/metrics",
     messages: "/api/messages",
     orders: "/api/orders",
     events: "/api/events",
@@ -40,6 +41,8 @@ function relayReadTimeoutSignal() {
     lastSync: null,
     status: null,
     statusError: null,
+    evaluationMetrics: null,
+    evaluationMetricsError: null,
     panelErrors: new Set(),
     filters: { q: "", channelId: "", state: "" },
     orderStatus: "",
@@ -106,7 +109,8 @@ function relayReadTimeoutSignal() {
     if (["recovery_review", "viable"].includes(stateName)) return "is-recovery";
     if (["recovery_error", "invalidated"].includes(stateName)) return "is-error";
     if (stateName === "not_actionable") return "is-context";
-    if (["held", "pending", "waiting", "review"].includes(stateName)) return "is-held";
+    if (["held", "pending", "waiting", "review", "evaluating"].includes(stateName)) return "is-held";
+    if (["evaluated", "interpretation_ready"].includes(stateName)) return "is-context";
     if (["paper_order", "shadow_proposal", "shadow_order", "broker_order", "filled", "open", "partially_filled", "submitted"].includes(stateName)) return "is-order";
     if (["context", "duplicate", "canceled", "cancelled", "expired"].includes(stateName)) return "is-context";
     if (["rejected", "unknown", "error", "failed"].includes(stateName)) return "is-error";
@@ -237,6 +241,8 @@ function relayReadTimeoutSignal() {
 
   function decisionActionLabel(event) {
     if (event?.state === "error" && !decisionAction(event)) return "Evaluation failed";
+    if (normalized(event?.state) === "evaluating") return "Interpretation in progress";
+    if (["evaluated", "interpretation_ready"].includes(normalized(event?.state))) return `Interpretation ready${decisionAction(event) ? ` · ${humanize(decisionAction(event))}` : ""}`;
     return humanize(decisionAction(event), "No action");
   }
 
@@ -289,33 +295,69 @@ function relayReadTimeoutSignal() {
     return `${Number(hours.toFixed(hours < 10 ? 1 : 0))}h`;
   }
 
+  function formatEvaluationPercent(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) return "unavailable";
+    const percent = number <= 1 ? number * 100 : number;
+    return `${Number(percent.toFixed(percent < 10 ? 1 : 0))}%`;
+  }
+
+  function evaluationTimingValue(event) {
+    const stages = evaluationTimingStages(event);
+    if (stages.length) return stages[stages.length - 1].timing;
+    return {};
+  }
+
+  function evaluationTimingPart(timing, key, label) {
+    const value = Number(timing?.[key]);
+    return Number.isFinite(value) && value >= 0 ? `${label} ${formatEvaluationDuration(value)}` : "";
+  }
+
   function renderEvaluationTiming(parent, event) {
     if (evaluationTimingPending(event)) return;
     const stages = evaluationTimingStages(event);
+    const timing = evaluationTimingValue(event);
+    const stateName = normalized(firstValue(event?.state, readDecision(event).state));
+    const hasTiming = stages.length > 0;
+    if (!hasTiming && !["evaluating", "evaluated", "interpretation_ready", "error", "failed", "recovery_error"].includes(stateName)) return;
+
+    const trace = node("div", "evaluation-trace");
+    const ruleEvaluation = stages.some(({ timing: stage }) => stage.evaluator === "rules"
+      || stage.route === "direct" || stage.model === "deterministic-entry-v1");
+    append(trace, node("div", "evaluation-trace-heading", ruleEvaluation ? "Rule evaluation" : "Model interpretation"));
+
     const labels = [];
     const recovery = isRecoveryEvent(event);
-    if (stages.some(({ kind, timing }) => kind === "recovery" || timing.path === "recovery")) labels.push("Recovered");
-    if (stages.some(({ timing }) => timing.delayed === true)) labels.push("Delayed");
+    if (stages.some(({ kind, timing: stage }) => kind === "recovery" || stage.path === "recovery")) labels.push("Recovered");
+    if (stages.some(({ timing: stage }) => stage.delayed === true)) labels.push("Delayed");
+    if (stages.some(({ timing: stage }) => stage.clock_uncertain === true)) labels.push("Clock uncertain");
     if (recovery && stages.length === 1) labels.push("1 stage recorded");
 
     const modelDurations = stages
-      .map(({ timing }) => Number(timing.model_duration_seconds))
+      .map(({ timing: stage }) => Number(stage.model_duration_seconds))
       .filter((value) => Number.isFinite(value) && value >= 0);
-    const model = modelDurations.length
-      ? `Model evaluation ${formatEvaluationDuration(modelDurations.reduce((sum, value) => sum + value, 0))}`
-      : "Model evaluation not recorded";
+    const ruleDurations = stages
+      .map(({ timing: stage }) => Number(stage.rules_duration_seconds))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const modelSummary = ruleEvaluation
+      ? ruleDurations.length
+        ? `Rule evaluation ${formatEvaluationDuration(ruleDurations.reduce((sum, value) => sum + value, 0))}`
+        : "Rule evaluation not recorded"
+      : modelDurations.length
+        ? `Model evaluation ${formatEvaluationDuration(modelDurations.reduce((sum, value) => sum + value, 0))}`
+        : "Model evaluation not recorded";
 
     const attempts = stages
-      .map(({ timing }) => Number(timing.attempts))
+      .map(({ timing: stage }) => Number(stage.attempts))
       .filter((value) => Number.isInteger(value) && value >= 1 && value <= 2)
       .reduce((sum, value) => sum + value, 0);
     if (attempts > 1) labels.push(`${Math.min(4, attempts)} attempts`);
 
     let latestPosted = null;
-    stages.forEach(({ timing }, index) => {
-      const posted = Number(timing.posted_to_decision_seconds);
+    stages.forEach(({ timing: stage }, index) => {
+      const posted = Number(stage.posted_to_decision_seconds);
       if (!Number.isFinite(posted) || posted < 0) return;
-      const decisionAt = new Date(timing.decision_at || "").getTime();
+      const decisionAt = new Date(stage.decision_at || "").getTime();
       const candidate = { posted, decisionAt: Number.isFinite(decisionAt) ? decisionAt : null, index };
       if (!latestPosted) {
         latestPosted = candidate;
@@ -332,7 +374,68 @@ function relayReadTimeoutSignal() {
     const posted = latestPosted
       ? `Posted → decision ${formatEvaluationDuration(latestPosted.posted)}`
       : "Posted → decision not recorded";
-    append(parent, node("p", "evaluation-timing", [...labels, model, posted].join(" · ")));
+    append(trace, node("p", "evaluation-timing", [...labels, modelSummary, posted].join(" · ")));
+
+    const stageSummaries = stages.map(({ kind, timing: stage }) => {
+      const label = kind === "recovery" || stage.path === "recovery" ? "Recovery" : "Direct";
+      const parts = [
+        evaluationTimingPart(stage, "model_duration_seconds", "Evaluator"),
+        evaluationTimingPart(stage, "rules_duration_seconds", "Rules"),
+        evaluationTimingPart(stage, "interpretation_seconds", "Interpretation"),
+        evaluationTimingPart(stage, "posted_to_decision_seconds", "Posted → decision"),
+      ].filter(Boolean);
+      return parts.length ? `${label} ${parts.join(" · ")}` : `${label} timing recorded`;
+    });
+    if (stageSummaries.length) append(trace, node("p", "evaluation-stages", `Stages ${stageSummaries.join(" · ")}`));
+
+    const provider = firstValue(timing.evaluator, timing.provider, timing.evaluator_name, timing.path);
+    const route = firstValue(timing.route);
+    const fallback = firstValue(timing.fallback_reason);
+    const model = firstValue(timing.model);
+    const providerParts = [
+      provider ? `Evaluator ${humanize(provider)}` : "",
+      route ? `Route ${humanize(route)}` : "",
+      model ? `Model ${safeString(model)}` : "",
+      fallback ? `Fallback ${humanize(fallback)}` : "",
+    ].filter(Boolean);
+    if (providerParts.length) append(trace, node("p", "evaluation-provider", providerParts.join(" · ")));
+    if (timing.jev_shadow_action) append(trace, node("p", "evaluation-provider", `JEV shadow ${humanize(timing.jev_shadow_action)} · ${timing.jev_shadow_agrees ? "agrees with Codex" : "differs from Codex"}`));
+
+    const confidenceParts = [
+      timing.semantic_confidence !== undefined ? `${route === "shadow" ? "JEV shadow semantic" : "Semantic"} ${formatEvaluationPercent(timing.semantic_confidence)}` : "",
+      timing.allocation_confidence !== undefined ? `Allocation ${formatEvaluationPercent(timing.allocation_confidence)}` : "",
+      timing.selected_probability !== undefined ? `Selected ${formatEvaluationPercent(timing.selected_probability)}` : "",
+      timing.native_confidence !== undefined ? `Native ${formatEvaluationPercent(timing.native_confidence)}` : "",
+      timing.eligibility_probability !== undefined ? `Eligibility ${formatEvaluationPercent(timing.eligibility_probability)}` : "",
+    ].filter(Boolean);
+    if (confidenceParts.length) append(trace, node("p", "evaluation-confidence", confidenceParts.join(" · ")));
+
+    const detailParts = [
+      evaluationTimingPart(timing, "queue_wait_seconds", "Queue"),
+      evaluationTimingPart(timing, "posted_to_receipt_seconds", "Posted → received"),
+      evaluationTimingPart(timing, "preparation_seconds", "Preparation"),
+      evaluationTimingPart(timing, "jev_duration_seconds", "JEV"),
+      evaluationTimingPart(timing, "codex_duration_seconds", "Codex"),
+      evaluationTimingPart(timing, "interpretation_seconds", "Interpretation"),
+      evaluationTimingPart(timing, "posted_to_interpretation_seconds", "Posted → interpretation"),
+      evaluationTimingPart(timing, "execution_wait_seconds", "Execution wait"),
+      evaluationTimingPart(timing, "execution_seconds", "Execution"),
+      evaluationTimingPart(timing, "snapshot_seconds", "Snapshot"),
+      evaluationTimingPart(timing, "quote_seconds", "Quote"),
+      evaluationTimingPart(timing, "source_verification_seconds", "Source verification"),
+      evaluationTimingPart(timing, "contract_resolution_seconds", "Contract resolution"),
+      evaluationTimingPart(timing, "submission_seconds", "Submission"),
+      evaluationTimingPart(timing, "received_to_submission_seconds", "Received → submission"),
+      evaluationTimingPart(timing, "posted_to_submission_seconds", "Posted → submission"),
+    ].filter(Boolean);
+    if (timing.interpretation_ready_at) detailParts.push(`Ready ${formatDate(timing.interpretation_ready_at, true)}`);
+    if (detailParts.length) append(trace, node("p", "evaluation-detail", detailParts.join(" · ")));
+
+    if (!providerParts.length && !confidenceParts.length && !detailParts.length && !stageSummaries.length) {
+      append(trace, node("p", "evaluation-detail", stateName === "evaluating" ? "Interpretation in progress." : "Interpretation ready; timing not recorded."));
+    }
+    append(trace, node("p", "evaluation-boundary", "Final broker result is recorded separately from model interpretation."));
+    append(parent, trace);
   }
 
   function isRecoveryEvent(event) {
@@ -558,6 +661,142 @@ function relayReadTimeoutSignal() {
     });
   }
 
+  function metricObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  }
+
+  function metricNumber(value) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  function evaluationMetricsRoot() {
+    const status = state.status || {};
+    const candidates = [
+      status.evaluation_metrics,
+      status.metrics?.evaluation,
+      status.metrics?.evaluation_metrics,
+      status.evaluation?.metrics,
+      status.evaluation?.summary,
+      status.evaluation_summary,
+      state.evaluationMetrics,
+      state.evaluationMetrics?.evaluation_metrics,
+    ];
+    return candidates.find((value) => metricObject(value)) || null;
+  }
+
+  function evaluationMetricsBucket(root) {
+    if (!root) return null;
+    const buckets = metricObject(root.buckets);
+    const candidates = [
+      root.recent,
+      root.live,
+      root.historical,
+      root.recovery,
+      buckets?.recent,
+      buckets?.live,
+      buckets?.historical,
+      buckets?.recovery,
+    ];
+    return candidates.find((value) => metricObject(value)) || null;
+  }
+
+  function evaluationMetricsBucketName(root) {
+    if (!root) return null;
+    const buckets = metricObject(root.buckets);
+    const candidates = [
+      ["recent", root.recent],
+      ["live", root.live],
+      ["historical", root.historical],
+      ["recovery", root.recovery],
+      ["recent", buckets?.recent],
+      ["live", buckets?.live],
+      ["historical", buckets?.historical],
+      ["recovery", buckets?.recovery],
+    ];
+    return candidates.find(([, value]) => metricObject(value))?.[0] || null;
+  }
+
+  function metricPercent(value) {
+    const number = metricNumber(value);
+    if (number === null) return "—";
+    const ratio = number > 1 ? number / 100 : number;
+    return `${Number((ratio * 100).toFixed(ratio * 100 < 10 ? 1 : 0))}%`;
+  }
+
+  function metricTiming(bucket, names) {
+    const timings = metricObject(bucket?.timings) || {};
+    for (const name of names) {
+      const summary = metricObject(timings[name]) || metricObject(bucket?.[name]);
+      if (summary) return summary;
+    }
+    return null;
+  }
+
+  function metricTimingValue(summary, key) {
+    const value = metricNumber(summary?.[key]);
+    return value === null ? "—" : formatEvaluationDuration(value);
+  }
+
+  function metricTimingTriplet(summary) {
+    if (!summary) return "— / — / —";
+    return ["p50", "p95", "p99"].map((key) => metricTimingValue(summary, key)).join(" / ");
+  }
+
+  function metricRatio(value, numerator, denominator) {
+    const direct = metricNumber(value);
+    if (direct !== null) return direct;
+    const top = metricNumber(numerator);
+    const bottom = metricNumber(denominator);
+    return top !== null && bottom > 0 ? top / bottom : null;
+  }
+
+  function renderEvaluationMetrics() {
+    const root = evaluationMetricsRoot();
+    const bucket = evaluationMetricsBucket(root);
+    const available = Boolean(bucket && Object.keys(bucket).length);
+    const total = metricNumber(bucket?.total ?? bucket?.count);
+    const evaluated = metricNumber(bucket?.evaluated);
+    const eligible = metricNumber(bucket?.eligible);
+    const fastPath = metricNumber(bucket?.fast_path);
+    const direct = metricNumber(bucket?.direct);
+    const jev = metricNumber(bucket?.jev);
+    const fastCoverage = metricRatio(bucket?.coverage?.fast_path, fastPath, total);
+    const eligibleCoverage = metricRatio(bucket?.coverage?.eligible, fastPath, eligible);
+    const directCoverage = metricRatio(bucket?.coverage?.direct, direct, total);
+    const jevCoverage = metricRatio(bucket?.coverage?.jev, jev, total);
+    const fallback = metricNumber(bucket?.fallback);
+    const failures = metricNumber(bucket?.failures);
+    const timeouts = metricNumber(bucket?.timeouts);
+    const interpretation = metricTiming(bucket, ["interpretation_seconds"]);
+    const brokerAck = metricTiming(bucket, ["broker_ack_seconds"]);
+    const fills = metricTiming(bucket, ["fill_seconds"]);
+
+    setText("#evaluation-summary-count", total === null ? "—" : formatNumber(total));
+    setText("#evaluation-summary-count-detail", available
+      ? `${evaluated === null ? "—" : formatNumber(evaluated)} evaluated · ${eligible === null ? "—" : formatNumber(eligible)} eligible`
+      : "Aggregate unavailable");
+    setText("#evaluation-summary-fast-path", metricPercent(fastCoverage));
+    setText("#evaluation-summary-fast-path-detail", available
+      ? `Eligible coverage ${eligibleCoverage === null ? "—" : metricPercent(eligibleCoverage)} · Direct ${direct === null ? "—" : formatNumber(direct)} (${metricPercent(directCoverage)}) · JEV ${jev === null ? "—" : formatNumber(jev)} (${metricPercent(jevCoverage)})`
+      : "Direct and JEV coverage unavailable");
+    setText("#evaluation-summary-fallback", fallback === null ? "—" : formatNumber(fallback));
+    setText("#evaluation-summary-fallback-detail", available
+      ? `Errors ${failures === null ? "—" : formatNumber(failures)} · timeouts ${timeouts === null ? "—" : formatNumber(timeouts)}`
+      : "No aggregate detail");
+    setText("#evaluation-summary-interpretation", metricTimingTriplet(interpretation));
+    setText("#evaluation-summary-interpretation-detail", interpretation ? "Seconds · p50 / p95 / p99" : "Interpretation timing unavailable");
+    setText("#evaluation-summary-broker", `${metricTimingValue(brokerAck, "p50")} / ${metricTimingValue(fills, "p50")}`);
+    setText("#evaluation-summary-broker-detail", brokerAck || fills
+      ? `Ack p95/p99 ${metricTimingValue(brokerAck, "p95")} / ${metricTimingValue(brokerAck, "p99")} · fill p95/p99 ${metricTimingValue(fills, "p95")} / ${metricTimingValue(fills, "p99")}`
+      : "Final broker timing unavailable");
+    const window = firstValue(root?.window, root?.scope, bucket?.window, bucket?.scope, evaluationMetricsBucketName(root));
+    const windowLabel = typeof window === "object" ? firstValue(window.label, window.name, window.limit && `last ${window.limit}`) : window;
+    setText("#evaluation-summary-window", safeString(windowLabel, "RECENT").toUpperCase());
+    setText("#evaluation-summary-detail", available
+      ? `Bounded ${safeString(windowLabel, "recent")} aggregate · per-message interpretation traces remain authoritative for individual records.`
+      : "Aggregate evaluation metrics unavailable; per-message interpretation traces remain available.");
+  }
+
   function runtimePart(name) {
     return state.status?.runtime?.[name] || state.status?.[name] || {};
   }
@@ -585,6 +824,7 @@ function relayReadTimeoutSignal() {
     const channelCount = configured.length || runtimeChannels.length;
 
     renderMetrics();
+    renderEvaluationMetrics();
     renderChannelOptions();
     renderRecoveryStateOptions();
     setText("#runtime-updated", updatedAt ? `Runtime ${formatRelative(updatedAt)} · ${formatDate(updatedAt, true)}` : "Runtime timestamp unavailable");
@@ -982,6 +1222,7 @@ function relayReadTimeoutSignal() {
       const created = node("time", "event-time", formatDate(firstValue(event.created_at, event.timestamp)));
       if (event.created_at) created.dateTime = event.created_at;
       append(row, stateNode, reason, action, created);
+      renderEvaluationTiming(row, event);
       list.appendChild(row);
     });
     setText("#events-range", rangeText("events"));
@@ -1019,6 +1260,19 @@ function relayReadTimeoutSignal() {
     } catch (error) {
       state.statusError = error;
       renderConnection();
+      return false;
+    }
+  }
+
+  async function loadEvaluationMetrics() {
+    try {
+      state.evaluationMetrics = await request(API.evaluationMetrics);
+      state.evaluationMetricsError = null;
+      renderEvaluationMetrics();
+      return true;
+    } catch (error) {
+      state.evaluationMetricsError = error;
+      renderEvaluationMetrics();
       return false;
     }
   }
@@ -1140,6 +1394,7 @@ function relayReadTimeoutSignal() {
     try {
       const results = await Promise.allSettled([
         loadStatus(),
+        loadEvaluationMetrics(),
         loadMessages(),
         loadOrders(),
         loadRelationshipOrders(),
@@ -1276,7 +1531,9 @@ function relayReadTimeoutSignal() {
     expiryPolicyInFlight: false,
     expiryPolicyDirty: false,
     evaluationDirty: false,
+    evaluationJevDirty: false,
     evaluationInFlight: false,
+    evaluationTestInFlight: false,
     modeChangeInFlight: false,
     modeReturnFocus: null,
     discoveryRequestInFlight: false,
@@ -1341,6 +1598,8 @@ function relayReadTimeoutSignal() {
       disabled: "Disabled",
       pending: "Pending",
       sent: "Sent",
+      unavailable: "Unavailable",
+      needs_attention: "Needs attention",
     };
     if (provider === "discord" && ["connected", "existing_connected"].includes(setupStateName(value))) return "Signed in";
     return labels[setupStateName(value)] || setupText(value, "Unknown");
@@ -1348,7 +1607,7 @@ function relayReadTimeoutSignal() {
   const setupStatusClass = (value) => {
     const stateName = setupStateName(value);
     if (["connected", "existing_connected", "configured", "enabled", "sent"].includes(stateName)) return "is-order";
-    if (["failed", "error"].includes(stateName)) return "is-error";
+    if (["failed", "error", "unavailable", "needs_attention", "auth_error"].includes(stateName)) return "is-error";
     if (["starting", "waiting", "paused", "stopped", "pending_reload", "pending"].includes(stateName)) return "is-held";
     return "is-context";
   };
@@ -1758,7 +2017,7 @@ function relayReadTimeoutSignal() {
       authors: restrict ? setupSelectedAuthorIds(row) : [],
     };
   });
-  const setupRenderEvaluation = (value) => {
+  const setupRenderEvaluationLegacy = (value) => {
     const settings = value || {};
     const saving = setupState.evaluationInFlight || setupState.expiryPolicyInFlight;
     const values = { "evaluation-model": settings.model || "", "evaluation-effort": settings.reasoning_effort || "medium",
@@ -1775,6 +2034,60 @@ function relayReadTimeoutSignal() {
       save.textContent = setupState.evaluationInFlight ? "Saving…" : setupState.status?.paused === false ? "Pause and save evaluation settings" : "Save evaluation settings";
     }
   };
+  const setupRenderEvaluation = (value) => {
+    const settings = value && typeof value === "object" ? value : {};
+    const jev = settings.jev && typeof settings.jev === "object" ? settings.jev : settings;
+    const saving = setupState.evaluationInFlight || setupState.expiryPolicyInFlight;
+    const testing = setupState.evaluationTestInFlight;
+    const percentValue = (current, fallback) => {
+      const number = Number(current ?? fallback);
+      return Number.isFinite(number) ? (number <= 1 ? number * 100 : number) : fallback * 100;
+    };
+    const values = {
+      "evaluation-model": settings.model || "",
+      "evaluation-effort": settings.reasoning_effort || "medium",
+      "evaluation-tier": settings.service_tier || "standard",
+      "evaluation-chase": Number(settings.max_chase_fraction ?? 0.10) * 100,
+      "evaluation-mode": jev.mode || "codex",
+      "evaluation-direct-entries": settings.direct_entries ?? jev.direct_entries ?? true,
+      "evaluation-timeout": Number(jev.timeout_ms ?? 1200),
+      "evaluation-min-confidence": percentValue(jev.min_confidence, 0.95),
+      "evaluation-min-probability": percentValue(jev.min_probability, 0.95),
+      "evaluation-min-eligibility": percentValue(jev.min_eligibility, 0.98),
+    };
+    Object.entries(values).forEach(([id, current]) => {
+      const field = setupById(id);
+      if (!field) return;
+      if (!setupState.evaluationDirty && !saving) {
+        if (field.type === "checkbox") field.checked = Boolean(current);
+        else field.value = String(current);
+      }
+      field.disabled = saving || testing;
+    });
+    const statusValue = setupFirst(jev.state, jev.status, jev.credential_configured === true ? "configured" : "not_configured");
+    setupSetStatus("jev-provider-status", statusValue, "jev");
+    const credentialConfigured = jev.credential_configured === true;
+    setupSetText("jev-credential-state", credentialConfigured ? "Credential configured" : "Credential not configured");
+    const directEntries = settings.direct_entries ?? jev.direct_entries ?? true;
+    const modeLabel = {
+      codex: directEntries ? "Codex fallback" : "Codex only",
+      jev_shadow: "JEV shadow comparison",
+      jev: "JEV with Codex fallback",
+    }[setupText(jev.mode, "codex")] || (directEntries ? "Codex fallback" : "Codex only");
+    const detail = setupDetail(jev, credentialConfigured ? `${modeLabel} · ${setupText(jev.model, "jev-latest")}` : `${modeLabel} · TypeSafe credential required`);
+    setupSetText("jev-provider-detail", detail);
+    const save = setupById("save-evaluation");
+    if (save) {
+      save.disabled = saving || testing;
+      save.textContent = setupState.evaluationInFlight ? "Saving…" : setupState.status?.paused === false ? "Pause and save evaluation settings" : "Save evaluation settings";
+    }
+    const test = setupById("test-evaluation");
+    if (test) {
+      test.disabled = saving || testing;
+      test.textContent = testing ? "Testing…" : "Test JEV connection";
+    }
+  };
+
   const setupRenderRisk = (risk) => {
     const container = setupById("risk-context");
     if (!container || !risk || typeof risk !== "object") return;
@@ -2075,7 +2388,7 @@ function relayReadTimeoutSignal() {
   const setupSchedulePoll = () => {
     if (setupState.pollTimer) window.clearTimeout(setupState.pollTimer);
     const activeTrading = setupTradingStatus(setupState.status);
-    const active = setupState.authActive.codex || setupState.authActive.robinhood || setupState.modeChangeInFlight || setupState.notificationsSaveInFlight || setupState.discordSaveInFlight || activeTrading.pending || setupById("browser-login-dialog")?.open || setupState.discoveryRequestInFlight || setupState.discovery.state === "waiting";
+    const active = setupState.authActive.codex || setupState.authActive.robinhood || setupState.modeChangeInFlight || setupState.notificationsSaveInFlight || setupState.discordSaveInFlight || setupState.evaluationTestInFlight || activeTrading.pending || setupById("browser-login-dialog")?.open || setupState.discoveryRequestInFlight || setupState.discovery.state === "waiting";
     setupState.pollTimer = window.setTimeout(async () => {
       await setupLoadStatus();
       setupSchedulePoll();
@@ -2155,7 +2468,7 @@ function relayReadTimeoutSignal() {
       setupRenderEvaluation(setupState.status?.evaluation || status.evaluation);
     }
   };
-  const setupSaveEvaluation = async () => {
+  const setupSaveEvaluationLegacy = async () => {
     if (setupState.evaluationInFlight || setupState.expiryPolicyInFlight) return;
     const status = setupState.status || {};
     if (!setupState.csrfToken) {
@@ -2182,6 +2495,98 @@ function relayReadTimeoutSignal() {
       setupRenderStatus(setupState.status || status);
     }
   };
+  const setupSaveEvaluation = async () => {
+    if (setupState.evaluationInFlight || setupState.expiryPolicyInFlight) return;
+    const status = setupState.status || {};
+    if (!setupState.csrfToken) {
+      setupSetFeedback("evaluation-feedback", "Wait for setup status, then save again.", "error");
+      return;
+    }
+    const percent = (id, fallback) => {
+      const value = Number(setupById(id)?.value);
+      return Number.isFinite(value) ? value / 100 : fallback;
+    };
+    const timeout = Number(setupById("evaluation-timeout")?.value);
+    const minConfidence = percent("evaluation-min-confidence", 0.95);
+    const minProbability = percent("evaluation-min-probability", 0.95);
+    const minEligibility = percent("evaluation-min-eligibility", 0.98);
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1200 || [minConfidence, minProbability, minEligibility].some((value) => value <= 0 || value > 1)) {
+      setupSetFeedback("evaluation-feedback", "JEV deadline must be 1–1200 ms and thresholds must be greater than 0 and at most 100%.", "error");
+      return;
+    }
+    const jevSettings = {
+      mode: setupById("evaluation-mode").value,
+      direct_entries: Boolean(setupById("evaluation-direct-entries")?.checked),
+      model: "jev-latest",
+      timeout_ms: timeout,
+      min_confidence: minConfidence,
+      min_probability: minProbability,
+      min_eligibility: minEligibility,
+    };
+    const body = {
+      model: setupById("evaluation-model").value.trim() || null,
+      reasoning_effort: setupById("evaluation-effort").value,
+      service_tier: setupById("evaluation-tier").value,
+      max_chase_fraction: String(Number(setupById("evaluation-chase").value) / 100),
+    };
+    const key = setupText(setupById("evaluation-typesafe-key")?.value, "").trim();
+    const currentJev = status.evaluation?.jev;
+    if ((currentJev && typeof currentJev === "object") || setupState.evaluationJevDirty || key) body.evaluation = jevSettings;
+    if (key) body.typesafe_api_key = key;
+    setupState.evaluationInFlight = true;
+    setupSetFeedback("evaluation-feedback", "Saving…");
+    setupRenderStatus(status);
+    try {
+      if (status.paused !== true) {
+        const paused = await setupPost("/api/setup/pause", { paused: true }, "evaluation-feedback");
+        if (!paused || paused.paused !== true) return;
+      }
+      if (await setupPost("/api/setup/evaluation", body, "evaluation-feedback")) {
+        setupState.evaluationDirty = false;
+        setupState.evaluationJevDirty = false;
+        const keyInput = setupById("evaluation-typesafe-key");
+        if (keyInput) keyInput.value = "";
+        setupSetFeedback("evaluation-feedback", "Evaluation settings saved. Resume after the worker reloads.", "success");
+      }
+    } finally {
+      setupState.evaluationInFlight = false;
+      setupRenderStatus(setupState.status || status);
+    }
+  };
+
+  const setupTestEvaluation = async () => {
+    if (setupState.evaluationTestInFlight || setupState.evaluationInFlight) return;
+    if (!setupState.csrfToken) {
+      setupSetFeedback("evaluation-jev-feedback", "Wait for setup status, then test again.", "error");
+      return;
+    }
+    setupState.evaluationTestInFlight = true;
+    setupSetFeedback("evaluation-jev-feedback", "Running synthetic JEV classification…");
+    setupRenderEvaluation(setupState.status?.evaluation || {});
+    try {
+      const payload = await setupJson("/api/setup/evaluation/test", { method: "POST", body: {} });
+      const returnedStatus = payload?.setup && typeof payload.setup === "object"
+        ? payload.setup
+        : payload?.evaluation && typeof payload.evaluation === "object" && payload?.configured !== undefined
+          ? payload
+          : null;
+      if (returnedStatus) setupRenderStatus(returnedStatus);
+      const result = payload?.result && typeof payload.result === "object" ? payload.result : payload || {};
+      const stateName = setupText(result.state || result.status, "completed");
+      const latency = Number(result.latency_ms);
+      const detail = setupText(result.detail, setupText(result.message, "Synthetic classification completed."));
+      const suffix = Number.isFinite(latency) && latency >= 0 ? ` · ${Math.round(latency)} ms` : "";
+      const kind = ["ok", "ready", "configured", "connected", "completed", "success", "passed"].includes(setupStateName(stateName)) ? "success" : "";
+      const displayState = setupText(stateName, "completed").replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+      setupSetFeedback("evaluation-jev-feedback", `JEV test ${displayState}${suffix}: ${detail}`, kind);
+    } catch (error) {
+      setupSetFeedback("evaluation-jev-feedback", `JEV test failed: ${setupText(error?.message, "request failed")}`, "error");
+    } finally {
+      setupState.evaluationTestInFlight = false;
+      setupRenderEvaluation(setupState.status?.evaluation || {});
+    }
+  };
+
   const setupReadNotifications = () => {
     const body = { enabled: Boolean(setupById("notifications-enabled")?.checked) };
     const webhookUrl = setupText(setupById("notifications-webhook")?.value, "").trim();
@@ -2491,14 +2896,22 @@ function relayReadTimeoutSignal() {
       setupRenderRisk(setupState.status?.risk);
     });
     setupById("save-expiry-policy")?.addEventListener("click", setupSaveExpiryPolicy);
-    setupById("evaluation-form")?.addEventListener("input", () => {
+    const jevFieldIds = new Set(["evaluation-mode", "evaluation-direct-entries", "evaluation-typesafe-key", "evaluation-timeout", "evaluation-min-confidence", "evaluation-min-probability", "evaluation-min-eligibility"]);
+    setupById("evaluation-form")?.addEventListener("input", (event) => {
       setupState.evaluationDirty = true;
+      if (jevFieldIds.has(event.target?.id)) setupState.evaluationJevDirty = true;
+      setupSetFeedback("evaluation-feedback", "Unsaved changes.");
+    });
+    setupById("evaluation-form")?.addEventListener("change", (event) => {
+      setupState.evaluationDirty = true;
+      if (jevFieldIds.has(event.target?.id)) setupState.evaluationJevDirty = true;
       setupSetFeedback("evaluation-feedback", "Unsaved changes.");
     });
     setupById("evaluation-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       setupSaveEvaluation();
     });
+    setupById("test-evaluation")?.addEventListener("click", setupTestEvaluation);
     setupById("pause-relay")?.addEventListener("click", async () => {
       const paused = Boolean(setupState.status?.paused);
       const status = await setupPost("/api/setup/pause", { paused: !paused }, "control-feedback");

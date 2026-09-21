@@ -19,7 +19,7 @@
     }
   ],
   "discord": {
-    "transport": "browser",
+    "transport": "gateway",
     "token_store": "state/discord-user.json",
     "token_env": "DISCORD_USER_TOKEN"
   },
@@ -66,5 +66,15 @@
     "access_token_env": "ROBINHOOD_ACCESS_TOKEN",
     "timeout_seconds": 30,
     "token_store": "state/robinhood-oauth.json"
+  },
+  "evaluation": {
+    "mode": "codex",
+    "direct_entries": true,
+    "model": "jev-latest",
+    "timeout_ms": 1200,
+    "min_confidence": 0.95,
+    "min_probability": 0.95,
+    "min_eligibility": 0.98,
+    "api_key_file": "state/typesafe.key"
   }
 }

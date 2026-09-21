@@ -261,6 +261,7 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_routes_baseline_to_recovery_and_shuts_down_cleanly(self):
         from relay.cli import run
+        self.config["discord"]["transport"] = "browser"
         recovery = self.evaluator()
         message = self.message() | {"ingestion": "baseline", "ingestion_reason": "baseline"}
         self.config["channels"][0]["guild_id"] = "1545000000000000001"

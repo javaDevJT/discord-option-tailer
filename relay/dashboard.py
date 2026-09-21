@@ -25,7 +25,7 @@ MAX_OFFSET = 100_000
 RUNTIME_STALE_SECONDS = 30
 IMAGE_PREVIEW_SLOTS = threading.BoundedSemaphore(2)
 MESSAGE_STATES = frozenset({
-    "observed", "context", "ignore", "wait", "open", "reduce", "close", "update_stop",
+    "observed", "evaluating", "evaluated", "context", "ignore", "wait", "open", "reduce", "close", "update_stop",
     "shadow_order", "paper_order", "broker_order", "held", "unknown", "error", "duplicate",
     "invalid", "untrusted", "recovery_pending", "recovery_evaluating", "recovery_review",
     "recovery_error",
@@ -279,19 +279,65 @@ def _project_recovery_facts(value):
 def _project_evaluation_timing(value):
     timing = _json_object(value)
     result = {}
-    for key in ("model_duration_seconds", "posted_to_decision_seconds"):
+    for key in (
+        "model_duration_seconds", "rules_duration_seconds", "posted_to_receipt_seconds", "posted_to_interpretation_seconds",
+        "posted_to_decision_seconds", "jev_duration_seconds",
+        "codex_duration_seconds", "queue_wait_seconds", "preparation_seconds",
+        "interpretation_seconds", "execution_wait_seconds", "execution_seconds",
+        "snapshot_seconds", "quote_seconds", "source_verification_seconds",
+        "contract_resolution_seconds", "submission_seconds", "received_to_submission_seconds",
+        "posted_to_submission_seconds",
+        "broker_ack_seconds", "fill_seconds",
+    ):
         number = timing.get(key)
         if type(number) in (int, float) and not isinstance(number, bool) and math.isfinite(number) and 0 <= number <= 315_360_000:
+            result[key] = number
+    for key in (
+        "semantic_confidence", "allocation_confidence", "selected_probability",
+        "native_confidence", "eligibility_probability",
+    ):
+        number = timing.get(key)
+        if type(number) in (int, float) and not isinstance(number, bool) and math.isfinite(number) and 0 <= number <= 1:
             result[key] = number
     attempts = timing.get("attempts")
     if type(attempts) is int and 1 <= attempts <= 2:
         result["attempts"] = attempts
-    decision_at = _safe_timestamp(timing.get("decision_at"))
-    if decision_at is not None:
-        result["decision_at"] = decision_at
+    for key in ("decision_at", "received_at", "interpretation_ready_at", "broker_result_at"):
+        timestamp = _safe_timestamp(timing.get(key))
+        if timestamp is not None:
+            result[key] = timestamp
     path = _safe_text(timing.get("path"), 32)
-    if path in {"direct", "recovery"}:
+    if path in {"direct", "recovery", "historical"}:
         result["path"] = path
+    for key in ("evaluator", "provider"):
+        provider = _safe_text(timing.get(key), 32).lower()
+        if provider in {"rules", "jev", "codex", "synthetic"}:
+            result[key] = provider
+    route = _safe_text(timing.get("route"), 32).lower()
+    if route in {"direct", "jev", "codex", "fallback", "shadow"}:
+        result["route"] = route
+    fallback_reason = _safe_identifier(timing.get("fallback_reason"), 64).lower()
+    if fallback_reason and re.fullmatch(r"[a-z0-9_.:-]{1,64}", fallback_reason):
+        result["fallback_reason"] = fallback_reason
+    model = _safe_identifier(timing.get("model"), 128)
+    if model:
+        result["model"] = model
+    jev_model = _safe_identifier(timing.get("jev_model"), 128)
+    if jev_model:
+        result["jev_model"] = jev_model
+    if isinstance(timing.get("jev_shadow_action"), str) and timing["jev_shadow_action"] in {"OPEN", "REDUCE", "CLOSE", "WAIT", "IGNORE", "UPDATE_STOP"}:
+        result["jev_shadow_action"] = timing["jev_shadow_action"]
+    if type(timing.get("jev_shadow_agrees")) is bool:
+        result["jev_shadow_agrees"] = timing["jev_shadow_agrees"]
+    broker_result_status = _safe_identifier(timing.get("broker_result_status"), 32).lower()
+    if broker_result_status in {
+        "accepted", "rejected", "unknown", "filled", "submitted", "canceled", "error",
+        "open", "partially_filled", "pending", "expired",
+    }:
+        result["broker_result_status"] = broker_result_status
+    for key in ("eligible", "fast_path", "timed_out", "clock_uncertain"):
+        if type(timing.get(key)) is bool:
+            result[key] = timing[key]
     if type(timing.get("delayed")) is bool:
         result["delayed"] = timing["delayed"]
     return result
@@ -497,6 +543,29 @@ def _safe_runtime_section(value):
     return result
 
 
+def _safe_evaluation_runtime_section(value):
+    result = _safe_runtime_section(value)
+    section = value if isinstance(value, dict) else {}
+    for key in ("evaluator", "provider"):
+        provider = _safe_text(section.get(key), 32).lower()
+        if provider in {"rules", "jev", "codex", "synthetic"}:
+            result[key] = provider
+    route = _safe_text(section.get("route"), 32).lower()
+    if route in {"direct", "jev", "codex", "fallback", "shadow"}:
+        result["route"] = route
+    fallback_reason = _safe_identifier(section.get("fallback_reason"), 64).lower()
+    if fallback_reason and re.fullmatch(r"[a-z0-9_.:-]{1,64}", fallback_reason):
+        result["fallback_reason"] = fallback_reason
+    model = _safe_identifier(section.get("model"), 128)
+    if model:
+        result["model"] = model
+    for key in ("received_at", "interpretation_ready_at"):
+        timestamp = _safe_timestamp(section.get(key))
+        if timestamp is not None:
+            result[key] = timestamp
+    return result
+
+
 def _safe_runtime(raw, path):
     unavailable = {
         "available": False,
@@ -506,6 +575,7 @@ def _safe_runtime(raw, path):
         "discord": {"state": "unknown", "channels": []},
         "codex": {"state": "unknown"},
         "broker": {"state": "unknown"},
+        "evaluation": {"state": "unknown"},
     }
     if path is None or not path.is_file():
         return unavailable
@@ -547,8 +617,152 @@ def _safe_runtime(raw, path):
         "discord": {"state": _safe_state(discord.get("state")), "detail": _safe_detail(discord.get("detail")), "channels": channels},
         "codex": _safe_runtime_section(value.get("codex")),
         "broker": _safe_runtime_section(value.get("broker")),
+        "jev": _safe_runtime_section(value.get("jev")),
+        "evaluation": _safe_evaluation_runtime_section(value.get("evaluation")),
     }
     return result
+
+
+EVALUATION_METRIC_DURATION_FIELDS = (
+    "model_duration_seconds", "rules_duration_seconds", "posted_to_receipt_seconds", "posted_to_interpretation_seconds",
+    "posted_to_decision_seconds", "queue_wait_seconds",
+    "preparation_seconds", "jev_duration_seconds", "codex_duration_seconds",
+    "interpretation_seconds", "execution_wait_seconds", "execution_seconds",
+    "snapshot_seconds", "quote_seconds", "source_verification_seconds",
+    "contract_resolution_seconds", "submission_seconds", "received_to_submission_seconds",
+    "posted_to_submission_seconds",
+    "broker_ack_seconds", "fill_seconds",
+)
+
+
+def _metric_percentile(values, percentile):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * percentile))))
+    return ordered[index]
+
+
+def _empty_evaluation_metric_bucket():
+    return {
+        "total": 0,
+        "evaluated": 0,
+        "eligible": 0,
+        "fast_path": 0,
+        "direct": 0,
+        "jev": 0,
+        "fallback": 0,
+        "failures": 0,
+        "timeouts": 0,
+        "routes": {},
+        "fallback_reasons": {},
+        "under_2s": {"count": 0, "denominator": 0, "rate": None},
+        "coverage": {"fast_path": None, "eligible": None, "direct": None, "jev": None},
+        "timings": {key: {"count": 0, "p50": None, "p95": None, "p99": None}
+                    for key in EVALUATION_METRIC_DURATION_FIELDS},
+    }
+
+
+def _aggregate_evaluation_samples(samples):
+    buckets = {name: _empty_evaluation_metric_bucket()
+               for name in ("live", "historical", "recovery")}
+    for sample in samples:
+        bucket = buckets[sample["bucket"]]
+        bucket["total"] += 1
+        bucket["evaluated"] += int(sample["evaluated"])
+        timing = sample["timing"]
+        if timing.get("eligible") is True:
+            bucket["eligible"] += 1
+        fast_path = timing.get("fast_path") is True or timing.get("route") == "jev"
+        if fast_path:
+            bucket["fast_path"] += 1
+        route = timing.get("route") or timing.get("evaluator") or "unknown"
+        if route == "direct" or timing.get("evaluator") == "rules":
+            bucket["direct"] += 1
+        if route == "jev" or timing.get("evaluator") == "jev":
+            bucket["jev"] += 1
+        bucket["routes"][route] = bucket["routes"].get(route, 0) + 1
+        reason = timing.get("fallback_reason")
+        is_fallback = route == "fallback" or bool(reason)
+        if is_fallback:
+            bucket["fallback"] += 1
+            if reason:
+                bucket["fallback_reasons"][reason] = bucket["fallback_reasons"].get(reason, 0) + 1
+        if sample["failed"]:
+            bucket["failures"] += 1
+        if sample["timed_out"]:
+            bucket["timeouts"] += 1
+        for key in EVALUATION_METRIC_DURATION_FIELDS:
+            value = timing.get(key)
+            if type(value) in (int, float) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                bucket["timings"][key].setdefault("_values", []).append(value)
+        final_seconds = timing.get("posted_to_decision_seconds")
+        if type(final_seconds) in (int, float) and not isinstance(final_seconds, bool) and math.isfinite(final_seconds) and final_seconds <= 2:
+            bucket["under_2s"]["count"] += 1
+    for bucket in buckets.values():
+        bucket["under_2s"]["denominator"] = bucket["total"]
+        if bucket["total"]:
+            bucket["under_2s"]["rate"] = bucket["under_2s"]["count"] / bucket["total"]
+            bucket["coverage"]["fast_path"] = bucket["fast_path"] / bucket["total"]
+            bucket["coverage"]["direct"] = bucket["direct"] / bucket["total"]
+            bucket["coverage"]["jev"] = bucket["jev"] / bucket["total"]
+        if bucket["eligible"]:
+            bucket["coverage"]["eligible"] = bucket["fast_path"] / bucket["eligible"]
+        for key, summary in bucket["timings"].items():
+            values = summary.pop("_values", [])
+            summary["count"] = len(values)
+            summary["p50"] = _metric_percentile(values, 0.50)
+            summary["p95"] = _metric_percentile(values, 0.95)
+            summary["p99"] = _metric_percentile(values, 0.99)
+    return buckets
+
+
+_EVALUATION_TIMEOUT_REASONS = frozenset({
+    "deadline", "timeout", "timed_out", "jev_timeout", "provider_timeout",
+})
+
+
+def _evaluation_metric_sample(row):
+    """Project one durable event into the bounded public metrics contract."""
+    decision = _json_object(row["decision"])
+    top_timing = _json_object(decision.get("evaluation_timing"))
+    recovery = _json_object(decision.get("recovery"))
+    recovery_timing = _json_object(recovery.get("evaluation_timing"))
+    state = _safe_state(row["state"])
+    recovery_row = (
+        state.startswith("recovery")
+        or top_timing.get("path") == "recovery"
+        or recovery_timing.get("path") == "recovery"
+    )
+    timing = recovery_timing if recovery_row and recovery_timing else top_timing
+    timing = _project_evaluation_timing(timing)
+    body = _json_object(row["message_body"])
+    historical = (
+        not recovery_row
+        and timing.get("path") == "historical"
+    )
+    if not recovery_row and not historical:
+        ingestion = body.get("ingestion")
+        source = body.get("source")
+        historical = (
+            ingestion is not None and ingestion != "live"
+        ) or (
+            source is not None and source not in {"browser", "gateway"}
+        )
+    bucket = "recovery" if recovery_row else "historical" if historical else "live"
+    reason = _safe_text(row["reason"], 4000).lower()
+    fallback_reason = timing.get("fallback_reason")
+    timed_out = timing.get("timed_out") is True or fallback_reason in _EVALUATION_TIMEOUT_REASONS
+    if not timed_out and any(token in reason for token in ("timed out", "timeout", "deadline exceeded")):
+        timed_out = True
+    return {
+        "bucket": bucket,
+        "timing": timing,
+        "evaluated": bool(timing.get("route") or "model_duration_seconds" in timing or
+                          decision.get("action") in {"OPEN", "REDUCE", "CLOSE", "WAIT", "IGNORE", "UPDATE_STOP"}),
+        "failed": state in {"error", "recovery_error"},
+        "timed_out": timed_out,
+    }
 
 
 def _safe_path(root, raw, default):
@@ -704,9 +918,52 @@ class DashboardApp:
             "kill_switch": bool(config.get("kill_switch") and config["kill_switch"].exists()),
             "ledger_available": available,
             "counts": counts,
+            "evaluation_metrics": self.evaluation_metrics(),
             "configured_channels": self._channels(config),
             "runtime": _safe_runtime(raw, config.get("runtime_status_file")),
         }
+
+    def evaluation_metrics(self):
+        """Return bounded, read-only aggregates over the latest durable evaluations."""
+        config = self.snapshot()
+        sample_limit = 1000
+        empty = {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "available": False,
+            "sample_limit": sample_limit,
+            "sample_count": 0,
+            "buckets": _aggregate_evaluation_samples([]),
+        }
+
+        def read(connection, tables):
+            if "events" not in tables:
+                return empty
+            message_join = ""
+            message_select = "'' AS message_body"
+            if "messages" in tables:
+                message_join = "LEFT JOIN messages AS m ON m.id = e.message_id AND m.revision = e.revision"
+                message_select = "m.body AS message_body"
+            rows = connection.execute(
+                f"""
+                SELECT e.state, e.reason, e.decision, {message_select}
+                FROM events AS e
+                {message_join}
+                ORDER BY e.id DESC
+                LIMIT ?
+                """,
+                (sample_limit,),
+            ).fetchall()
+            samples = [_evaluation_metric_sample(row) for row in rows]
+            return {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "available": True,
+                "sample_limit": sample_limit,
+                "sample_count": len(samples),
+                "buckets": _aggregate_evaluation_samples(samples),
+            }
+
+        result, _ = self._ledger(config, read, empty)
+        return result
 
     def _list_query(self, query, allowed, endpoint):
         params = parse_qs(query, keep_blank_values=True, strict_parsing=True)
@@ -950,7 +1207,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         routes = {
-            "/api/setup/channels", "/api/setup/pause", "/api/setup/reconnect", "/api/setup/mode", "/api/setup/notifications", "/api/setup/expiry-policy", "/api/setup/evaluation",
+            "/api/setup/channels", "/api/setup/pause", "/api/setup/reconnect", "/api/setup/mode", "/api/setup/notifications", "/api/setup/expiry-policy", "/api/setup/evaluation", "/api/setup/evaluation/test",
             "/api/setup/discord", "/api/setup/discord/discover",
             "/api/setup/auth/codex/start", "/api/setup/auth/codex/cancel",
             "/api/setup/auth/robinhood/start", "/api/setup/auth/robinhood/cancel",
@@ -995,6 +1252,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = manager.set_expiry_policy(payload)
             elif path == "/api/setup/evaluation":
                 result = manager.save_evaluation(payload)
+            elif path == "/api/setup/evaluation/test":
+                result = manager.test_evaluation(payload)
             elif path == "/api/setup/pause":
                 if set(payload) != {"paused"} or not isinstance(payload["paused"], bool):
                     raise ValueError("paused must be a boolean")
@@ -1100,6 +1359,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if parsed.query:
                     raise QueryError("schema diagnostics do not accept query parameters")
                 self._json(200, self.app.setup.robinhood_schemas(), api=True, head=head)
+                return
+            if path == "/api/evaluation/metrics":
+                if parsed.query:
+                    raise QueryError("evaluation metrics does not accept query parameters")
+                self._json(200, self.app.evaluation_metrics(), api=True, head=head)
                 return
             if path == "/api/messages":
                 self._json(200, self.app.messages(parsed.query), api=True, head=head)

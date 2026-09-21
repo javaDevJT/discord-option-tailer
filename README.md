@@ -1,6 +1,6 @@
 # Discord Option Tailer
 
-Discord Option Tailer watches exactly two configured Discord channels through a personal-account Gateway session (`discord.py-self`) or a manually signed-in browser. It sends bounded message context to Codex through an existing ChatGPT subscription, applies deterministic option and risk checks, and records the decision trail in a mode-bound SQLite ledger.
+Discord Option Tailer watches exactly two configured Discord channels through a personal-account Gateway session (`discord.py-self`) or a manually signed-in browser. Complete literal entries use deterministic code without a model call. Other messages use optional JEV with subscription-backed Codex fallback. Existing option risk checks and a mode-bound SQLite ledger govern execution.
 
 Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker data and save proposed orders, but it never submits them. **Live** is an explicit, paused setup action that can submit real Robinhood orders. Missed entries remain review-only; verified missed exits can close existing relay-owned contracts in Live.
 
@@ -12,6 +12,7 @@ The [account monitoring guide](docs/container.md#account-balances-and-holdings) 
 - [TrueNAS deployment](docs/truenas.md): deploy the published image with persistent private storage.
 - [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.
 - [Broker integration](docs/robinhood-integration.md): authorization, account inspection, and execution checks.
+- [Fast entry and evaluation design](docs/jev-evaluation-design.md): direct entry rules, JEV/Codex boundaries, timing targets, and qualification checks.
 - [Configuration template](config.example.json): CLI and offline-rehearsal defaults.
 - [Container environment](.env.example): dashboard binding and password settings.
 - [Relay source](relay/): Gateway and browser readers, interpreter, ledger, broker adapter, dashboard, and worker.
@@ -24,7 +25,7 @@ Private account exports, browser profiles, OAuth state, databases, and local cre
 Expiry-day monitoring closes remaining in-the-money relay-owned options independently of Discord. See [expiry exercise protection](docs/container.md#expiry-exercise-protection) for timing, restart behavior, alerts, and fill limitations.
 
 1. The Gateway reader receives live message events through `discord.py-self==2.1.0`; the browser fallback reads the rendered DOM. Both use the personal account and never post to the input channels. Configure the transport and optional private Gateway credential in **Setup → Discord input**.
-2. The relay stores normalized messages and passes a bounded chronological context window to Codex. Codex runs through the user's ChatGPT subscription; no OpenAI API key is required.
+2. The relay stores normalized messages. With Direct entries enabled, supported complete ENTRY and OPEN alerts are parsed without model calls; other messages use the configured fallback evaluator. Codex uses the user's ChatGPT subscription; optional JEV uses a separate TypeSafe credential entered in Setup. JEV shadow keeps Codex authoritative.
 3. Deterministic checks require a clear standard option contract, an allowed source, fresh inputs, current quotes, account-relative sizing, and a mode-specific ledger.
 4. The dashboard shows messages, interpretations, holds, recorded orders, relay-owned positions, and recovery assessments. Each newly evaluated message shows model evaluation duration and elapsed time from posting to the recorded decision. An optional Discord webhook reports selected setup assistance and relay actions.
 5. Robinhood access uses its normal browser OAuth flow and a configurable callback. Passwords and MFA stay with Robinhood; setup performs account inspection before any execution mode can be selected.

@@ -113,10 +113,47 @@
               <strong data-metric="positions">—</strong>
               <span>Owned records in this ledger</span>
             </article>
+        </div>
+        <section class="evaluation-summary" id="evaluation-summary" aria-labelledby="evaluation-summary-title">
+          <div class="section-heading section-heading-compact">
+            <div>
+              <p class="eyebrow">EVALUATION PULSE</p>
+              <h3 id="evaluation-summary-title">Recent interpretation performance</h3>
+            </div>
+            <span class="section-stamp" id="evaluation-summary-window">RECENT</span>
           </div>
+          <div class="evaluation-summary-grid">
+            <article class="evaluation-summary-card">
+              <p>Recent messages</p>
+              <strong id="evaluation-summary-count">—</strong>
+              <span id="evaluation-summary-count-detail">Aggregate unavailable</span>
+            </article>
+            <article class="evaluation-summary-card evaluation-summary-card-blue">
+              <p>Fast-path coverage</p>
+              <strong id="evaluation-summary-fast-path">—</strong>
+              <span id="evaluation-summary-fast-path-detail">Eligible coverage unavailable</span>
+            </article>
+            <article class="evaluation-summary-card evaluation-summary-card-amber">
+              <p>Fallbacks and errors</p>
+              <strong id="evaluation-summary-fallback">—</strong>
+              <span id="evaluation-summary-fallback-detail">No aggregate detail</span>
+            </article>
+            <article class="evaluation-summary-card">
+              <p>Interpretation p50 / p95 / p99</p>
+              <strong id="evaluation-summary-interpretation">— / — / —</strong>
+              <span id="evaluation-summary-interpretation-detail">Interpretation timing unavailable</span>
+            </article>
+            <article class="evaluation-summary-card evaluation-summary-card-green">
+              <p>Broker ack / fill p50</p>
+              <strong id="evaluation-summary-broker">— / —</strong>
+              <span id="evaluation-summary-broker-detail">Final broker timing unavailable</span>
+            </article>
+          </div>
+          <p class="panel-note" id="evaluation-summary-detail">Bounded recent aggregates will appear when the relay publishes them.</p>
         </section>
+      </section>
 
-        <section class="panel-section setup-section" id="setup" aria-labelledby="setup-title">
+      <section class="panel-section setup-section" id="setup" aria-labelledby="setup-title">
           <div class="section-heading">
             <div>
               <p class="eyebrow">02 / SETUP</p>
@@ -393,17 +430,65 @@
             <button class="button button-quiet" id="save-expiry-policy" type="button" disabled>Save permission</button>
             <p class="form-feedback" id="expiry-policy-feedback" role="status" aria-live="polite"></p>
           </div>
-          <form class="setup-card" id="evaluation-form">
-            <p class="eyebrow">SIGNAL EVALUATION</p>
-            <h3>Model and entry price</h3>
-            <p class="setup-help">Failed evaluations get one retry when appropriate. Authentication and subscription-limit failures require attention. Saving pauses the relay; resume after the worker reloads.</p>
-            <div class="setup-field-grid">
-              <label class="field-wide" for="evaluation-model">Model <input id="evaluation-model" name="model" type="text" maxlength="128" placeholder="Codex default"></label>
+          <form class="setup-card evaluation-card" id="evaluation-form">
+            <div class="setup-card-heading">
+              <div>
+                <p class="eyebrow">SIGNAL EVALUATION</p>
+                <h3>Codex and JEV routing</h3>
+              </div>
+              <span class="status-pill is-context" id="jev-provider-status">Not configured</span>
+            </div>
+          <p class="setup-help">Clean ENTRY and supported complete OPEN text can use rule evaluation directly. Ambiguous or image messages use the selected provider; uncheck Direct entries to opt out. JEV entry attempts are capped at 700 ms; shadow keeps Codex authoritative. Gateway transport is event-driven for fastest arrival; browser transport remains polling based.</p>
+          <label class="check-row direct-entry-toggle"><input id="evaluation-direct-entries" type="checkbox"><span>Direct entries</span></label>
+          <p class="setup-help setup-help-small">Rule evaluation parses entry intent only; it does not claim profitability, broker acceptance, or fills.</p>
+            <div class="setup-field-grid evaluation-codex-fields">
+              <label class="field-wide" for="evaluation-model">Codex model <input id="evaluation-model" name="model" type="text" maxlength="128" placeholder="Codex default"></label>
               <label for="evaluation-effort">Reasoning <select id="evaluation-effort" name="reasoning_effort"><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option></select></label>
               <label for="evaluation-tier">Speed <select id="evaluation-tier" name="service_tier"><option value="standard">Standard</option><option value="fast">Fast</option></select></label>
               <label for="evaluation-chase">Maximum chase (%) <input id="evaluation-chase" name="max_chase_percent" type="number" min="0" max="100" step="0.1" required></label>
             </div>
             <p class="setup-help setup-help-small">Chase is the maximum entry-price increase over the alert premium. It is separate from position sizing. Fast uses more subscription credits.</p>
+
+            <div class="evaluation-jev-panel" aria-labelledby="jev-settings-title">
+              <div class="setup-card-heading">
+                <div>
+                  <p class="eyebrow">TYPE SAFE / JEV</p>
+                  <h4 id="jev-settings-title">Fast-path evaluation</h4>
+                </div>
+                <span class="muted-label" id="jev-credential-state">Credential not configured</span>
+              </div>
+              <div class="setup-field-grid evaluation-jev-fields">
+                <label class="field-wide" for="evaluation-mode">Provider mode
+                  <select id="evaluation-mode" name="evaluation_mode">
+                    <option value="codex">Codex only</option>
+                    <option value="jev_shadow">JEV shadow</option>
+                    <option value="jev">JEV with Codex fallback</option>
+                  </select>
+                </label>
+                <label class="field-wide" for="evaluation-typesafe-key">TypeSafe API key <span class="muted-label">write-only</span>
+                  <input id="evaluation-typesafe-key" name="typesafe_api_key" type="password" autocomplete="new-password" placeholder="Enter to replace the saved key" aria-describedby="jev-key-help">
+                </label>
+                <label for="evaluation-timeout">JEV deadline (ms)
+                  <input id="evaluation-timeout" name="evaluation_timeout_ms" type="number" min="1" max="1200" step="1" inputmode="numeric">
+                </label>
+                <label for="evaluation-min-confidence">Native confidence (%)
+                  <input id="evaluation-min-confidence" name="evaluation_min_confidence" type="number" min="0.1" max="100" step="0.1" inputmode="decimal">
+                </label>
+                <label for="evaluation-min-probability">Selected probability (%)
+                  <input id="evaluation-min-probability" name="evaluation_min_probability" type="number" min="0.1" max="100" step="0.1" inputmode="decimal">
+                </label>
+                <label for="evaluation-min-eligibility">Eligibility probability (%)
+                  <input id="evaluation-min-eligibility" name="evaluation_min_eligibility" type="number" min="0.1" max="100" step="0.1" inputmode="decimal">
+                </label>
+              </div>
+              <p class="setup-help setup-help-small" id="jev-key-help">The saved key is never returned to the browser. Leave this blank to keep the current key; use the synthetic test to check the configured evaluator without placing an order.</p>
+              <div class="evaluation-jev-status" aria-live="polite">
+                <p id="jev-provider-detail">JEV status is not available yet.</p>
+                <button class="button button-quiet" id="test-evaluation" type="button">Test JEV connection</button>
+              </div>
+              <p class="form-feedback" id="evaluation-jev-feedback" role="status" aria-live="polite"></p>
+            </div>
+
             <button class="button button-quiet" id="save-evaluation" type="submit">Save evaluation settings</button>
             <p class="form-feedback" id="evaluation-feedback" role="status" aria-live="polite"></p>
           </form>
@@ -608,6 +693,8 @@
               <select id="message-state" name="state">
                 <option value="">All states</option>
                 <option value="observed">Observed</option>
+                <option value="evaluating">Interpreting</option>
+                <option value="evaluated">Interpretation ready</option>
                 <option value="context">Context</option>
                 <option value="ignore">Ignore</option>
                 <option value="wait">Wait</option>

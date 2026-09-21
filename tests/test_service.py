@@ -166,6 +166,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_interrupted_consumer_preserves_queued_messages_without_replay(self):
         from relay.cli import run
+        self.config["discord"]["transport"] = "browser"
         channel = self.config["channels"][0]
         consumed = asyncio.Event()
         messages = [normalize({"id": str(1545000000000000011 + i), "channel_id": channel["id"],

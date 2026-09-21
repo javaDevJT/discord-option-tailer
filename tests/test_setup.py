@@ -58,7 +58,8 @@ class SetupManagerTests(unittest.TestCase):
         self.path.write_text(json.dumps(old))
         self.manager.set_paused(True)
         result = self.manager.save_evaluation(payload)
-        self.assertEqual(result["evaluation"], payload)
+        self.assertEqual({key: result["evaluation"][key] for key in payload}, payload)
+        self.assertEqual(result["evaluation"]["jev"]["mode"], "codex")
         self.assertTrue(result["paused"])
         self.assertTrue(result["trading"]["pending"])
         saved = json.loads(self.path.read_text())
@@ -68,13 +69,16 @@ class SetupManagerTests(unittest.TestCase):
         self.assertEqual(saved, old)
         # A paused worker with failed authentication must still be configurable.
         changed = payload | {"reasoning_effort": "low"}
-        self.assertEqual(self.manager.save_evaluation(changed)["evaluation"], changed)
-        self.assertEqual(self.manager.save_evaluation(payload)["evaluation"], payload)
+        saved_preferences = self.manager.save_evaluation(changed)["evaluation"]
+        self.assertEqual({key: saved_preferences[key] for key in changed}, changed)
+        saved_preferences = self.manager.save_evaluation(payload)["evaluation"]
+        self.assertEqual({key: saved_preferences[key] for key in payload}, payload)
         with self.assertRaisesRegex(RuntimeError, "worker"):
             self.manager.set_paused(False)
         self.manager.close()
         self.manager = SetupManager(self.path)
-        self.assertEqual(self.manager.status()["evaluation"], payload)
+        saved_preferences = self.manager.status()["evaluation"]
+        self.assertEqual({key: saved_preferences[key] for key in payload}, payload)
         self.assertTrue(self.manager.status()["paused"])
 
     def test_same_day_permission_requires_pause_and_worker_reload_preserving_other_settings(self):
@@ -109,6 +113,10 @@ class SetupManagerTests(unittest.TestCase):
             kill_switch="state/STOP",
             runtime_status_file="state/runtime-status.json",
         )
+        # These setup tests exercise the browser-session status and OAuth
+        # paths. Keep that transport explicit because the public example
+        # configuration defaults to Gateway.
+        self.config["discord"]["transport"] = "browser"
         self.config["browser"]["profile_dir"] = "state/discord-browser"
         self.config["robinhood"]["token_store"] = "state/robinhood-oauth.json"
         self.path = self.base / "config.json"

@@ -2536,3 +2536,224 @@ h2 {
     text-align: left;
   }
 }
+
+.evaluation-card {
+  border-top: 2px solid rgba(139, 180, 216, 0.42);
+}
+
+.evaluation-card h4 {
+  margin: 0.18rem 0 0;
+  color: var(--paper-100);
+  font-family: var(--display);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.evaluation-codex-fields {
+  margin-top: 1rem;
+}
+
+.evaluation-jev-panel {
+  margin-top: 1rem;
+  padding: 0.95rem;
+  border: 1px solid rgba(139, 180, 216, 0.24);
+  border-radius: 0.45rem;
+  background: rgba(139, 180, 216, 0.035);
+}
+
+.evaluation-jev-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 0.75rem;
+}
+
+.evaluation-jev-fields .field-wide {
+  grid-column: 1 / -1;
+}
+
+.evaluation-jev-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-top: 0.8rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+
+.evaluation-jev-status p {
+  margin: 0;
+  color: var(--paper-300);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.evaluation-jev-status .button {
+  flex: 0 0 auto;
+}
+
+.evaluation-jev-panel .form-feedback {
+  margin-bottom: 0;
+}
+
+.form-feedback.is-success {
+  color: var(--green);
+}
+
+.evaluation-trace {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.7rem;
+  padding: 0.6rem 0.65rem;
+  border-left: 2px solid rgba(139, 180, 216, 0.45);
+  background: rgba(139, 180, 216, 0.035);
+}
+
+.evaluation-trace-heading {
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 0.57rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.evaluation-provider,
+.evaluation-confidence,
+.evaluation-stages,
+.evaluation-detail,
+.evaluation-boundary {
+  margin: 0;
+  color: var(--paper-300);
+  font-family: var(--mono);
+  font-size: 0.58rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.evaluation-confidence {
+  color: var(--green);
+}
+
+.evaluation-stages {
+  color: var(--paper-200);
+}
+
+.evaluation-boundary {
+  color: var(--muted);
+  font-size: 0.55rem;
+}
+
+.event-row .evaluation-trace {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+@media (max-width: 760px) {
+  .evaluation-jev-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .evaluation-jev-status {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .evaluation-jev-status .button {
+    width: 100%;
+  }
+}
+
+.evaluation-summary {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid rgba(139, 180, 216, 0.2);
+  border-radius: 0.55rem;
+  background: rgba(139, 180, 216, 0.035);
+}
+
+.evaluation-summary .section-heading {
+  margin-bottom: 0.8rem;
+}
+
+.evaluation-summary h3 {
+  margin: 0.18rem 0 0;
+  color: var(--paper-100);
+  font-family: var(--display);
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.evaluation-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.evaluation-summary-card {
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-top: 2px solid var(--line-strong);
+  background: rgba(20, 27, 29, 0.62);
+}
+
+.evaluation-summary-card-blue {
+  border-top-color: rgba(139, 180, 216, 0.7);
+}
+
+.evaluation-summary-card-amber {
+  border-top-color: rgba(224, 166, 74, 0.7);
+}
+
+.evaluation-summary-card-green {
+  border-top-color: rgba(130, 209, 174, 0.7);
+}
+
+.evaluation-summary-card p,
+.evaluation-summary-card span {
+  display: block;
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.56rem;
+  line-height: 1.45;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.evaluation-summary-card strong {
+  display: block;
+  min-height: 2rem;
+  margin: 0.55rem 0 0.25rem;
+  color: var(--paper-100);
+  font-family: var(--display);
+  font-size: clamp(1.25rem, 2vw, 1.85rem);
+  font-weight: 400;
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.evaluation-summary-card span {
+  color: var(--paper-300);
+  font-size: 0.54rem;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+@media (max-width: 1120px) {
+  .evaluation-summary-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .evaluation-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .evaluation-summary-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -13,6 +13,7 @@ import copy
 import http.client
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -61,6 +62,87 @@ PUBLIC_RISK_FIELDS = frozenset({
     "fee_reserve_per_contract", "allow_same_day_expiry",
     "duplicate_window_seconds", "max_pending_messages",
 })
+
+EVALUATION_MODES = frozenset({"codex", "jev_shadow", "jev"})
+EVALUATION_DEFAULTS = {
+    "mode": "codex",
+    "direct_entries": True,
+    "model": "jev-latest",
+    "timeout_ms": 1200,
+    "min_confidence": 0.95,
+    "min_probability": 0.95,
+    "min_eligibility": 0.98,
+    "api_key_file": "state/typesafe.key",
+}
+EVALUATION_FIELDS = frozenset(EVALUATION_DEFAULTS)
+EVALUATION_UPDATE_FIELDS = EVALUATION_FIELDS | {"typesafe_api_key"}
+
+
+def _evaluation_number(value: object, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(number) or not 0 < number <= 1:
+        raise ValueError(f"{name} must be greater than 0 and at most 1")
+    return number
+
+
+def _validated_evaluation_update(value: object, *, partial: bool = True) -> dict:
+    if value is None and partial:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("evaluation settings must be an object")
+    unknown = set(value) - EVALUATION_UPDATE_FIELDS
+    if unknown:
+        raise ValueError("Unsupported evaluation setting")
+    result = {}
+    if "mode" in value:
+        if not isinstance(value["mode"], str) or value["mode"] not in EVALUATION_MODES:
+            raise ValueError("Evaluation mode must be codex, jev_shadow, or jev")
+        result["mode"] = value["mode"]
+    if "direct_entries" in value:
+        if type(value["direct_entries"]) is not bool:
+            raise ValueError("direct_entries must be a boolean")
+        result["direct_entries"] = value["direct_entries"]
+    if "model" in value:
+        model = value["model"]
+        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
+            raise ValueError("JEV model must be a model identifier")
+        result["model"] = model
+    if "timeout_ms" in value:
+        timeout = value["timeout_ms"]
+        if type(timeout) is not int or not 1 <= timeout <= 1200:
+            raise ValueError("JEV timeout must be between 1 and 1200 milliseconds")
+        result["timeout_ms"] = timeout
+    for name in ("min_confidence", "min_probability", "min_eligibility"):
+        if name in value:
+            result[name] = _evaluation_number(value[name], name)
+    if "api_key_file" in value and value["api_key_file"] != EVALUATION_DEFAULTS["api_key_file"]:
+        raise ValueError("TypeSafe API key file must be state/typesafe.key")
+    if "api_key_file" in value:
+        result["api_key_file"] = EVALUATION_DEFAULTS["api_key_file"]
+    if "typesafe_api_key" in value:
+        key = value["typesafe_api_key"]
+        if not isinstance(key, str) or len(key) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in key):
+            raise ValueError("TypeSafe API key must be a bounded single-line string")
+        result["typesafe_api_key"] = key.strip()
+    if not partial and set(result) - {"typesafe_api_key"} != EVALUATION_FIELDS:
+        raise ValueError("Evaluation settings are incomplete")
+    return result
+
+
+def _evaluation_settings(raw: dict) -> dict:
+    section = raw.get("evaluation", {}) if isinstance(raw, dict) else {}
+    result = dict(EVALUATION_DEFAULTS)
+    try:
+        result.update({key: value for key, value in _validated_evaluation_update(section).items()
+                       if key != "typesafe_api_key"})
+    except ValueError:
+        return result
+    return result
 
 
 class _AuthCancelled(RuntimeError):
@@ -426,7 +508,7 @@ class SetupManager:
     def save_evaluation(self, payload: dict) -> dict:
         """Save bounded interpreter preferences and chase tolerance while paused."""
         fields = {"model", "reasoning_effort", "service_tier", "max_chase_fraction"}
-        if not isinstance(payload, dict) or set(payload) != fields:
+        if not isinstance(payload, dict) or set(payload) not in (fields, fields | {"evaluation"}):
             raise ValueError("Provide model, reasoning_effort, service_tier, and max_chase_fraction")
         model = payload["model"]
         if model is not None and (not isinstance(model, str) or (model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model))):
@@ -438,6 +520,8 @@ class SetupManager:
         chase = money(payload["max_chase_fraction"])
         if not 0 <= chase <= 1:
             raise ValueError("Chase tolerance must be between 0% and 100%")
+        evaluation_payload = _validated_evaluation_update(payload.get("evaluation"), partial=True)
+        typesafe_api_key = evaluation_payload.pop("typesafe_api_key", None)
         with self._lock:
             self._ensure_open_locked()
             latest = self._read_raw_locked()
@@ -447,12 +531,57 @@ class SetupManager:
             candidate.setdefault("llm", {}).update(model=model or None,
                 reasoning_effort=payload["reasoning_effort"], service_tier=payload["service_tier"])
             candidate.setdefault("risk", {})["max_chase_fraction"] = str(chase)
-            if candidate == latest:
+            if "evaluation" in payload or isinstance(latest.get("evaluation"), dict):
+                settings = _evaluation_settings(latest)
+                settings.update(evaluation_payload)
+                candidate["evaluation"] = settings
+            changed = candidate != latest or bool(typesafe_api_key)
+            if not changed:
                 return self._action_response_locked("evaluation_unchanged")
             candidate["mode_change_id"] = uuid.uuid4().hex
             self._validate_candidate(candidate)
+            if typesafe_api_key:
+                self._write_typesafe_key_locked(typesafe_api_key)
             self._atomic_write_config_locked(candidate)
             return self._action_response_locked("evaluation_saved")
+
+    def test_evaluation(self, payload: dict | None = None) -> dict:
+        """Explicitly run the provider's synthetic, non-trading probe."""
+        if payload not in (None, {}):
+            raise ValueError("Synthetic evaluation test does not accept parameters")
+        started = time.monotonic()
+        try:
+            from .evaluation import synthetic_test
+            with self._lock:
+                self._ensure_open_locked()
+                raw = self._read_raw_locked()
+            provider_config = copy.deepcopy(raw)
+            provider_config["_config_dir"] = str(self.config_path.parent)
+            result = asyncio.run(synthetic_test(provider_config))
+            if not isinstance(result, dict):
+                raise RuntimeError("provider returned an invalid synthetic result")
+            state = result.get("state") if isinstance(result.get("state"), str) else "failed"
+            detail = result.get("detail") if isinstance(result.get("detail"), str) else "Synthetic classification completed."
+            latency = result.get("latency_ms")
+            if not isinstance(latency, (int, float)) or isinstance(latency, bool) or not math.isfinite(latency) or latency < 0:
+                latency = max(0.0, time.monotonic() - started) * 1000
+            return {
+                "state": state,
+                "provider": "jev",
+                "configured": self._typesafe_credential_configured(),
+                "synthetic": True,
+                "latency_ms": round(float(latency), 3),
+                "detail": detail[:400],
+            }
+        except Exception:
+            return {
+                "state": "failed",
+                "provider": "jev",
+                "configured": self._typesafe_credential_configured(),
+                "synthetic": True,
+                "latency_ms": round(max(0.0, time.monotonic() - started) * 1000, 3),
+                "detail": "Synthetic classification failed.",
+            }
 
     def set_mode(self, payload: dict) -> dict:
         """Select a mode and its own ledger; activation remains a separate Resume."""
@@ -505,11 +634,18 @@ class SetupManager:
             return self._action_response_locked("mode_saved")
 
     def _require_live_ready_locked(self, raw: dict) -> None:
+        evaluator_ready = self._evaluation_ready_locked(raw)
         if (not self._public_channels(raw)[1]
-                or self._public_codex_locked()["state"] != "connected"
+                or not evaluator_ready
                 or self._public_robinhood_locked(raw)["state"] != "connected"
                 or self._public_discord(raw)["state"] != "connected"):
-            raise RuntimeError("Connect Discord, Codex and Robinhood and save both channels before using Live.")
+            raise RuntimeError("Connect Discord, the selected evaluator and Robinhood and save both channels before using Live.")
+
+    def _evaluation_ready_locked(self, raw: dict) -> bool:
+        if self._public_codex_locked()["state"] == "connected":
+            return True
+        settings = _evaluation_settings(raw)
+        return settings["mode"] == "jev" and self._typesafe_credential_configured()
 
     def _mode_database_path(self, value: str) -> Path:
         if not isinstance(value, str) or not value.strip():
@@ -654,7 +790,8 @@ class SetupManager:
         robinhood = self._public_robinhood_locked(raw)
         discord = self._public_discord(raw)
         risk = self._public_risk(raw)
-        configured = bool(channels_valid and codex["state"] == "connected" and robinhood["state"] == "connected")
+        configured = bool(channels_valid and self._evaluation_ready_locked(raw)
+                          and robinhood["state"] == "connected")
         return {
             "channels": channels,
             "poll_seconds": poll_seconds,
@@ -669,8 +806,7 @@ class SetupManager:
             "notifications": notification_status(self.config_path),
         }
 
-    @staticmethod
-    def _public_evaluation(raw: dict) -> dict:
+    def _public_evaluation(self, raw: dict) -> dict:
         llm = raw.get("llm", {})
         if not isinstance(llm, dict):
             llm = {}
@@ -682,10 +818,34 @@ class SetupManager:
         risk = raw.get("risk", {})
         if not isinstance(risk, dict):
             risk = {}
+        settings = _evaluation_settings(raw)
+        configured = self._typesafe_credential_configured()
+        runtime = self._read_runtime(raw)
+        runtime_evaluation = runtime.get("jev", runtime.get("evaluation", {})) if isinstance(runtime, dict) else {}
+        if not isinstance(runtime_evaluation, dict):
+            runtime_evaluation = {}
+        if runtime_evaluation.get("state"):
+            state = runtime_evaluation.get("state")
+            detail = runtime_evaluation.get("detail")
+        elif settings["mode"] == "codex":
+            state, detail = "disabled", "JEV is disabled; Codex handles evaluation."
+        elif not configured:
+            state, detail = "needs_attention", "TypeSafe credential is not configured."
+        else:
+            state, detail = "unknown", "JEV runtime status is unavailable."
+        if not isinstance(state, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", state):
+            state = "unknown"
+        if not isinstance(detail, str) or not 1 <= len(detail) <= 400 or any(ord(char) < 32 or ord(char) == 127 for char in detail):
+            detail = "JEV runtime status is unavailable."
+        status = {"state": state, "detail": detail}
+        jev = {key: value for key, value in settings.items() if key != "api_key_file"}
+        jev.update(configured=configured, credential_configured=configured, state=state, detail=detail, status=status)
         return {"model": model,
                 "reasoning_effort": effort if effort in ("minimal", "low", "medium", "high", "xhigh") else "medium",
                 "service_tier": tier if tier in ("standard", "fast") else "standard",
-                "max_chase_fraction": risk.get("max_chase_fraction", "0.10")}
+                "max_chase_fraction": risk.get("max_chase_fraction", "0.10"),
+                "direct_entries": settings["direct_entries"],
+                "mode": settings["mode"], "configured": configured, "status": status, "jev": jev}
 
     def _action_response_locked(self, action: str) -> dict:
         value = self._status_locked()
@@ -1776,6 +1936,51 @@ class SetupManager:
             return default.resolve()
         path = Path(value).expanduser()
         return path.resolve() if path.is_absolute() else (self.config_path.parent / path).resolve()
+
+    def _typesafe_key_path(self) -> Path:
+        return self.config_path.parent / EVALUATION_DEFAULTS["api_key_file"]
+
+    def _typesafe_credential_configured(self) -> bool:
+        path = self._typesafe_key_path()
+        try:
+            if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+                file_configured = False
+            else:
+                file_configured = bool(path.read_text(encoding="utf-8").strip())
+        except (OSError, UnicodeError):
+            file_configured = False
+        env_configured = any(bool(os.environ.get(name, "").strip())
+                             for name in ("TYPESAFE_API_KEY", "TYPESAFE_AI_API_KEY"))
+        return file_configured or env_configured
+
+    def _write_typesafe_key_locked(self, value: str) -> None:
+        path = self._typesafe_key_path()
+        state_dir = path.parent
+        if state_dir.is_symlink() or path.is_symlink():
+            raise RuntimeError("TypeSafe API key path must not be a symlink")
+        if state_dir.exists() and not state_dir.is_dir():
+            raise RuntimeError("TypeSafe API key directory must be a directory")
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary_name = tempfile.mkstemp(prefix=".typesafe.key.", dir=state_dir)
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(value)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            path.chmod(0o600)
+            directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise RuntimeError("could not save TypeSafe API key") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _is_paused(self, raw: dict) -> bool:
         path = self._configured_path(raw, "kill_switch", self.config_path.parent / "state" / "STOP")

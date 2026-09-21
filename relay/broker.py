@@ -27,6 +27,7 @@ READ_TOOLS = frozenset({
     "get_option_positions", "get_option_orders", "get_option_historicals",
     "get_option_level_upgrade_info",
 })
+_SNAPSHOT_READ_CONCURRENCY = 4
 
 
 class BrokerError(RuntimeError):
@@ -754,6 +755,46 @@ def _contracts(value):
 class RobinhoodBroker(RobinhoodMCP):
     """Normalized Agentic account reads and explicitly enabled single-leg limit orders."""
 
+    async def _snapshot_position_data(self, positions):
+        option_ids = []
+        seen = set()
+        for position in positions:
+            quantity = _contracts(position["quantity"])
+            if not quantity:
+                continue
+            if position["type"] != "long" or _decimal(position["trade_value_multiplier"], "multiplier") != 100:
+                raise BrokerError("Short or adjusted option positions require separate risk qualification")
+            option_id = position["option_id"]
+            if option_id not in seen:
+                seen.add(option_id)
+                option_ids.append(option_id)
+
+        if not option_ids:
+            return {}
+
+        async def bounded_reads(reader):
+            semaphore = asyncio.Semaphore(_SNAPSHOT_READ_CONCURRENCY)
+            tasks = []
+
+            async def read(option_id):
+                async with semaphore:
+                    return await reader(option_id)
+
+            try:
+                tasks = [asyncio.create_task(read(option_id)) for option_id in option_ids]
+                return await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+        instruments = dict(zip(option_ids, await bounded_reads(self._instrument)))
+        contracts = {option_id: self._instrument_contract(instrument) for option_id, instrument in instruments.items()}
+        quotes = dict(zip(option_ids, await bounded_reads(self._raw_quote)))
+        return {option_id: (contracts[option_id], quotes[option_id]) for option_id in option_ids}
+
     def __init__(self, config, *, interactive=False, clock=None, on_status=None):
         super().__init__(config, interactive=interactive, on_status=on_status)
         self.runtime = config
@@ -763,10 +804,17 @@ class RobinhoodBroker(RobinhoodMCP):
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.currency = None
         self.instruments = {}
+        self.contracts = {}
         self.order_bodies = {}
         self.order_results = {}
         self.attempted = set()
         self.account_changed = asyncio.Event()
+
+    async def __aenter__(self):
+        self.contracts.clear()
+        self.instruments.clear()
+        self.currency = None
+        return await super().__aenter__()
 
     def _qualified(self, name):
         tool = self.catalog.get(name)
@@ -1034,15 +1082,14 @@ class RobinhoodBroker(RobinhoodMCP):
         portfolio, power = portfolio_result
         exposure, normalized = {}, []
         reported_pending_buys = {}
+        position_data = await self._snapshot_position_data(positions)
         for position in positions:
             quantity = _contracts(position["quantity"])
             if not quantity:
                 continue
             if position["type"] != "long" or _decimal(position["trade_value_multiplier"], "multiplier") != 100:
                 raise BrokerError("Short or adjusted option positions require separate risk qualification")
-            instrument = await self._instrument(position["option_id"])
-            contract = self._instrument_contract(instrument)
-            quote = await self._raw_quote(position["option_id"])
+            contract, quote = position_data[position["option_id"]]
             self._check_quote_age(quote["updated_at"])
             average_cost = _decimal(position["average_price"], "position contract cost")
             mark = _decimal(quote["mark_price"], "option mark")
@@ -1138,16 +1185,40 @@ class RobinhoodBroker(RobinhoodMCP):
 
     async def quote(self, contract):
         target = _contract_key(contract)
-        chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
         candidates = []
-        for chain in chains:
-            if chain["symbol"] != target[0] or target[1] not in (chain["expiration_dates"] or []):
-                continue
-            rows = await self._pages("get_option_instruments", {"chain_id": chain["id"], "expiration_dates": target[1],
-                "strike_price": format(Decimal(target[2]), "f"), "type": target[3], "state": "active", "tradability": "tradable"}, "instruments")
-            for instrument in rows:
-                if instrument["chain_id"] == chain["id"] and _contract_key(self._instrument_contract(instrument)) == target:
-                    candidates.append((chain, instrument))
+        cached = self.contracts.get(target)
+        if cached is not None:
+            # Cache identity only. Refresh execution authority and raw prices every time.
+            reads = await asyncio.gather(
+                self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains"),
+                self._pages("get_option_instruments", {"ids": cached["option_id"]}, "instruments"),
+                return_exceptions=True,
+            )
+            for result in reads:
+                if isinstance(result, BaseException):
+                    raise result
+            chains, instruments = reads
+            candidates = [
+                (chain, instrument) for chain in chains for instrument in instruments
+                if chain["id"] == cached["chain_id"] and chain["symbol"] == target[0]
+                and target[1] in (chain["expiration_dates"] or [])
+                and instrument["id"] == cached["option_id"]
+                and instrument["chain_id"] == chain["id"]
+                and _contract_key(self._instrument_contract(instrument)) == target
+            ]
+            if len(candidates) != 1:
+                self.contracts.pop(target, None)
+                candidates = []
+        if not candidates:
+            chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
+            for chain in chains:
+                if chain["symbol"] != target[0] or target[1] not in (chain["expiration_dates"] or []):
+                    continue
+                rows = await self._pages("get_option_instruments", {"chain_id": chain["id"], "expiration_dates": target[1],
+                    "strike_price": format(Decimal(target[2]), "f"), "type": target[3], "state": "active", "tradability": "tradable"}, "instruments")
+                for instrument in rows:
+                    if instrument["chain_id"] == chain["id"] and _contract_key(self._instrument_contract(instrument)) == target:
+                        candidates.append((chain, instrument))
         if len(candidates) != 1:
             raise BrokerError("Exact option contract is missing or ambiguous across chains")
         chain, instrument = candidates[0]
@@ -1170,6 +1241,10 @@ class RobinhoodBroker(RobinhoodMCP):
         if _decimal(chain["trade_value_multiplier"], "chain multiplier") != 100:
             raise BrokerError("Nonstandard chain multiplier")
         self.instruments[instrument["id"]] = instrument
+        self.contracts[target] = {
+            "chain_id": chain["id"],
+            "option_id": instrument["id"],
+        }
         raw = await self._raw_quote(instrument["id"])
         bid, ask = _decimal(raw["bid_price"], "bid"), _decimal(raw["ask_price"], "ask")
         if bid > ask:
@@ -1274,10 +1349,22 @@ class RobinhoodBroker(RobinhoodMCP):
             return dict(self.order_results[client_id])
         if client_id in self.attempted:
             raise BrokerError("Prior submission outcome is unknown; reconcile without resubmitting")
-        snapshot = await self.snapshot()
+        if self.currency is None:
+            snapshot = await self.snapshot()
+            args, quote = await self._order_args(order)
+        else:
+            snapshot_task = asyncio.create_task(self.snapshot())
+            order_args_task = asyncio.create_task(self._order_args(order))
+            try:
+                snapshot, order_result = await asyncio.gather(snapshot_task, order_args_task)
+            except BaseException:
+                snapshot_task.cancel()
+                order_args_task.cancel()
+                await asyncio.gather(snapshot_task, order_args_task, return_exceptions=True)
+                raise
+            args, quote = order_result
         if snapshot["restrictions"] or not snapshot["market_open"]:
             raise BrokerError("Account restrictions or closed market prevent order placement")
-        args, quote = await self._order_args(order)
         if order["side"] == "sell":
             available = sum(position["available_quantity"] for position in snapshot["positions"]
                             if position["option_id"] == quote["option_id"])

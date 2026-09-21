@@ -137,6 +137,7 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_refreshes_while_paused_without_messages_and_closes_cleanly(self):
         from relay.cli import run
         config = json.loads((Path(__file__).resolve().parents[1] / "config.example.json").read_text())
+        config["discord"]["transport"] = "browser"
         config.update(mode="shadow", database=str(self.root / "worker.sqlite3"), kill_switch=str(self.root / "STOP"))
         Path(config["kill_switch"]).touch()
         config["robinhood"]["account_number"] = self.broker.account_number

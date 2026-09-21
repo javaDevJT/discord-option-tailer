@@ -376,7 +376,7 @@ class RecoveryEvaluator:
         while True:
             # Assessments run alongside fresh interpretation; only final exit dispatch takes the lock.
             await asyncio.sleep(1)
-            if not fresh_queue.empty() or self.engine.lock.locked() or Path(self.engine.config["kill_switch"]).exists():
+            if self.engine.evaluations_active or not fresh_queue.empty() or self.engine.lock.locked() or Path(self.engine.config["kill_switch"]).exists():
                 continue
             async with self.engine.lock:
                 await self.reconcile_orders()

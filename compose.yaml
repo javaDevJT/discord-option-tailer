@@ -16,6 +16,8 @@ services:
     environment:
       HOME: /home/relay
       CODEX_HOME: /data/codex
+      TYPESAFE_API_KEY: "${TYPESAFE_API_KEY:-}"
+      TYPESAFE_AI_API_KEY: "${TYPESAFE_AI_API_KEY:-}"
       DISPLAY: ":99"
       BROWSER: /usr/local/bin/relay-browser
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright

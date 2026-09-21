@@ -7,6 +7,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -263,6 +265,9 @@ def load_config(path, *, allow_unbound=False):
     poll = config["browser"].get("poll_seconds", 3)
     if type(poll) not in (int, float) or not 2 <= poll <= 60:
         raise Hold("browser polling must be between 2 and 60 seconds")
+    from .evaluation import evaluation_settings
+    config["evaluation"] = evaluation_settings(config)
+    config["evaluation"]["api_key_file"] = str((path.parent / config["evaluation"]["api_key_file"]).absolute())
     return config
 
 
@@ -304,6 +309,17 @@ class Store:
                 source_group TEXT NOT NULL, contract TEXT NOT NULL, quantity INTEGER NOT NULL,
                 average_price TEXT NOT NULL, PRIMARY KEY(source_group, contract));
         """)
+        self.db.executescript("""
+          CREATE TABLE IF NOT EXISTS source_generations (
+            source_group TEXT PRIMARY KEY, generation INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS evaluation_attempts (
+            message_id TEXT NOT NULL, revision TEXT NOT NULL, attempt_id TEXT NOT NULL,
+            source_group TEXT NOT NULL, source_generation INTEGER NOT NULL,
+            position_generation TEXT NOT NULL, state TEXT NOT NULL,
+                PRIMARY KEY(message_id,revision));
+            CREATE INDEX IF NOT EXISTS messages_source_chronology ON messages(source_group,length(id),id);
+        """)
+        self.db.execute("UPDATE evaluation_attempts SET state='interrupted' WHERE state IN ('evaluating','accepted')")
         # A crash after dispatch cannot establish whether the broker accepted an order.
         self.db.execute("UPDATE orders SET status='unknown' WHERE status='submitting'")
         self.db.commit()
@@ -338,15 +354,53 @@ class Store:
                                         (json.dumps(stored), message["id"], message["revision"]))
             return "same"
         with self.db:
+            self.db.execute("INSERT INTO source_generations VALUES (?,1) ON CONFLICT(source_group) DO UPDATE SET generation=generation+1", (message["source_group"],))
             self.db.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?)", (
                 message["id"], message["channel_id"], message["source_group"], message["timestamp"],
-                message["revision"], json.dumps(message)))
+                message["revision"], json.dumps({k: v for k, v in message.items() if k not in {"_received_monotonic", "_evaluation_claim", "_execution_started"}})))
             self.db.execute("INSERT OR IGNORE INTO events(message_id,revision,state,reason,created_at) VALUES (?,?,?,?,?)", (
                 message["id"], message["revision"], "observed", "awaiting interpretation", datetime.now(UTC).isoformat()))
         return "edit" if old else "new"
 
+
+    def source_generation(self, source_group):
+        row = self.db.execute("SELECT generation FROM source_generations WHERE source_group=?", (source_group,)).fetchone()
+        return row[0] if row else 0
+
+    def position_generation(self, source_group):
+        # Source-owned inventory affects interpretation; global funds are checked at dispatch.
+        positions = [tuple(r) for r in self.db.execute(
+            "SELECT contract,quantity,average_price FROM positions WHERE source_group=? ORDER BY contract", (source_group,))]
+        orders = [tuple(r) for r in self.db.execute(
+            "SELECT id,status,filled_quantity,filled_notional FROM orders WHERE source_group=? AND status NOT IN ('filled','canceled','rejected','expired') ORDER BY id", (source_group,))]
+        return hashlib.sha256(json.dumps([positions, orders], separators=(",", ":")).encode()).hexdigest()
+
+    def begin_evaluation(self, message):
+        attempt = {"attempt_id": uuid.uuid4().hex,
+                   "source_generation": self.source_generation(message["source_group"]),
+                   "position_generation": self.position_generation(message["source_group"])}
+        with self.db:
+            row = self.db.execute(
+                "INSERT OR IGNORE INTO evaluation_attempts VALUES (?,?,?,?,?,?,?)",
+                (message["id"], message["revision"], attempt["attempt_id"], message["source_group"],
+                 attempt["source_generation"], attempt["position_generation"], "evaluating"))
+        return attempt if row.rowcount == 1 else None
+
+    def claim_evaluation(self, message, attempt_id):
+        with self.db:
+            result = self.db.execute(
+                "UPDATE evaluation_attempts SET state='accepted' WHERE message_id=? AND revision=? AND attempt_id=? AND state='evaluating'",
+                (message["id"], message["revision"], attempt_id))
+        return result.rowcount == 1
+
+    def finish_evaluation(self, message, attempt_id):
+        with self.db:
+            self.db.execute(
+                "UPDATE evaluation_attempts SET state='finished' WHERE message_id=? AND revision=? AND attempt_id=?",
+                (message["id"], message["revision"], attempt_id))
+
     def record(self, message, state, reason, decision=None):
-        if decision and state not in {"recovery_pending", "recovery_evaluating"}:
+        if decision and state not in {"recovery_pending", "recovery_evaluating", "evaluating", "evaluated"}:
             # Observation time predates evaluation. Finish timing at the durable
             # outcome, including policy checks and any broker response.
             finished = datetime.now(UTC)
@@ -356,6 +410,8 @@ class Store:
                 timing = stage.get("evaluation_timing")
                 if not isinstance(timing, dict):
                     continue
+                if type(message.get("_execution_started")) in (int, float):
+                    timing["execution_seconds"] = round(max(0, time.monotonic() - message["_execution_started"]), 6)
                 timing["decision_at"] = finished.isoformat()
                 timing.pop("posted_to_decision_seconds", None)
                 timing.pop("delayed", None)
@@ -471,6 +527,7 @@ class Engine:
         self.store.bind_execution(self.mode, self.account)
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lock = asyncio.Lock()
+        self.evaluations_active = 0
         self.channels = {c["id"]: c for c in config["channels"]}
         self.observations = {}
         self.source_latest = {}
@@ -498,9 +555,21 @@ class Engine:
                 self.source_latest[group] = max(int(identity), self.source_latest.get(group, 0))
 
     def unchanged(self, message):
+        claim = message.get("_evaluation_claim")
+        if claim is not None:
+            if self.store.source_generation(message["source_group"]) != claim["source_generation"]:
+                raise Hold("source context changed during evaluation; reassessment required")
+            if self.store.position_generation(message["source_group"]) != claim["position_generation"]:
+                raise Hold("owned inventory or orders changed during evaluation; reassessment required")
+        stored = self.store.db.execute("SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()
+        if stored and stored[0] != message["revision"]:
+            raise Hold("message changed during interpretation")
         if self.observations.get(message["id"], message["revision"]) != message["revision"]:
             raise Hold("message was revised during interpretation")
-        if self.source_latest.get(message["source_group"], int(message["id"])) > int(message["id"]):
+        latest = self.store.db.execute(
+            "SELECT id FROM messages WHERE source_group=? ORDER BY length(id) DESC,id DESC LIMIT 1",
+            (message["source_group"],)).fetchone()
+        if max(self.source_latest.get(message["source_group"], 0), int(latest[0]) if latest else 0) > int(message["id"]):
             raise Hold("a newer source message requires interpretation before this action")
 
     def fresh(self, message, now):
@@ -525,7 +594,7 @@ class Engine:
             raise Hold("the original action message was revised")
         return origin
 
-    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None):
+    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None, verify_source=True):
         """Recheck intent after broker review and immediately before its placement boundary."""
         async def current(*, refresh=False):
             now = self.clock()
@@ -579,12 +648,12 @@ class Engine:
                     self.check_exit_profit(message, decision, order, executable_price)
 
         await current(refresh=snapshot is not None)
-        if expiry_guard is None and (recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification")):
+        if verify_source and expiry_guard is None and (recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification")):
             options = {} if recovery_guard is None else {"recovery": True, "latest_id": recovery_guard()}
-            if self.verify_current is None or not await self.verify_current(message, **options):
+            if self.verify_current is None or not await self.measure(decision, "source_verification_seconds", self.verify_current(message, **options)):
                 raise RetryHold("current Discord message could not be verified before dispatch")
             origin = self.origin(message, decision)
-            if recovery_guard is not None and origin["id"] != message["id"] and not await self.verify_current(origin, **options):
+            if recovery_guard is not None and origin["id"] != message["id"] and not await self.measure(decision, "source_verification_seconds", self.verify_current(origin, **options)):
                 raise RetryHold("original Discord exit could not be verified before dispatch")
         await current()
 
@@ -599,49 +668,100 @@ class Engine:
         if source_day != self.clock().astimezone(EASTERN).date():
             raise Hold("an older entry without an explicit expiry cannot roll into a new contract")
         requested = canonical_contract(dict(contract, expiry=source_day.isoformat()))
-        resolved = canonical_contract(await self.broker.nearest_expiry(requested))
+        resolved = canonical_contract(await self.measure(decision, "contract_resolution_seconds", self.broker.nearest_expiry(requested)))
         if any(resolved[key] != requested[key] for key in ("symbol", "strike", "option_type")) or resolved["expiry"] < requested["expiry"]:
             raise Hold("broker expiry resolution changed the intended option")
         return decision | {"contract": resolved, "reason": (decision["reason"][:3800] +
             f" Default expiry: {resolved['expiry']}, nearest listed to the original {source_day} New York message date.")}
 
     async def handle(self, message, *, analyze_history=False, _observed=None):
-        # ponytail: one serialized decision stream; per-account workers only if throughput requires them.
-        async with self.lock:
-            message = dict(message)
-            channel = self.channels.get(str(message.get("channel_id")))
-            if not channel or not channel_allows_author(channel, message.get("author_id", "")):
-                return {"message_id": message.get("id"), "state": "untrusted", "reason": "channel or author is not allowlisted"}
-            message["source_group"] = channel["source_group"]
-            try:
-                instant(message.get("timestamp"))
-                if not re.fullmatch(r"\d{15,22}", str(message.get("id", ""))):
-                    raise Hold("message ID is invalid")
-                if not isinstance(message.get("revision"), str) or not message["revision"]:
-                    raise Hold("message revision is missing")
-                if message.get("edited_timestamp"):
-                    instant(message["edited_timestamp"])
-            except Hold as exc:
-                return {"message_id": message.get("id"), "state": "invalid", "reason": str(exc)}
-            # The live reader commits observation before enqueueing; its in-memory
-            # receipt is never persisted/reused to execute a message after restart.
-            observed = self.store.observe(message) if _observed is None else _observed
-            if observed == "same":
-                return {"message_id": message["id"], "state": "duplicate", "reason": "already observed"}
-            context_only = observed == "edit" or message.get("edited_timestamp") or message.get("ingestion") != "live" or message.get("source") not in {"browser", "gateway"} or channel["role"] != "signals"
-            if context_only and not analyze_history:
-                return self.store.record(message, "context", "baseline, import, edit, or context channel; no execution")
-            if self.interpreter is None:
-                return self.store.record(message, "context", "no interpreter configured")
-            decision = None
-            try:
+        # Model work is concurrent; account execution remains serialized.
+        message = dict(message)
+        message.pop("_evaluation_claim", None)
+        channel = self.channels.get(str(message.get("channel_id")))
+        if not channel or not channel_allows_author(channel, message.get("author_id", "")):
+            return {"message_id": message.get("id"), "state": "untrusted", "reason": "channel or author is not allowlisted"}
+        message["source_group"] = channel["source_group"]
+        try:
+            instant(message.get("timestamp"))
+            if not re.fullmatch(r"\d{15,22}", str(message.get("id", ""))):
+                raise Hold("message ID is invalid")
+            if not isinstance(message.get("revision"), str) or not message["revision"]:
+                raise Hold("message revision is missing")
+            if message.get("edited_timestamp"):
+                instant(message["edited_timestamp"])
+        except Hold as exc:
+            return {"message_id": message.get("id"), "state": "invalid", "reason": str(exc)}
+        # The live reader commits observation before enqueueing; its in-memory
+        # receipt is never persisted/reused to execute a message after restart.
+        observed = self.store.observe(message) if _observed is None else _observed
+        if observed == "same":
+            return {"message_id": message["id"], "state": "duplicate", "reason": "already observed"}
+        context_only = observed == "edit" or message.get("edited_timestamp") or message.get("ingestion") != "live" or message.get("source") not in {"browser", "gateway"} or channel["role"] != "signals"
+        if context_only and not analyze_history:
+            return self.store.record(message, "context", "baseline, import, edit, or context channel; no execution")
+        if self.interpreter is None:
+            return self.store.record(message, "context", "no interpreter configured")
+        started = time.monotonic()
+        received = message.get("_received_monotonic", started)
+        if type(received) not in (float, int) or not 0 <= received <= started:
+            received = started
+        message["_received_monotonic"] = received
+        timing = {"received_at": message.get("received_at", datetime.now(UTC).isoformat()),
+                  "queue_wait_seconds": round(started - received, 6)}
+        try:
+            elapsed = (instant(timing["received_at"]) - instant(message["timestamp"])).total_seconds()
+            if elapsed >= 0:
+                timing["posted_to_receipt_seconds"] = round(elapsed, 6)
+            else:
+                timing["clock_uncertain"] = True
+        except Hold:
+            timing["clock_uncertain"] = True
+        decision, attempt, prepared_snapshot = None, None, None
+        self.evaluations_active += 1
+        try:
+            if not context_only:
+                self.fresh(message, self.clock())
+                self.unchanged(message)
+            if Path(self.config["kill_switch"]).exists():
+                raise Hold("kill switch is present")
+            context = self.store.context(message, self.config.get("llm", {}).get("context_messages", 60))
+            attempt = self.store.begin_evaluation(message)
+            if attempt is None:
+                return {"message_id": message["id"], "state": "duplicate", "reason": "evaluation already claimed"}
+            message["_evaluation_claim"] = attempt
+            timing["preparation_seconds"] = round(time.monotonic() - started, 6)
+            self.store.record(message, "evaluating", "Evaluating message", {"evaluation_timing": timing})
+            model_started = time.monotonic()
+            decision = await self.interpreter.interpret(message, context, self.store.positions())
+            timing.update(decision.get("evaluation_timing", {}))
+            # The model's completion is provisional until deterministic execution checks finish.
+            for key in ("decision_at", "posted_to_decision_seconds", "delayed"):
+                timing.pop(key, None)
+            timing.setdefault("model_duration_seconds", round(time.monotonic() - model_started, 6))
+            timing["interpretation_ready_at"] = datetime.now(UTC).isoformat()
+            timing["interpretation_seconds"] = round(time.monotonic() - received, 6)
+            if "posted_to_receipt_seconds" in timing:
+                timing["posted_to_interpretation_seconds"] = round(timing["posted_to_receipt_seconds"] + timing["interpretation_seconds"], 6)
+            decision["evaluation_timing"] = timing
+            self.store.record(message, "evaluated", "Interpretation ready; execution checks pending", decision)
+            wait_started = time.monotonic()
+            async with self.lock:
+                timing["execution_wait_seconds"] = round(time.monotonic() - wait_started, 6)
+                message["_execution_started"] = time.monotonic()
+                if asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
                 if not context_only:
-                    self.fresh(message, self.clock())
                     self.unchanged(message)
-                if Path(self.config["kill_switch"]).exists():
-                    raise Hold("kill switch is present")
-                context = self.store.context(message, self.config.get("llm", {}).get("context_messages", 60))
-                decision = await self.interpreter.interpret(message, context, self.store.positions())
+                    self.fresh(message, self.clock())
+                if not self.store.claim_evaluation(message, attempt["attempt_id"]):
+                    raise Hold("evaluation was superseded; no action dispatched")
+                if (not context_only and decision["action"] == "OPEN"
+                        and (decision.get("contract") or {}).get("expiry") == "nearest"):
+                    # Fresh account reads do not depend on expiry discovery.
+                    async def read_snapshot():
+                        return await self.measure(decision, "snapshot_seconds", self.broker.snapshot())
+                    prepared_snapshot = asyncio.create_task(read_snapshot())
                 decision = await self.resolve_expiry(message, decision)
                 # Interpreter validates the complete schema and evidence; controls remain deterministic below.
                 if decision["action"] in {"IGNORE", "WAIT"}:
@@ -650,26 +770,47 @@ class Engine:
                     raise Hold("historical, baseline, or revised message; analysis only")
                 if decision["action"] == "UPDATE_STOP":
                     raise Hold("stop changes require broker-native order support and review; no software stop was installed")
-                return await self.execute_decision(message, decision)
-            except Hold as exc:
-                return self.store.record(message, "held", str(exc), decision)
-            except InterpretationError as exc:
-                # The interpreter owns provider details and retry accounting.
-                # Persist only its allowlisted diagnostic contract; no broker
-                # call occurs until a validated decision reaches plan().
-                timing = getattr(exc, "evaluation_timing", None)
-                if isinstance(timing, dict):
-                    decision = (decision or {}) | {"evaluation_timing": timing}
-                return self.store.record(message, "error", safe_interpretation_reason(exc), decision)
-            except Exception as exc:
-                # Do not leak response bodies, tokens, or Discord message content.
-                if decision is None:
-                    return self.store.record(message, "error", safe_interpretation_reason(
-                        InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False),
-                    ), decision)
-                return self.store.record(message, "error", "internal execution failure; no retry submitted", decision)
+                return await self.execute_decision(message, decision, prepared_snapshot=prepared_snapshot)
+        except asyncio.CancelledError:
+            if attempt is not None:
+                self.store.record(message, "context", "Worker stopped during evaluation; retained for context, never automatically replayed", decision or {"evaluation_timing": timing})
+            raise
+        except Hold as exc:
+            return self.store.record(message, "held", str(exc), decision or {"evaluation_timing": timing})
+        except InterpretationError as exc:
+            # The interpreter owns provider details and retry accounting.
+            # Persist only its allowlisted diagnostic contract; no broker
+            # call occurs until a validated decision reaches plan().
+            provider_timing = getattr(exc, "evaluation_timing", None)
+            if isinstance(provider_timing, dict):
+                timing.update(provider_timing)
+            decision = (decision or {}) | {"evaluation_timing": timing}
+            return self.store.record(message, "error", safe_interpretation_reason(exc), decision)
+        except Exception as exc:
+            # Do not leak response bodies, tokens, or Discord message content.
+            if decision is None:
+                return self.store.record(message, "error", safe_interpretation_reason(
+                    InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False),
+                ), {"evaluation_timing": timing})
+            return self.store.record(message, "error", "internal execution failure; no retry submitted", decision)
+        finally:
+            if prepared_snapshot is not None:
+                if not prepared_snapshot.done():
+                    prepared_snapshot.cancel()
+                await asyncio.gather(prepared_snapshot, return_exceptions=True)
+            self.evaluations_active -= 1
+            if attempt is not None:
+                self.store.finish_evaluation(message, attempt["attempt_id"])
 
-    async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None):
+    async def measure(self, decision, stage, operation):
+        started = time.monotonic()
+        try:
+            return await operation
+        finally:
+            timing = decision.setdefault("evaluation_timing", {})
+            timing[stage] = round(timing.get(stage, 0) + time.monotonic() - started, 6)
+
+    async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         def reason(label):
             if expiry_guard is not None:
                 facts = decision["expiry_exit"]
@@ -687,17 +828,35 @@ class Engine:
             self.fresh(origin, self.clock())
         else:
             recovery_guard()
-        order = await self.plan(message, decision, recovery_guard=recovery_guard, expiry_guard=expiry_guard)
-        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard, expiry_guard=expiry_guard)
+        order = await self.plan(message, decision, recovery_guard=recovery_guard, expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+        # Live placement repeats local checks and performs one authoritative source
+        # verification after broker review, immediately before submitting.
+        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard, expiry_guard=expiry_guard, verify_source=self.mode != "live")
         if self.mode == "shadow":
             return self.store.record(message, "shadow_order", reason("account-sized proposal; no order submitted"),
                                      decision | {"order_proposal": order})
         self.store.reserve(message, decision, order, self.clock())
+        if message.get("_evaluation_claim") is not None:
+            # The reservation is our own serialized mutation, not competing inventory.
+            message["_evaluation_claim"]["position_generation"] = self.store.position_generation(message["source_group"])
+        async def before_submit(snapshot, quote):
+            await self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard, expiry_guard=expiry_guard)
+            timing = decision.setdefault("evaluation_timing", {})
+            timing["submission_started_at"] = datetime.now(UTC).isoformat()
+            received = message.get("_received_monotonic")
+            now = time.monotonic()
+            if type(received) in (float, int) and 0 <= received <= now:
+                timing["received_to_submission_seconds"] = round(now - received, 6)
+                if "posted_to_receipt_seconds" in timing:
+                    timing["posted_to_submission_seconds"] = round(timing["posted_to_receipt_seconds"] + now - received, 6)
         try:
             if self.mode == "live":
-                result = await self.broker.submit(order, before_submit=lambda snapshot, quote: self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard, expiry_guard=expiry_guard))
+                result = await self.measure(decision, "submission_seconds", self.broker.submit(order, before_submit=before_submit))
             else:
-                result = await self.broker.submit(order)
+                result = await self.measure(decision, "submission_seconds", self.broker.submit(order))
+            # This is the observed response time, not an exchange fill timestamp.
+            decision["evaluation_timing"]["broker_result_at"] = datetime.now(UTC).isoformat()
+            decision["evaluation_timing"]["broker_result_status"] = result["status"]
             self.store.apply_result(order["client_order_id"], result)
         except BrokerPreflightHold as exc:
             self.store.reject_before_submission(order["client_order_id"])
@@ -715,7 +874,7 @@ class Engine:
             label = "missed exit catch-up; " + label
         return self.store.record(message, state, reason(label + result["status"]), decision | {"order_proposal": order})
 
-    async def plan(self, message, decision, *, recovery_guard=None, expiry_guard=None):
+    async def plan(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         risk = self.config["risk"]
         self.check_execution_mode()
         if type(decision.get("ambiguous")) is not bool or decision["ambiguous"]:
@@ -776,7 +935,16 @@ class Engine:
                 raise Hold("sell quantity exceeds the owned position")
         if action != "OPEN" and (type(qty) is not int or qty <= 0):
             raise Hold("quantity must be a positive whole contract")
-        snapshot = await self.broker.snapshot()
+        # Both reads must still be fresh when dispatch is rechecked below.
+        reads = [prepared_snapshot if prepared_snapshot is not None else asyncio.create_task(self.measure(decision, "snapshot_seconds", self.broker.snapshot())),
+                 asyncio.create_task(self.measure(decision, "quote_seconds", self.broker.quote(contract)))]
+        try:
+            snapshot, quote = await asyncio.gather(*reads)
+        finally:
+            for task in reads:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*reads, return_exceptions=True)
         if self.mode != "paper" and snapshot.get("account_id") != self.account:
             raise Hold("broker snapshot does not match the bound account")
         restrictions = snapshot.get("restrictions", [])
@@ -785,7 +953,6 @@ class Engine:
         if snapshot.get("market_open") is not True:
             raise RetryHold("broker has not confirmed an open options session")
         self.check_quote_age(snapshot, self.clock(), "account snapshot")
-        quote = await self.broker.quote(contract)
         if canonical_contract(quote.get("contract")) != contract or quote.get("tradable") is not True:
             raise Hold("quote does not identify the requested tradable contract")
         if quote.get("multiplier") != 100 or quote.get("currency") != "USD" or quote.get("asset_type") != "equity_option":

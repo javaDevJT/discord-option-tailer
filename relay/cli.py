@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import sys
+import time
 import tempfile
 from collections import Counter
 from contextlib import AsyncExitStack
@@ -147,7 +148,11 @@ async def run(config, *, observe_only=False, on_status=None):
             from .broker import RobinhoodBroker
             broker = await connections.enter_async_context(RobinhoodBroker(config, on_status=on_status))
         publish_status(on_status, "broker", "paper" if config["mode"] == "paper" else "connected")
-        engine = Engine(config, store, None if observe_only else CodexInterpreter(config, on_status=on_status), broker)
+        from .evaluation import EvaluationRouter
+        interpreter = None if observe_only else EvaluationRouter(config, codex=CodexInterpreter(config, on_status=on_status), broker=broker, on_status=on_status)
+        if interpreter is not None:
+            connections.push_async_callback(interpreter.aclose)
+        engine = Engine(config, store, interpreter, broker)
         from .recovery import RecoveryEvaluator
         recovery = RecoveryEvaluator(engine)
         from .expiry import ExpiryExits
@@ -155,6 +160,9 @@ async def run(config, *, observe_only=False, on_status=None):
         queue = asyncio.Queue(maxsize=config["risk"]["max_pending_messages"])
 
         async def on_message(message):
+            message = dict(message)
+            message["received_at"] = datetime.now(timezone.utc).isoformat()
+            message["_received_monotonic"] = time.monotonic()
             engine.note_observation(message)
             channel = engine.channels.get(str(message.get("channel_id")))
             if not channel or not channel_allows_author(channel, message.get("author_id", "")):
@@ -172,13 +180,44 @@ async def run(config, *, observe_only=False, on_status=None):
                 raise Hold("message queue filled; kill switch set and reader stopped") from exc
 
         async def consume():
-            while True:
-                message, observed = await queue.get()
+            # Bounded waiting evaluations; provider slots and account dispatch have their own locks.
+            active = set()
+            slots = asyncio.Semaphore(config["risk"]["max_pending_messages"])
+
+            async def process(message, observed):
                 try:
                     result = await engine.handle(message, _observed=observed)
                     emit(recovery.enqueue(message, observed) or result)
+                except Exception as exc:
+                    stop = Path(config["kill_switch"])
+                    stop.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    stop.touch(mode=0o600)
+                    emit({"message_id": message.get("id"), "state": "error",
+                          "reason": f"Message processing failed ({type(exc).__name__}); kill switch set. Inspect the local service logs."})
                 finally:
                     queue.task_done()
+                    slots.release()
+
+            try:
+                while True:
+                    await slots.acquire()
+                    try:
+                        message, observed = await queue.get()
+                    except BaseException:
+                        slots.release()
+                        raise
+                    task = asyncio.create_task(process(message, observed))
+                    active.add(task)
+                    def completed(done):
+                        active.discard(done)
+                        # Consume unexpected errors; an interpreter must not orphan the dispatcher.
+                        if not done.cancelled():
+                            done.exception()
+                    task.add_done_callback(completed)
+            finally:
+                for task in active:
+                    task.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
 
         def register_verifier(callback):
             engine.verify_current = callback
@@ -212,7 +251,7 @@ async def run(config, *, observe_only=False, on_status=None):
                 with store.db:
                     store.db.execute("""UPDATE events SET state='held',
                         reason='Worker stopped before interpretation completed; retained for context, never automatically replayed'
-                        WHERE state='observed' AND NOT EXISTS
+                        WHERE state IN ('observed','evaluating','evaluated') AND NOT EXISTS
                         (SELECT 1 FROM orders WHERE orders.message_id=events.message_id)""")
             store.close()
 

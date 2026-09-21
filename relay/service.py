@@ -18,6 +18,7 @@ from .discord_session import credential_configured
 from .broker import broker_credentials_state
 from .core import Store, channel_allows_author, load_config
 from .interpreter import CodexInterpreter, InterpretationError, safe_interpretation_reason
+from .evaluation import evaluation_settings, credential_configured as jev_credential_configured
 from .pacing import discord_delay
 from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, failure_detail, previous_auth_state
 
@@ -36,15 +37,15 @@ class RuntimeStatus:
         self.detail = "Waiting for configuration and authentication."
         self.value = {"state": "starting", "detail": self.detail,
                       "discord": {"state": "starting", "channels": []},
-                      "codex": {"state": "unknown"}, "broker": {"state": "unknown"}}
-        for component in ("codex", "broker"):
+                      "codex": {"state": "unknown"}, "broker": {"state": "unknown"}, "jev": {"state": "unknown"}}
+        for component in ("codex", "broker", "jev"):
             state = previous_auth_state(self.path, component)
             if state is not None:
                 self.value[component] = {"state": state}
 
     def event(self, event):
         component = event.get("component")
-        if component not in {"discord", "codex", "broker"}:
+        if component not in {"discord", "codex", "broker", "jev"}:
             return
         state = str(event.get("state", "unknown"))
         if component == "discord" and event.get("channel_id"):
@@ -60,7 +61,7 @@ class RuntimeStatus:
             affected = next((row for row in rows.values() if row.get("state") == aggregate), {})
             self.value[component].update(state=aggregate, detail=affected.get("detail", ""), channels=list(rows.values()))
         else:
-            if (component in {"codex", "broker"}
+            if (component in {"codex", "broker", "jev"}
                     and str(self.value[component].get("state", "")).lower() in AUTH_REQUIRED_STATES
                     and state not in HEALTHY_STATES and state not in AUTH_REQUIRED_STATES):
                 # A credential file, saved login, or nonhealthy probe is only a
@@ -155,6 +156,10 @@ async def serve(config_path):
             status.value.update(mode=config["mode"], mode_change_id=config.get("mode_change_id"),
                                 live_enabled=config.get("robinhood", {}).get("enable_live_orders") is True)
             config["runtime_status_file"] = str(status.path)
+            evaluation = evaluation_settings(config)
+            paths.append(evaluation["api_key_file"])
+            jev_ready = jev_credential_configured(config)
+            status.event({"component": "jev", "state": "configured" if jev_ready else "not_configured"})
             configured_channels = all(SNOWFLAKE.fullmatch(str(channel["guild_id"])) for channel in config["channels"])
             broker_state = broker_credentials_state(config)
             broker_ready = broker_state in {"paper", "configured"}
@@ -175,9 +180,11 @@ async def serve(config_path):
                           if isinstance(exc, InterpretationError) else failure_detail(exc, provider="Codex", phase="startup check"))
                 status.event({"component": "codex", "state": "auth_required" if isinstance(exc, InterpretationError) and exc.code == "auth_required" else "unavailable", "detail": detail})
             discord_ready = discord_transport(config) != "gateway" or credential_configured(config)
-            status.ready = configured_channels and broker_ready and codex_ready and discord_ready
+            direct_ready = evaluation["direct_entries"] and evaluation["mode"] != "jev_shadow"
+            evaluator_ready = direct_ready or codex_ready or (evaluation["mode"] == "jev" and jev_ready)
+            status.ready = configured_channels and broker_ready and evaluator_ready and discord_ready
             status.detail = ("Monitoring configured channels; execution follows the configured mode." if status.ready else
-                             "Observation only until channel IDs, Robinhood authorization and Codex subscription login are configured.")
+                             "Observation only until channels, broker authorization and an evaluation provider are configured.")
             status.write()
             if not status.ready:
                 paths += [Path(config["robinhood"]["token_store"]),

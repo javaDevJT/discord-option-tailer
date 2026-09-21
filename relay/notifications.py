@@ -38,7 +38,7 @@ ORDER_STATES = {
 }
 ACTION_NAMES = {"OPEN", "REDUCE", "CLOSE"}
 MODE_LABELS = {"paper": "Paper", "shadow": "Shadow", "live": "Live"}
-PROVIDERS = (("discord", "Discord"), ("codex", "Codex"), ("broker", "Robinhood"))
+PROVIDERS = (("discord", "Discord"), ("codex", "Codex"), ("broker", "Robinhood"), ("jev", "JEV / TypeSafe"))
 
 
 class DeliveryError(RuntimeError):

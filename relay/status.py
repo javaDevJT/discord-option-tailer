@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 
-PROVIDER_COMPONENTS = frozenset({"discord", "codex", "broker"})
+PROVIDER_COMPONENTS = frozenset({"discord", "codex", "broker", "jev"})
 AUTH_REQUIRED_STATES = frozenset({
     "auth_required", "authentication_required", "login_required", "reauth_required",
     "unauthorized", "unauthenticated",
