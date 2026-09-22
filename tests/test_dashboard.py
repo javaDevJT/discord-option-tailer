@@ -270,6 +270,10 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["items"], [])
 
+        status, _, payload = self.request("/api/messages?state=unknown")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["items"], [])  # Uninterpreted messages have no event, not an unknown order.
+
         status, _, payload = self.request("/api/events?limit=1")
         self.assertEqual(status, 200)
         self.assertEqual(payload["items"][0]["state"], "filled")

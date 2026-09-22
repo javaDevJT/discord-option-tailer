@@ -1138,7 +1138,7 @@ class DashboardApp:
                     "dashboard_event_state", 2,
                     lambda raw_state, raw_decision: _project_event_state(raw_state, _project_decision(raw_decision)),
                 )
-                clauses.append("dashboard_event_state(e.state, e.decision) = ?")
+                clauses.append("e.id IS NOT NULL AND dashboard_event_state(e.state, e.decision) = ?")
                 parameters.append(state)
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             sql = f"SELECT m.*, {event_select} FROM messages AS m {event_join}{where} ORDER BY m.timestamp DESC, m.id DESC LIMIT ? OFFSET ?"
