@@ -96,6 +96,9 @@ class FixtureBroker(RobinhoodBroker):
         if name == "get_option_instruments":
             if "ids" in args:
                 return [copy.deepcopy(row) for row in self.instrument_by_expiry.values() if row["id"] == args["ids"]]
+            if args.get("chain_symbol") == "SPY":
+                return [copy.deepcopy(row) for row in self.instrument_by_expiry.values()
+                        if row["expiration_date"] in args["expiration_dates"].split(",")]
             return [copy.deepcopy(self.instrument_by_expiry[args["expiration_dates"]])]
         raise AssertionError(f"unexpected page request: {name}")
 
@@ -223,6 +226,20 @@ class JevBrokerLatencyTests(unittest.IsolatedAsyncioTestCase):
             [name for name, _ in broker.page_calls],
             ["get_option_chains", "get_option_instruments", "get_option_chains", "get_option_instruments"],
         )
+        instrument_queries = [
+            args for name, args in broker.page_calls if name == "get_option_instruments"
+        ]
+        self.assertEqual(
+            instrument_queries[0],
+            {
+                "chain_symbol": "SPY",
+                "expiration_dates": "2026-09-11",
+                "strike_price": "500",
+                "type": "call",
+                "state": "active",
+                "tradability": "tradable",
+            },
+        )
         self.assertEqual(broker.page_calls[-1][1], {"ids": option_id})
         self.assertEqual(set(broker.contracts[next(iter(broker.contracts))]), {"chain_id", "option_id"})
         self.assertEqual(broker.search_calls, 0)
@@ -296,6 +313,7 @@ class SnapshotProbe(RobinhoodBroker):
         self.release_instruments = asyncio.Event()
         self.quote_started = asyncio.Event()
         self.release_quotes = asyncio.Event()
+        self.quote_cancelled = asyncio.Event()
         self.instrument_calls = []
         self.quote_calls = []
         self.quote_age_checks = []
@@ -387,7 +405,11 @@ class SnapshotProbe(RobinhoodBroker):
         self.quote_calls.append(option_id)
         if len(self.quote_calls) == 2:
             self.quote_started.set()
-        await self.release_quotes.wait()
+        try:
+            await self.release_quotes.wait()
+        except asyncio.CancelledError:
+            self.quote_cancelled.set()
+            raise
         return copy.deepcopy(self.fixture_quotes[option_id])
 
     def _check_quote_age(self, timestamp, label="Option quote"):
@@ -480,6 +502,23 @@ class ExpiryProbe(RobinhoodBroker):
             return copy.deepcopy(self.chains)
         if name != "get_option_instruments":
             raise AssertionError(f"unexpected page request: {name}")
+        if args.get("chain_symbol") == "SPY":
+            self.instrument_started.append("combined")
+            self.all_instruments_started.set()
+            try:
+                if self.failing_chain is not None:
+                    raise BrokerError("fixture instrument failure")
+                await self.release_instruments.wait()
+            except asyncio.CancelledError:
+                self.sibling_cancelled.set()
+                raise
+            expiries = args["expiration_dates"].split(",")
+            return copy.deepcopy([
+                instrument
+                for rows in self.rows_by_chain.values()
+                for instrument in rows
+                if instrument["expiration_date"] in expiries
+            ])
         chain_id = args["chain_id"]
         self.instrument_started.append(chain_id)
         if len(set(self.instrument_started)) == len(self.chains):
@@ -539,9 +578,9 @@ class SnapshotLatencyTests(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(broker.instrument_started.wait(), 1)
         self.assertFalse(task.done())
-        broker.release_instruments.set()
         await asyncio.wait_for(broker.quote_started.wait(), 1)
         self.assertFalse(task.done())
+        broker.release_instruments.set()
         broker.release_quotes.set()
 
         first = await task
@@ -568,7 +607,8 @@ class SnapshotLatencyTests(unittest.IsolatedAsyncioTestCase):
             await broker.snapshot()
 
         await asyncio.wait_for(broker.sibling_cancelled.wait(), 1)
-        self.assertEqual(broker.quote_calls, [])
+        await asyncio.wait_for(broker.quote_cancelled.wait(), 1)
+        self.assertEqual(broker.quote_calls, ["opt-a", "opt-b"])
 
 
 class BrokerReadLatencyTests(unittest.IsolatedAsyncioTestCase):
@@ -601,17 +641,65 @@ class BrokerReadLatencyTests(unittest.IsolatedAsyncioTestCase):
 
         resolved = await task
         self.assertEqual(resolved["expiry"], "2026-09-11")
-        self.assertEqual(set(broker.instrument_started), {"chain-a", "chain-b"})
+        self.assertEqual(broker.instrument_started, ["combined"])
 
     async def test_nearest_expiry_cancels_sibling_chain_read_on_failure(self):
         broker = ExpiryProbe(failing_chain="chain-b")
         request = CONTRACT | {"expiry": "2026-09-08"}
 
+        original = broker._pages
+        chain_started, chain_cancelled = asyncio.Event(), asyncio.Event()
+
+        async def pages(name, args, key):
+            if name == "get_option_chains":
+                chain_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    chain_cancelled.set()
+            await chain_started.wait()
+            return await original(name, args, key)
+
+        broker._pages = pages
+
         with self.assertRaisesRegex(BrokerError, "fixture instrument failure"):
+            await asyncio.wait_for(broker.nearest_expiry(request), .5)
+
+        self.assertEqual(broker.instrument_started, ["combined"])
+        self.assertTrue(chain_cancelled.is_set())
+
+    async def test_same_day_precedes_later_dates_and_inconsistent_listing_holds(self):
+        broker = FixtureBroker()
+        today = broker.now.date().isoformat()
+        broker.chain["expiration_dates"].append(today)
+        broker.instrument_by_expiry[today] = broker._instrument("same-day", today, "500.00")
+        request = CONTRACT | {"expiry": today}
+        self.assertEqual((await broker.nearest_expiry(request))["expiry"], today)
+        queries = [args for name, args in broker.page_calls if name == "get_option_instruments"]
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(len(queries[0]["expiration_dates"].split(",")), 7)
+        broker.chain["expiration_dates"].remove(today)
+        with self.assertRaisesRegex(BrokerError, "metadata is inconsistent"):
             await broker.nearest_expiry(request)
 
-        await asyncio.wait_for(broker.sibling_cancelled.wait(), 1)
-        self.assertEqual(set(broker.instrument_started), {"chain-a", "chain-b"})
+    async def test_prefetched_instruments_follow_all_pages_before_selecting(self):
+        fixture = FixtureBroker()
+        broker = RobinhoodBroker(fixture.runtime, clock=lambda: fixture.now)
+        first = fixture.instrument_by_expiry["2026-09-18"]
+        second = fixture.instrument_by_expiry["2026-09-11"]
+
+        async def data(name, args):
+            if name == "get_option_chains":
+                return {"chains": [fixture.chain]}
+            self.assertEqual(name, "get_option_instruments")
+            if args.get("cursor") == "second":
+                return {"instruments": [second], "next": None}
+            return {"instruments": [first], "next": "https://fixture.invalid/instruments?cursor=second"}
+
+        broker._data = AsyncMock(side_effect=data)
+        resolved = await broker.nearest_expiry(CONTRACT | {"expiry": "2026-09-08"})
+        self.assertEqual(resolved["expiry"], "2026-09-11")
+        self.assertEqual(broker._data.await_count, 3)
 
     async def test_nearest_expiry_advances_dates_only_after_no_exact_match(self):
         broker = ExpiryProbe()
@@ -629,7 +717,7 @@ class BrokerReadLatencyTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             [args["expiration_dates"] for args in instrument_queries],
-            ["2026-09-11", "2026-09-11", "2026-09-18"],
+            ["2026-09-08,2026-09-09,2026-09-10,2026-09-11,2026-09-12,2026-09-13,2026-09-14", "2026-09-18"],
         )
 
     async def test_nearest_expiry_holds_ambiguous_earliest_date(self):

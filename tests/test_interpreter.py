@@ -486,6 +486,61 @@ class InterpreterChecks(unittest.TestCase):
                 _strict_json(content)
 
 class CodexInterpreterChecks(unittest.TestCase):
+    def test_invalid_evidence_retry_reprompts_without_rewriting_message_or_images(self):
+        message = {
+            "id": "1551000000000000001",
+            "content": "Profit is $200 per contract on our $XYZ calls <a:check:111111111111111111> \n\nI'm aiming for $110 before trimming, but you MIGHT scalp these and re-enter <@&222222222222222222>",
+            "source_group": "source-b",
+            "timestamp": "2026-09-22T13:55:46.897000+00:00",
+            "attachments": [{
+                "filename": "alert.png",
+                "content_type": "image/png",
+                "url": "https://cdn.discordapp.com/attachments/123/456/alert.png",
+            }],
+        }
+        invalid = {
+            "action": "WAIT", "origin_message_id": None, "contract": None,
+            "quantity": None, "fraction": None, "alert_price": None, "stop_price": None,
+            "confidence": .2, "ambiguous": True, "reason": "Image evidence is insufficient.",
+            "evidence": [{"message_id": message["id"], "quote": "XYZ calls profit $200 per contract"}],
+            "profit_only": False,
+        }
+        valid = invalid | {
+            "reason": "The supplied text does not identify an actionable contract.",
+            "evidence": [{"message_id": message["id"], "quote": message["content"]}],
+        }
+        observed = []
+
+        def model(data, **options):
+            observed.append((copy.deepcopy(data), options.get("system_prompt")))
+            return invalid if len(observed) == 1 else valid
+
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        with patch.object(interpreter, "_interpret", side_effect=model) as run:
+            result = asyncio.run(interpreter.interpret(message, [], []))
+
+        self.assertEqual(result["evidence"][0]["quote"], message["content"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(observed[0][0], observed[1][0])
+        self.assertIsNone(observed[0][1])
+        self.assertIn("RETRY EVIDENCE CHECK", observed[1][1])
+        self.assertIn("rendered custom emoji", observed[1][1])
+        self.assertIn("Evidence does not quote a supplied message", observed[1][1])
+        self.assertEqual(observed[1][0]["current_message"]["id"], message["id"])
+        self.assertEqual(observed[1][0]["image_inputs"], [{"message_id": message["id"]}])
+
+    def test_evidence_diagnostics_expose_only_allowlisted_validation_reason(self):
+        error = InterpretationError("Evidence does not quote a supplied message", attempts=2)
+        self.assertIn("Evidence does not quote a supplied message", safe_interpretation_reason(error))
+        error = InterpretationError("Evidence contains private provider response", attempts=2)
+        self.assertNotIn("private provider response", safe_interpretation_reason(error))
+        error.evidence_issue = "private provider response"
+        self.assertNotIn("private provider response", safe_interpretation_reason(error))
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        with patch.object(interpreter, "_interpret", side_effect=[error, DECISION]) as run:
+            asyncio.run(interpreter.interpret(MESSAGE, [], []))
+        self.assertNotIn("private provider response", run.call_args_list[1].kwargs["system_prompt"])
+
     def test_retryable_image_transport_failure_retries_once_then_succeeds(self):
         message = MESSAGE | {"attachments": [{
             "filename": "alert.png", "content_type": "image/png",
@@ -793,13 +848,22 @@ class CodexInterpreterChecks(unittest.TestCase):
             ],
         }
         invalid = assessment | {"evidence": [{"message_id": LATER["id"], "quote": LATER["content"]}]}
+        prompts = []
+
+        def model(_data, **options):
+            prompts.append(options.get("system_prompt"))
+            return invalid if len(prompts) == 1 else assessment
+
         with tempfile.TemporaryDirectory() as directory:
             interpreter = self.interpreter(directory)
-            with patch.object(interpreter, "_interpret", side_effect=[invalid, assessment]) as run:
+            with patch.object(interpreter, "_interpret", side_effect=model) as run:
                 result = asyncio.run(interpreter.assess_recovery(MESSAGE, [LATER], [], DECISION, RECOVERY_FACTS))
         self.assertEqual(without_evaluation_timing(result), assessment)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(interpreter.last_attempts, 2)
+        self.assertIn("RETRY EVIDENCE CHECK (recovery)", prompts[1])
+        self.assertIn("viable, invalidated, or uncertain", prompts[1])
+        self.assertNotIn("WAIT or IGNORE", prompts[1])
 
     def test_recovery_requires_original_and_current_same_source_evidence(self):
         invalid = {

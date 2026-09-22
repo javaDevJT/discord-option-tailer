@@ -934,9 +934,17 @@ class RobinhoodBroker(RobinhoodMCP):
         if not option_ids:
             return {}
 
-        instruments = dict(zip(option_ids, await self._bounded_reads(self._instrument, option_ids)))
+        async def read(item):
+            reader, option_id = item
+            return await reader(option_id)
+
+        results = await self._bounded_reads(read, [
+            (reader, option_id) for option_id in option_ids
+            for reader in (self._instrument, self._raw_quote)
+        ])
+        instruments = dict(zip(option_ids, results[0::2]))
         contracts = {option_id: self._instrument_contract(instrument) for option_id, instrument in instruments.items()}
-        quotes = dict(zip(option_ids, await self._bounded_reads(self._raw_quote, option_ids)))
+        quotes = dict(zip(option_ids, results[1::2]))
         return {option_id: (contracts[option_id], quotes[option_id]) for option_id in option_ids}
 
     def __init__(self, config, *, interactive=False, clock=None, on_status=None):
@@ -1344,7 +1352,19 @@ class RobinhoodBroker(RobinhoodMCP):
     async def nearest_expiry(self, contract):
         """Choose the first listed standard contract at the requested strike/type."""
         target = _contract_key(contract)
-        chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
+        requested_day = datetime.strptime(target[1], "%Y-%m-%d").date()
+        # One bounded near-term query removes the chain dependency for daily/weekly entries.
+        # Later dates still use individual exact queries, with complete pagination.
+        prefetched_dates = [(requested_day + timedelta(days=day)).isoformat() for day in range(7)]
+        chains, instruments = await self._bounded_reads(lambda query: self._pages(*query), [
+            ("get_option_chains", {"underlying_symbol": target[0]}, "chains"),
+            ("get_option_instruments", {
+                "chain_symbol": target[0], "expiration_dates": ",".join(prefetched_dates),
+                "strike_price": format(Decimal(target[2]), "f"), "type": target[3],
+                "state": "active", "tradability": "tradable",
+            }, "instruments"),
+        ])
+
         eligible_chains = [
             chain for chain in chains
             if chain["symbol"] == target[0]
@@ -1353,27 +1373,29 @@ class RobinhoodBroker(RobinhoodMCP):
             and (chain["cash_component"] is None or _decimal(chain["cash_component"], "cash component") == 0)
         ]
 
+        eligible_ids = {chain["id"] for chain in eligible_chains}
         expiries = sorted({
             expiry for chain in eligible_chains
             for expiry in (chain["expiration_dates"] or [])
             if expiry >= target[1]
-        })
+        } | {row["expiration_date"] for row in instruments
+             if row["chain_id"] in eligible_ids and row["expiration_date"] in prefetched_dates})
         for expiry in expiries:
-            matching_chains = [
-                chain for chain in eligible_chains
-                if expiry in (chain["expiration_dates"] or [])
-            ]
+            rows = instruments if expiry in prefetched_dates else await self._pages(
+                    "get_option_instruments",
+                    {
+                        "chain_symbol": target[0],
+                        "expiration_dates": expiry,
+                        "strike_price": format(Decimal(target[2]), "f"),
+                        "type": target[3],
+                        "state": "active",
+                        "tradability": "tradable",
+                    },
+                    "instruments",
+                )
 
-            async def read_instruments(chain):
-                return await self._pages("get_option_instruments", {
-                    "chain_id": chain["id"], "expiration_dates": expiry,
-                    "strike_price": format(Decimal(target[2]), "f"),
-                    "type": target[3], "state": "active", "tradability": "tradable",
-                }, "instruments")
-
-            rows_by_chain = await self._bounded_reads(read_instruments, matching_chains)
             candidates = []
-            for chain, rows in zip(matching_chains, rows_by_chain):
+            for chain in eligible_chains:
                 for instrument in rows:
                     if (instrument["chain_id"] != chain["id"]
                             or instrument.get("state") != "active"
@@ -1382,8 +1404,9 @@ class RobinhoodBroker(RobinhoodMCP):
                             or _decimal(instrument["trade_value_multiplier"], "multiplier") != 100):
                         continue
                     key = _contract_key(self._instrument_contract(instrument))
-                    if (key[0] == target[0] and key[1] == expiry and key[2:] == target[2:]
-                            and key[1] in (chain["expiration_dates"] or [])):
+                    if key[0] == target[0] and key[1] == expiry and key[2:] == target[2:]:
+                        if expiry not in (chain["expiration_dates"] or []):
+                            raise BrokerError("Broker option expiry metadata is inconsistent; refusing to skip an available date")
                         candidates.append((chain, instrument))
             if len(candidates) > 1:
                 raise BrokerError("Option expiration is ambiguous across chains")
@@ -1425,22 +1448,21 @@ class RobinhoodBroker(RobinhoodMCP):
                 self.contracts.pop(target, None)
                 candidates = []
         if not candidates:
-            chains = await self._pages("get_option_chains", {"underlying_symbol": target[0]}, "chains")
+            chains, instruments = await self._bounded_reads(lambda query: self._pages(*query), [
+                ("get_option_chains", {"underlying_symbol": target[0]}, "chains"),
+                ("get_option_instruments", {
+                    "chain_symbol": target[0], "expiration_dates": target[1],
+                    "strike_price": format(Decimal(target[2]), "f"), "type": target[3],
+                    "state": "active", "tradability": "tradable",
+                }, "instruments"),
+            ])
             matching_chains = [
                 chain for chain in chains
                 if chain["symbol"] == target[0] and target[1] in (chain["expiration_dates"] or [])
             ]
 
-            async def read_instruments(chain):
-                return await self._pages("get_option_instruments", {
-                    "chain_id": chain["id"], "expiration_dates": target[1],
-                    "strike_price": format(Decimal(target[2]), "f"), "type": target[3],
-                    "state": "active", "tradability": "tradable",
-                }, "instruments")
-
-            rows_by_chain = await self._bounded_reads(read_instruments, matching_chains)
-            for chain, rows in zip(matching_chains, rows_by_chain):
-                for instrument in rows:
+            for chain in matching_chains:
+                for instrument in instruments:
                     if instrument["chain_id"] == chain["id"] and _contract_key(self._instrument_contract(instrument)) == target:
                         candidates.append((chain, instrument))
         if len(candidates) != 1:

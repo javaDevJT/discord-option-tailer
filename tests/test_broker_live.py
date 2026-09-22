@@ -306,8 +306,10 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
                 return [chain]
             self.assertEqual(args["strike_price"], "500")
             self.assertEqual(args["type"], "call")
-            self.assertIn(args["expiration_dates"], dates)
-            return rows
+            requested_dates = args["expiration_dates"].split(",")
+            self.assertLessEqual(len(requested_dates), 7)
+            self.assertEqual(args["chain_symbol"], "SPY")
+            return [row for row in rows if row["expiration_date"] in requested_dates]
         self.broker._pages = AsyncMock(side_effect=pages)
         request = self.contract | {"expiry": "2026-09-08"}
         self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-08")

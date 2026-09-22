@@ -942,11 +942,34 @@ class Engine:
                 raise Hold("sell quantity exceeds the owned position")
         if action != "OPEN" and (type(qty) is not int or qty <= 0):
             raise Hold("quantity must be a positive whole contract")
-        # Both reads must still be fresh when dispatch is rechecked below.
+        side = "buy" if action == "OPEN" else "sell"
+
+        async def checked_quote():
+            quote = await self.measure(decision, "quote_seconds", self.broker.quote(contract))
+            if canonical_contract(quote.get("contract")) != contract or quote.get("tradable") is not True:
+                raise Hold("quote does not identify the requested tradable contract")
+            if quote.get("multiplier") != 100 or quote.get("currency") != "USD" or quote.get("asset_type") != "equity_option":
+                raise Hold("only standard USD equity or ETF option contracts are supported")
+            self.check_quote_age(quote, self.clock())
+            bid, ask = money(quote.get("bid"), positive=True), money(quote.get("ask"), positive=True)
+            tick = money(quote.get("tick_size"), positive=True)
+            if tick > ask or ask < bid or (expiry_guard is None and (ask - bid) / ask > money(risk["max_spread_fraction"])):
+                raise Hold("quote spread or tick size is unacceptable")
+            price = ((ask if side == "buy" else bid) / tick).to_integral_value(rounding=ROUND_CEILING if side == "buy" else ROUND_FLOOR) * tick
+            if price <= 0:
+                raise Hold("limit price rounds to zero")
+            if action == "OPEN":
+                evaluation = entry_chase_evaluation(ask, money(decision.get("alert_price"), positive=True), price, risk["max_chase_fraction"])
+                decision["entry_evaluation"] = evaluation
+                if not entry_chase_within_cap(evaluation):
+                    raise Hold(entry_chase_reason("current ask or rounded limit exceeds permitted chase from alert premium", evaluation))
+            return quote, price
+
+        # Reject an invalid quote immediately; accepted entries still need both fresh reads.
         reads = [prepared_snapshot if prepared_snapshot is not None else asyncio.create_task(self.measure(decision, "snapshot_seconds", self.broker.snapshot())),
-                 asyncio.create_task(self.measure(decision, "quote_seconds", self.broker.quote(contract)))]
+                 asyncio.create_task(checked_quote())]
         try:
-            snapshot, quote = await asyncio.gather(*reads)
+            snapshot, (quote, price) = await asyncio.gather(*reads)
         finally:
             for task in reads:
                 if not task.done():
@@ -960,27 +983,8 @@ class Engine:
         if snapshot.get("market_open") is not True:
             raise RetryHold("broker has not confirmed an open options session")
         self.check_quote_age(snapshot, self.clock(), "account snapshot")
-        if canonical_contract(quote.get("contract")) != contract or quote.get("tradable") is not True:
-            raise Hold("quote does not identify the requested tradable contract")
-        if quote.get("multiplier") != 100 or quote.get("currency") != "USD" or quote.get("asset_type") != "equity_option":
-            raise Hold("only standard USD equity or ETF option contracts are supported")
-        self.check_quote_age(quote, self.clock())
-        self.check_quote_age(snapshot, self.clock(), "account snapshot")
-        bid, ask = money(quote.get("bid"), positive=True), money(quote.get("ask"), positive=True)
-        tick = money(quote.get("tick_size"), positive=True)
-        if tick > ask or ask < bid or (expiry_guard is None and (ask - bid) / ask > money(risk["max_spread_fraction"])):
-            raise Hold("quote spread or tick size is unacceptable")
-        side = "buy" if action == "OPEN" else "sell"
-        price = ((ask if side == "buy" else bid) / tick).to_integral_value(rounding=ROUND_CEILING if side == "buy" else ROUND_FLOOR) * tick
-        if price <= 0:
-            raise Hold("limit price rounds to zero")
         sizing = None
         if action == "OPEN":
-            reference = money(decision.get("alert_price"), positive=True)
-            evaluation = entry_chase_evaluation(ask, reference, price, risk["max_chase_fraction"])
-            decision["entry_evaluation"] = evaluation
-            if not entry_chase_within_cap(evaluation):
-                raise Hold(entry_chase_reason("current ask or rounded limit exceeds permitted chase from alert premium", evaluation))
             qty, sizing = entry_size(risk, snapshot, contract, decision["confidence"], price, message["source_group"])
         self.check_quote_age(quote, self.clock())
         identity = message["id"] + ":" + message["revision"]

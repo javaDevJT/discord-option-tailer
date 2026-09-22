@@ -1,12 +1,14 @@
 # Fast entry rules, JEV, and Codex fallback
 
-Local verification completed on September 21, 2026. The regression suite passed all 484 tests, including the real HTTP key-save flow and broker read-scope checks. A subsequent focused run passed 39 checks, including an added off-thread startup-calendar regression. Tests did not use a live trade or model-provider call. Local parsing results and simulated broker delays do not establish live submission latency.
+Local verification on September 22, 2026 passed all 490 tests, including the real HTTP key-save flow, broker read-scope checks, expiry ordering, concurrent reads, and corrected evidence retries. Tests did not use a live trade or model-provider call. Local parsing results and simulated broker delays do not establish live submission latency.
 
 ## Routing boundaries
 
 1. **Direct code:** a recognized literal entry with exactly one contract and premium, no unsupported clause, and sufficient explicit facts returns a validated OPEN decision immediately. The current schemas cover clean structured ENTRY cards and complete supported OPEN/BUY text. No model lock, request, or token is involved.
 2. **JEV:** a bounded candidate with complete text facts but intent requiring interpretation can use the configured JEV fallback. Native confidence, selected probability, and action/evidence eligibility must meet their configured thresholds. Eligible entry attempts have a 700 ms ceiling, including slot waiting; other JEV attempts use the configured deadline, up to 1,200 ms.
 3. **Codex:** missing or contradictory facts, screenshot-dependent contracts, unsupported compound actions, unresolved references, schema failures, timeout, or uncertain JEV output use the subscription-backed evaluator. Recovery assessment remains Codex-only.
+
+Prose profit updates still use model interpretation. Evidence must quote the supplied message text or embeds exactly; rendered custom emoji and text read from an image are not substitutes for a source quote. A rejected evidence result gets one corrective retry with the specific local validation issue and the unchanged source/image context. Recovery uses its own assessment schema during that retry. If validation still fails, the dashboard reports the bounded validation reason and no order is submitted; raw provider output and credentials are never included in that diagnostic.
 
 A direct entry uses positive template matching. Extra comments, unparsed stop or sizing instructions, cancellation, historical/quoted content, conflicting contracts/prices, missing call/put, and incomplete fields do not become buys through a loose keyword match. Current text must independently establish the intended entry. An unrelated earlier image does not invalidate complete current text. An image that may supply a missing expiry or other necessary fact requires image-capable interpretation.
 
@@ -39,15 +41,19 @@ flowchart LR
     I --> J[Submit limit order]
 ```
 
-The direct route does not wait for the Codex lock. A fresh account snapshot starts alongside missing-expiry discovery. Expiry lookup requests the earliest eligible listed date first, advancing only if the exact strike/type is unavailable; it checks all matching chains and rejects ambiguity. It does not fetch every later expiry before selecting the nearest one.
+The direct route does not wait for the Codex lock. A fresh account snapshot starts alongside missing-expiry discovery. Chain metadata and instruments for the exact symbol/strike/type are requested concurrently. The initial instrument query covers only the source date and following six calendar dates; all response pages are read before choosing the earliest qualified contract across matching chains. If no nearby contract exists, later listed dates are queried individually in order. Ambiguity or a matching instrument whose expiry conflicts with its chain listing causes a hold. Cold lookups for an explicit expiry also overlap chain and instrument reads.
 
-Broker reads have a task-local scope covering one serialized decision. Just-resolved contract metadata passes to its first quote lookup. Successful account and quote reads may be reused for at most one second after completion within that scope, subject to their original timestamp checks; the cache does not reset their age. This removes repeated planning-to-submission reads without retaining completed prices or balances for later decisions. Failures, cancellation, completion, or a broker mutation invalidate the scope. Reads outside that scope retain their existing behavior. Position reads and chain lookups use bounded concurrency, and overlapping portfolio requests share only the currently running fetch.
+Broker reads have a task-local scope covering one serialized decision. Just-resolved contract metadata passes to its first quote lookup. Successful account and quote reads may be reused for at most one second after completion within that scope, subject to their original timestamp checks; the cache does not reset their age. This removes repeated planning-to-submission reads without retaining completed prices or balances for later decisions. Failures, cancellation, completion, or a broker mutation invalidate the scope. Reads outside that scope retain their existing behavior. Position metadata and raw quotes are read concurrently with a shared limit of four outstanding requests. Overlapping portfolio requests share only the currently running fetch.
 
 The exchange calendar is initialized in a background thread during broker startup, before signal processing. Market-session checks still run at decision and submission time. A local cold calendar call took 1.057 seconds versus 0.000115 seconds once initialized; those are CPU measurements, not broker-response measurements.
 
 An offline comparison of the same nearest-expiry entry through a fixture broker reduced the request count from 18 to 9. With a simulated 150 ms delay per request and calendars initialized for both versions, elapsed time through the simulated submission fell from 1.372 to 0.758 seconds. This excludes Discord source verification and real provider variability; it is a request-graph regression check, not a live latency claim.
 
+The September 22 follow-up kept nine calls but removed another serial dependency. With the same 150 ms simulated RPC delay, the same-day fixture fell from 0.828 to 0.639 seconds and the nearest-later-expiry fixture from 0.803 to 0.616 seconds. These measurements also exclude real network and Discord source verification. Broker latency can still keep a real submission above the one-second target.
+
 Live execution performs its authoritative source verification at the final pre-submit boundary after broker review, with local checks before and after. A changed source, kill switch, stale quote, account restriction, reduced affordability, excessive chase, or uncertain previous order still prevents placement. Cancellation drains pending reads. The existing order ledger and idempotency rules remain authoritative.
+
+Quote validation runs inside the parallel quote task. An invalid or over-chase quote can therefore stop the decision and cancel an unfinished account read immediately. An accepted entry still waits for both fresh account and quote results; this early rejection does not authorize a buy from cached account data.
 
 The dashboard distinguishes rules, JEV, and Codex and displays:
 

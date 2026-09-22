@@ -198,6 +198,10 @@ Every non-IGNORE decision requires exact, nonempty source quotes with the
 supplied message IDs. A trading proposal must quote the CURRENT message as well
 as any older record used to resolve its contract. Quotes must be verbatim from
 the transmitted content or embed text; never quote attachment names as signals.
+Rendered image/OCR text, including rendered custom emoji, is not textual evidence.
+If no exact quote from supplied content or embed text exists, use IGNORE with
+evidence=[]; WAIT requires a valid textual quote. Never invent or paraphrase a
+quote to satisfy evidence validation.
 For OPEN, REDUCE and CLOSE, origin_message_id must identify the supplied message
 that actually authorizes that entry or exit, with a quote from that message.
 A later clarification can fill missing contract details but cannot replace the
@@ -209,6 +213,25 @@ the origin timestamp independently. Use null when there is no entry/exit trigger
 IGNORE, WAIT and UPDATE_STOP may have a null origin_message_id.
 Confidence is 0 to 1. Uncertainty cannot be cured by a high confidence number.
 Give a concise reason describing the interpretation and any missing information.
+"""
+
+_DECISION_EVIDENCE_RETRY_GUIDANCE = """RETRY EVIDENCE CHECK (decision):
+The previous structured response failed local evidence validation. Re-evaluate
+the unchanged current message and context, then repair the evidence. Copy every
+quote character-for-character from supplied content or embed text. Do not quote
+OCR, rendered image text, attachment metadata, or rendered custom emoji. If no
+exact textual quote exists, return IGNORE with evidence=[]; WAIT requires a
+valid textual quote, so never invent or paraphrase one.
+"""
+
+_RECOVERY_EVIDENCE_RETRY_GUIDANCE = """RETRY EVIDENCE CHECK (recovery):
+The previous structured response failed local evidence validation. Re-evaluate
+the unchanged current message, original message, and context. Return only the
+recovery schema with status viable, invalidated, or uncertain. Copy evidence
+quotes character-for-character from supplied content or embed text, including
+the current message and original trigger when required. Do not quote OCR,
+rendered image text, attachment metadata, or rendered custom emoji. If a
+required textual quote is unavailable, do not fabricate one; remain fail-closed.
 """
 
 RECOVERY_SYSTEM_PROMPT = """You assess whether an already parsed options proposal remains viable for review at
@@ -261,6 +284,7 @@ class InterpretationError(ValueError):
         self.retryable = _retryable_code(self.code) if retryable is None else bool(retryable)
         self.attempts = attempts if type(attempts) is int and 1 <= attempts <= 2 else 1
         self.detail = DIAGNOSTIC_DETAILS[self.code]
+        self.evidence_issue = message if self.code == "invalid_evidence" and isinstance(message, str) and message in _EVIDENCE_VALIDATION_DETAILS else None
         # Every message is canonicalized so raw provider text cannot leak.
         super().__init__(self.detail)
 
@@ -288,6 +312,23 @@ DIAGNOSTIC_DETAILS = {
 
 RETRYABLE_DIAGNOSTIC_CODES = frozenset({
     "network_unavailable", "timeout", "invalid_output", "invalid_evidence", "provider_failed",
+})
+
+_EVIDENCE_VALIDATION_DETAILS = frozenset({
+    "evidence must be a bounded list", "Malformed evidence",
+    "Evidence requires a bounded quote and string ID",
+    "Evidence does not quote a supplied message",
+    "Trading evidence cannot cross source groups",
+    "Non-IGNORE decisions require evidence",
+    "Origin must be a supplied message from the same source group",
+    "Decision must quote its origin message",
+    "Trading proposals require current-message evidence",
+    "Recovery evidence must be a bounded nonempty list", "Malformed recovery evidence",
+    "Recovery evidence requires a bounded quote and string ID",
+    "Recovery evidence does not quote a supplied message",
+    "Recovery evidence cannot cross source groups",
+    "Recovery evidence must quote the current message",
+    "Recovery evidence must quote the original trigger",
 })
 
 
@@ -421,7 +462,11 @@ def safe_interpretation_reason(error):
     attempts = getattr(error, "attempts", 1)
     if type(attempts) is not int or not 1 <= attempts <= 2:
         attempts = 1
-    return f"evaluation failed: code={code}; attempts={attempts}; detail={DIAGNOSTIC_DETAILS[code]}; no order submitted"
+    detail = DIAGNOSTIC_DETAILS[code]
+    issue = getattr(error, "evidence_issue", None)
+    if code == "invalid_evidence" and isinstance(issue, str) and issue in _EVIDENCE_VALIDATION_DETAILS:
+        detail += ": " + issue
+    return f"evaluation failed: code={code}; attempts={attempts}; detail={detail}; no order submitted"
 
 
 def _text(value, limit=6000):
@@ -1209,6 +1254,15 @@ class CodexInterpreter:
                     error = InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False)
                 error.attempts = attempt
                 last_error = error
+                if error.code == "invalid_evidence" and error.retryable and attempt < 2:
+                    base_prompt = options.get("system_prompt") or SYSTEM_PROMPT
+                    guidance = (_RECOVERY_EVIDENCE_RETRY_GUIDANCE if timing_path == "recovery"
+                                else _DECISION_EVIDENCE_RETRY_GUIDANCE)
+                    issue = getattr(error, "evidence_issue", None)
+                    if isinstance(issue, str) and issue in _EVIDENCE_VALIDATION_DETAILS:
+                        guidance += "\nLocal validation: " + issue
+                    options["system_prompt"] = base_prompt.rstrip() + "\n\n" + guidance
+                    continue
                 if isinstance(error, _ImageContextMissing) and not context_retry_used and attempt < 2:
                     updated_sources = _merge_image_sources(image_sources, error.sources)
                     if len(updated_sources) > len(image_sources):

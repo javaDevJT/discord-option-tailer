@@ -170,6 +170,42 @@ class EntryExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evaluation_timing"]["evaluator"], "rules")
         self.assertEqual(result["evaluation_timing"]["model_duration_seconds"], 0)
 
+    async def test_chase_hold_cancels_pending_snapshot_but_valid_entry_waits(self):
+        snapshot_started = asyncio.Event()
+        snapshot_stopped = asyncio.Event()
+        release_snapshot = asyncio.Event()
+
+        async def snapshot():
+            snapshot_started.set()
+            try:
+                await release_snapshot.wait()
+                return self.broker.account
+            finally:
+                snapshot_stopped.set()
+
+        self.broker.snapshot = snapshot
+        self.broker.quotes.update(ask="1.20", bid="1.19")
+        result = await asyncio.wait_for(self.engine.handle(self.message()), .5)
+        self.assertEqual(result["state"], "held", result)
+        self.assertIn("permitted chase", result["reason"])
+        self.assertIn("evaluated ask=$1.2,", result["reason"])
+        self.assertTrue(snapshot_started.is_set())
+        self.assertTrue(snapshot_stopped.is_set())
+        self.assertFalse(self.broker.submissions)
+
+        snapshot_started.clear()
+        snapshot_stopped.clear()
+        self.broker.quotes.clear()
+        task = asyncio.create_task(self.engine.handle(self.message()))
+        await asyncio.wait_for(snapshot_started.wait(), .5)
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertFalse(self.broker.submissions)
+        release_snapshot.set()
+        result = await asyncio.wait_for(task, .5)
+        self.assertEqual(result["state"], "paper_order", result)
+        self.assertEqual(len(self.broker.submissions), 1)
+
     async def test_shadow_and_opt_out_preserve_codex_authority(self):
         for mode, direct_entries in (("jev_shadow", True), ("codex", False)):
             with self.subTest(mode=mode):
