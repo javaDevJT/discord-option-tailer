@@ -39,7 +39,7 @@ EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
-    "evaluation_timing", "profit_only", "exit_evaluation", "stop_evaluation",
+    "evaluation_timing", "profit_only", "exit_evaluation", "stop_evaluation", "order_reconciliation",
 )
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
@@ -162,6 +162,29 @@ def _project_stop_evaluation(value):
         result["order_id"] = order_id
     if result and "status" not in result:
         result["status"] = "unknown"
+    return result or None
+
+
+def _project_order_reconciliation(value):
+    reconciliation = _json_object(value)
+    if not reconciliation:
+        return None
+    result = {}
+    if "status" in reconciliation:
+        status = _safe_text(reconciliation["status"], 64).lower()
+        if status in ORDER_STATUSES:
+            result["status"] = status
+    for key in ("filled_quantity", "requested_quantity"):
+        quantity = reconciliation.get(key)
+        if type(quantity) is int and 0 <= quantity <= 1_000_000:
+            result[key] = quantity
+    broker_id = _safe_broker_id(reconciliation.get("broker_order_id"))
+    if broker_id:
+        result["broker_order_id"] = broker_id
+    if "fill_price" in reconciliation:
+        fill_price = _safe_scalar(reconciliation["fill_price"], 256)
+        if fill_price is not None:
+            result["fill_price"] = fill_price
     return result or None
 
 
@@ -455,6 +478,10 @@ def _project_decision(value):
             projected = _project_stop_evaluation(current)
             if projected is not None:
                 result[key] = projected
+        elif key == "order_reconciliation":
+            projected = _project_order_reconciliation(current)
+            if projected is not None:
+                result[key] = projected
         elif key == "exit_evaluation":
             result[key] = {name: _safe_scalar(value, 128) for name, value in _json_object(current).items()
                            if name in {"owned_quantity", "sell_quantity", "requested_fraction", "default_half", "profit_only",
@@ -475,6 +502,15 @@ def _project_decision(value):
     return result
 
 
+def _project_event_state(value, decision):
+    state = _safe_state(value)
+    reconciliation = decision.get("order_reconciliation") if isinstance(decision, dict) else None
+    reconciled_status = reconciliation.get("status") if isinstance(reconciliation, dict) else None
+    if state == "unknown" and reconciled_status in ORDER_STATUSES:
+        return reconciled_status
+    return state
+
+
 def _project_message(row, event):
     body = _json_object(row["body"])
     author = body.get("author") if isinstance(body.get("author"), dict) else {}
@@ -482,10 +518,11 @@ def _project_message(row, event):
     author_name = body.get("author_name") or author.get("global_name") or author.get("nickname") or author.get("name") or author.get("username") or ""
     latest_event = None
     if event is not None and event["id"] is not None:
+        decision = _project_decision(event["decision"])
         latest_event = {
-            "state": _safe_state(event["state"]),
+            "state": _project_event_state(event["state"], decision),
             "reason": _safe_text(event["reason"], 4000),
-            "decision": _project_decision(event["decision"]),
+            "decision": decision,
             "created_at": _safe_text(event["created_at"], 128),
         }
     return {
@@ -513,13 +550,14 @@ def _project_message_images(row, body):
 
 
 def _project_event(row):
+    decision = _project_decision(row["decision"])
     return {
         "id": row["id"] if type(row["id"]) is int else 0,
         "message_id": _safe_identifier(row["message_id"]),
         "revision": _safe_identifier(row["revision"], 128),
-        "state": _safe_state(row["state"]),
+        "state": _project_event_state(row["state"], decision),
         "reason": _safe_text(row["reason"], 4000),
-        "decision": _project_decision(row["decision"]),
+        "decision": decision,
         "created_at": _safe_text(row["created_at"], 128),
     }
 
@@ -1070,7 +1108,7 @@ class DashboardApp:
         config = self.snapshot()
         values, limit, offset = self._list_query(query, {"limit", "offset", "q", "channel_id", "state"}, "messages")
         state = values.get("state") or None
-        if state and state not in MESSAGE_STATES:
+        if state and state not in EVENT_STATES:
             raise QueryError("unknown message state")
 
         def read(connection, tables):
@@ -1096,7 +1134,11 @@ class DashboardApp:
             if state:
                 if not has_events:
                     return {"items": [], "next_offset": None}
-                clauses.append("e.state = ?")
+                connection.create_function(
+                    "dashboard_event_state", 2,
+                    lambda raw_state, raw_decision: _project_event_state(raw_state, _project_decision(raw_decision)),
+                )
+                clauses.append("dashboard_event_state(e.state, e.decision) = ?")
                 parameters.append(state)
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             sql = f"SELECT m.*, {event_select} FROM messages AS m {event_join}{where} ORDER BY m.timestamp DESC, m.id DESC LIMIT ? OFFSET ?"

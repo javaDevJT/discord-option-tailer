@@ -233,6 +233,53 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 2)
         self.assertEqual(payload["next_offset"], 2)
 
+    def test_reconciled_unknown_event_projects_terminal_state_without_duplicate_message(self):
+        connection = sqlite3.connect(self.database)
+        decision = json.loads(connection.execute("SELECT decision FROM events WHERE id=2").fetchone()[0])
+        decision["order_reconciliation"] = {
+            "status": "filled",
+            "filled_quantity": 1,
+            "requested_quantity": 1,
+            "broker_order_id": "broker-1",
+            "fill_price": "0.80",
+            "secret": "must not be projected",
+        }
+        connection.execute(
+            "UPDATE events SET state=?, reason=?, decision=? WHERE id=2",
+            ("unknown", "Order reconciled: filled; filled 1/1", json.dumps(decision)),
+        )
+        connection.commit()
+        connection.close()
+
+        status, _, payload = self.request("/api/messages?limit=5&q=entry%20two")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertIsNone(payload["next_offset"])
+        event = payload["items"][0]["latest_event"]
+        self.assertEqual(event["state"], "filled")
+        self.assertEqual(event["decision"]["action"], "OPEN")
+        self.assertEqual(event["decision"]["order_reconciliation"]["status"], "filled")
+        self.assertNotIn("secret", json.dumps(event))
+
+        status, _, payload = self.request("/api/messages?limit=5&q=entry%20two&state=filled")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["latest_event"]["state"], "filled")
+
+        status, _, payload = self.request("/api/messages?limit=5&q=entry%20two&state=unknown")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["items"], [])
+
+        status, _, payload = self.request("/api/events?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["items"][0]["state"], "filled")
+
+        from relay.dashboard import _project_decision
+        self.assertNotIn(
+            "order_reconciliation",
+            _project_decision({"order_reconciliation": {"status": "not-a-state"}}),
+        )
+
     def test_orders_events_positions_are_safe_projections_and_filterable(self):
         status, _, payload = self.request("/api/orders?status=pending")
         self.assertEqual(status, 200)
