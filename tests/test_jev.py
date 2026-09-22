@@ -266,6 +266,18 @@ class JEVTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JEVParserEntryTests(unittest.TestCase):
+    def test_stop_bearing_complete_entry_falls_back_to_codex(self):
+        for instruction in ("S/L BE", "SL .80", "S.L. .80", "B/E"):
+            with self.subTest(instruction=instruction):
+                result = extract_candidates({
+                    **MESSAGE,
+                    "content": "Buy TSLA 352.5 put expiring 2026-09-04 at .87; " + instruction,
+                })
+                self.assertEqual(result.candidates, ())
+                self.assertEqual(result.reason, "message_ambiguous")
+        from relay.jev import _has_stop_instruction
+        self.assertFalse(_has_stop_instruction("this may be quick"))
+
     def test_dollar_prefixed_entry_is_a_complete_candidate(self):
         message = {
             "id": "entry-1",

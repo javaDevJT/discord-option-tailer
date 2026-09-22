@@ -480,6 +480,37 @@ class InterpreterChecks(unittest.TestCase):
         stop = DECISION | {"action": "UPDATE_STOP", "origin_message_id": None, "stop_price": ".60"}
         self.assertEqual(validate_decision(stop, MESSAGE, []), stop)
 
+    def test_stop_price_accepts_canonical_breakeven_and_numeric_premium(self):
+        for action, fraction in (("REDUCE", .5), ("UPDATE_STOP", None)):
+            decision = DECISION | {
+                "action": action,
+                "origin_message_id": MESSAGE["id"] if action == "REDUCE" else None,
+                "fraction": fraction,
+                "alert_price": None,
+                "stop_price": "breakeven",
+                "reason": "Option premium stop.",
+                "evidence": [{"message_id": MESSAGE["id"], "quote": MESSAGE["content"]}],
+            }
+            self.assertEqual(validate_decision(decision, MESSAGE, []), decision)
+
+        numeric = DECISION | {"action": "UPDATE_STOP", "origin_message_id": None, "stop_price": ".60"}
+        self.assertEqual(validate_decision(numeric, MESSAGE, []), numeric)
+        with self.assertRaises(InterpretationError):
+            validate_decision(numeric | {"stop_price": "BE"}, MESSAGE, [])
+
+    def test_stop_prompt_requires_owned_option_premium_and_preserves_compound_exit(self):
+        prompt = " ".join(SYSTEM_PROMPT.split())
+        for phrase in (
+            'exactly the canonical literal "breakeven"',
+            "average option premium",
+            "stock or underlying-price",
+            'REDUCE with fraction 0.5 and stop_price "breakeven"',
+            "do not",
+            "unowned position",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+
     def test_duplicate_fields_nonfinite_and_nonjson_rejected(self):
         for content in ('{"a": 1, "a": 2}', '{"confidence": NaN}', '```json\n{}\n```', '{} trailing'):
             with self.subTest(content=content), self.assertRaises(InterpretationError):

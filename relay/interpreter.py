@@ -60,7 +60,10 @@ DECISION_SCHEMA = {
         "fraction": {"type": ["number", "null"]},
         "profit_only": {"type": "boolean"},
         "alert_price": {"type": ["string", "null"]},
-        "stop_price": {"type": ["string", "null"]},
+        "stop_price": {
+            "type": ["string", "null"],
+            "description": "Option premium stop as a positive decimal string or the canonical literal breakeven.",
+        },
         "confidence": {"type": "number"},
         "ambiguous": {"type": "boolean"},
         "reason": {"type": "string"},
@@ -158,9 +161,17 @@ For a reply, use its explicit referenced message when present and consistent.
 If multiple positions or competing theses fit, WAIT with ambiguous=true.
 REDUCE means an explicit partial exit or a high-confidence contextual CURRENT
 success/closing signal on one exact relay-owned position; UPDATE_STOP needs an
-explicit OPTION PREMIUM stop, not an underlying
-support/resistance number. "BE" means the known current position's average option
-premium; unknown cost basis means WAIT. Do not invent a numeric stop. OPEN may
+explicit OPTION PREMIUM stop, not a stock or underlying-price
+support/resistance number. The stop_price field is either null, a positive
+decimal string containing the option premium, or exactly the canonical literal
+"breakeven". "BE", "S/L BE" and "breakeven" mean the exact current
+relay-owned position's average option premium; the engine resolves that value
+later from the actual owned entry average. A compound partial-exit instruction
+such as "took half here - S/L BE" is REDUCE with fraction 0.5 and
+stop_price "breakeven". A standalone stop instruction is UPDATE_STOP with the
+same stop_price, with quantity=null and fraction=null: it protects the entire
+remaining owned position. Unknown cost basis means WAIT. Do not invent a numeric stop,
+guess a stock-underlying stop, or authorize an unowned position. OPEN may
 include an explicit option premium stop. Prices and strikes are decimal strings.
 Quantity is the user's explicit contract count when stated, otherwise null;
 fraction is a stated partial-exit fraction (0 < fraction <= 1), otherwise null.
@@ -606,6 +617,8 @@ def validate_decision(decision, message, context):
         raise InterpretationError("fraction must be greater than zero and at most one")
     for field in ("alert_price", "stop_price"):
         if decision[field] is not None:
+            if field == "stop_price" and decision[field] == "breakeven":
+                continue
             _decimal(decision[field], field)
     evidence = decision["evidence"]
     if not isinstance(evidence, list) or len(evidence) > 20:

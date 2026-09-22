@@ -309,6 +309,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS positions (
                 source_group TEXT NOT NULL, contract TEXT NOT NULL, quantity INTEGER NOT NULL,
                 average_price TEXT NOT NULL, PRIMARY KEY(source_group, contract));
+            CREATE TABLE IF NOT EXISTS stop_requests (
+                source_group TEXT NOT NULL, contract TEXT NOT NULL, message TEXT NOT NULL,
+                decision TEXT NOT NULL, stop_price TEXT NOT NULL, entry_id TEXT NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 0, order_id TEXT,
+                status TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(source_group,contract));
         """)
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS source_generations (
@@ -443,12 +448,38 @@ class Store:
                 for r in self.db.execute("SELECT * FROM positions WHERE quantity>0")]
 
     def unresolved(self):
-        return self.db.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('filled','canceled','rejected','expired')").fetchone()[0]
+        return self.db.execute("""SELECT COUNT(*) FROM orders WHERE status NOT IN ('filled','canceled','rejected','expired')
+            AND NOT (action='UPDATE_STOP' AND json_extract(body,'$.order_type')='stop_market'
+                     AND status IN ('open','partially_filled'))""").fetchone()[0]
 
     def reserve(self, message, decision, order, now):
         with self.db:
+            if decision["action"] in {"OPEN", "REDUCE"} and decision.get("stop_price") is not None:
+                self.save_stop_request(message, decision, entry_order=order if decision["action"] == "OPEN" else None)
             self.db.execute("INSERT INTO orders(id,message_id,source_group,contract,action,body,status,created_at) VALUES (?,?,?,?,?,?,?,?)", (
                 order["client_order_id"], message["id"], message["source_group"], contract_key(order["contract"]), decision["action"], json.dumps(order), "submitting", now.isoformat()))
+
+    def save_stop_request(self, message, decision, *, entry_order=None):
+        """Caller owns the transaction so compound exits and protection persist together."""
+        contract = canonical_contract(decision["contract"])
+        group, key = message["source_group"], contract_key(contract)
+        owned = self.db.execute("SELECT quantity,average_price FROM positions WHERE source_group=? AND contract=?", (group, key)).fetchone()
+        if entry_order is None and (owned is None or owned["quantity"] <= 0):
+            return None
+        entry = {"id": entry_order["client_order_id"]} if entry_order else self.db.execute("""SELECT id FROM orders WHERE source_group=? AND contract=?
+            AND action='OPEN' AND filled_quantity>0 ORDER BY rowid DESC LIMIT 1""", (group, key)).fetchone()
+        if entry is None:
+            raise Hold("stop requires an identifiable relay-owned entry fill")
+        value = decision.get("stop_price")
+        price = "breakeven" if entry_order and value == "breakeven" else money(owned["average_price"] if value == "breakeven" else value, positive=True)
+        self.db.execute("""INSERT INTO stop_requests
+            (source_group,contract,message,decision,stop_price,entry_id,status,reason)
+            VALUES (?,?,?,?,?,?,'pending','Awaiting native stop placement')
+            ON CONFLICT(source_group,contract) DO UPDATE SET
+            message=excluded.message,decision=excluded.decision,stop_price=excluded.stop_price,
+            entry_id=excluded.entry_id,order_id=NULL,status='pending',reason=excluded.reason""",
+            (group, key, json.dumps(message), json.dumps(decision), str(price), entry["id"]))
+        return self.db.execute("SELECT * FROM stop_requests WHERE source_group=? AND contract=?", (group, key)).fetchone()
 
     def mark_unknown(self, order_id):
         with self.db:
@@ -484,15 +515,16 @@ class Store:
         if row["status"] in TERMINAL and (status != row["status"] or count != row["filled_quantity"]):
             raise Hold("terminal order result changed")
         price = money(result.get("fill_price"), positive=True) if count else Decimal(0)
-        limit = money(order["limit_price"], positive=True)
-        if count and ((order["side"] == "buy" and price > limit) or (order["side"] == "sell" and price < limit)):
+        market_stop = row["action"] == "UPDATE_STOP" and order.get("order_type") in {"market", "stop_market"} and order["side"] == "sell" and order["position_effect"] == "close"
+        limit = None if market_stop else money(order["limit_price"], positive=True)
+        if count and limit is not None and ((order["side"] == "buy" and price > limit) or (order["side"] == "sell" and price < limit)):
             raise Hold("fill violates the order limit")
         total = price * count
         delta = count - row["filled_quantity"]
         delta_notional = total - money(row["filled_notional"])
         if delta < 0 or delta_notional < 0 or (delta == 0 and delta_notional != 0) or (delta > 0 and delta_notional <= 0):
             raise Hold("inconsistent cumulative fill accounting")
-        if delta and ((order["side"] == "buy" and delta_notional / delta > limit) or (order["side"] == "sell" and delta_notional / delta < limit)):
+        if delta and limit is not None and ((order["side"] == "buy" and delta_notional / delta > limit) or (order["side"] == "sell" and delta_notional / delta < limit)):
             raise Hold("incremental fill violates the order limit")
         with self.db:
             if delta:
@@ -533,6 +565,8 @@ class Engine:
         self.observations = {}
         self.source_latest = {}
         self.verify_current = None
+        from .stops import StopLoss
+        self.stops = StopLoss(self)
 
     def check_execution_mode(self):
         if self.mode not in {"paper", "shadow", "live"} or self.config.get("mode") != self.mode:
@@ -770,8 +804,6 @@ class Engine:
                     return self.store.record(message, decision["action"].lower(), decision["reason"], decision)
                 if context_only:
                     raise Hold("historical, baseline, or revised message; analysis only")
-                if decision["action"] == "UPDATE_STOP":
-                    raise Hold("stop changes require broker-native order support and review; no software stop was installed")
                 return await self.execute_decision(message, decision, prepared_snapshot=prepared_snapshot)
         except asyncio.CancelledError:
             if attempt is not None:
@@ -813,9 +845,15 @@ class Engine:
             timing[stage] = round(timing.get(stage, 0) + time.monotonic() - started, 6)
 
     async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
-        with getattr(self.broker, "execution_reads", nullcontext)():
-            return await self._execute_decision(message, decision, recovery_guard=recovery_guard,
-                                                expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+        if decision["action"] == "UPDATE_STOP":
+            return await self.stops.update(message, decision)
+        try:
+            with getattr(self.broker, "execution_reads", nullcontext)():
+                return await self._execute_decision(message, decision, recovery_guard=recovery_guard,
+                                                    expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+        finally:
+            if decision["action"] in {"REDUCE", "CLOSE"} and self.mode != "shadow" and not asyncio.current_task().cancelling():
+                await self.stops.restore(message, decision)
 
     async def _execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         def reason(label):
@@ -836,6 +874,10 @@ class Engine:
         else:
             recovery_guard()
         order = await self.plan(message, decision, recovery_guard=recovery_guard, expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+        if decision["action"] in {"REDUCE", "CLOSE"} and self.mode != "shadow":
+            await self.stops.before_exit(message, decision)
+            if message.get("_evaluation_claim") is not None:
+                message["_evaluation_claim"]["position_generation"] = self.store.position_generation(message["source_group"])
         # Live placement repeats local checks and performs one authoritative source
         # verification after broker review, immediately before submitting.
         await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard, expiry_guard=expiry_guard, verify_source=self.mode != "live")
@@ -877,9 +919,24 @@ class Engine:
             return self.store.record(message, "unknown", "submission or fill result is uncertain; all new orders are blocked pending reconciliation", decision)
         state = "paper_order" if self.mode == "paper" else "broker_order"
         label = "simulated order: " if self.mode == "paper" else "broker order: "
+        protection = None
+        if decision["action"] in {"REDUCE", "CLOSE"} or decision.get("stop_price") is not None:
+            protection = await self.stops.after_exit(message, decision)
+            if protection is not None:
+                decision["stop_evaluation"] = protection
         if recovery_guard is not None:
             label = "missed exit catch-up; " + label
-        return self.store.record(message, state, reason(label + result["status"]), decision | {"order_proposal": order})
+        detail = reason(label + result["status"])
+        if protection is not None:
+            detail += "; " + protection["reason"]
+        return self.store.record(message, state, detail, decision | {"order_proposal": order})
+
+    def check_entry_lifetime(self, message, decision):
+        entry = self.store.db.execute("""SELECT created_at FROM orders WHERE source_group=? AND contract=?
+            AND action='OPEN' AND filled_quantity>0 ORDER BY rowid DESC LIMIT 1""",
+            (message["source_group"], contract_key(decision["contract"]))).fetchone()
+        if entry is not None and instant(entry["created_at"]) > instant(self.origin(message, decision)["timestamp"]):
+            raise Hold("signal predates the current relay-owned entry; it cannot change a reopened position")
 
     async def plan(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         risk = self.config["risk"]
@@ -891,6 +948,8 @@ class Engine:
         action = decision["action"]
         if action not in {"OPEN", "REDUCE", "CLOSE"}:
             raise Hold("unsupported action")
+        if action != "OPEN" and expiry_guard is None:
+            self.check_entry_lifetime(message, decision)
         contract = canonical_contract(decision.get("contract"))
         key = contract_key(contract)
         now = self.clock()

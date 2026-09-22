@@ -131,13 +131,25 @@ The default configuration uses a confidence-based sizing reference between 5% an
 
 These percentage allocations determine quantity rather than a minimum account balance. When the reference budget cannot cover one whole contract, an otherwise eligible entry uses exactly one contract if available buying power after any configured cash reserve covers the rounded limit price times 100 plus fees. For example, a $35.32 reference budget and a $144 contract cost yield one contract when at least $144 is available. When the reference budget supports multiple contracts, normal whole-contract sizing applies. Existing and pending exposure still reduce that reference budget. There is no fixed-dollar cap, fixed contract-count cap, daily entry-count limit, or daily gross-entry limit. Optional calibrated quarter-Kelly statistics can reduce the reference budget; a nonpositive calibrated edge still blocks entry. Other eligibility, chase and broker checks remain required.
 
-The execution path accepts single-leg long standard USD equity or ETF options for buy-to-open, reduce, and sell-to-close actions. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, short positions, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
+The execution path accepts single-leg long standard USD equity or ETF options for buy-to-open, reduce, sell-to-close, and native sell-stop actions. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, short positions, spreads, conditional scheduling, averaging in are held. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
 
 Model, reasoning, Fast/Standard service, and chase can be saved in **Setup → Signal evaluation**. Saving pauses the relay and waits for the worker to load the configuration. The example uses `gpt-6-astra`, medium reasoning, Fast, and 10% chase on the existing ChatGPT subscription.
 
 Evaluation retries once for transient failures and invalid structured output or evidence; auth, quota, and configuration failures are not retried. Broker submissions are never retried by this mechanism. Failed evaluations include sanitized diagnostics in Messages and Audit. Codex or Robinhood authentication rejection updates Setup and triggers the configured Discord webhook once per incident. Reauthentication failures remain visible across restarts until the affected provider succeeds.
 
 ## Monitor and operate
+
+### Agent-directed stop losses
+
+Codex interprets stop instructions; stop-bearing messages bypass JEV and literal entry parsing. A partial exit plus a breakeven instruction produces one `REDUCE` decision with `stop_price="breakeven"`. A standalone stop change produces `UPDATE_STOP`. Numeric stops refer to the option premium; an underlying stock-price level is not treated as an option-premium stop.
+
+The contract must match an exact current relay-owned position from the same source. Breakeven uses the relay's actual average entry premium, rounded upward to a valid price tick. Half of two contracts sells one and protects the remaining one; half of one sells that contract and leaves no remainder. A held entry does not create an owned position.
+
+Protection uses broker-reviewed native stop-market sell-to-close orders, good until canceled. If the requested threshold is already reached when placing protection, the remaining contracts are sold with a reviewed market order during the open options session. A stop trigger is not a guaranteed fill price or a guarantee of profit after fees. Confirmed native stops remain with the broker when the relay is offline.
+
+Later trims, full exits and expiry liquidation cancel the existing relay-owned stop and confirm its terminal status before placing a competing sale. A fill racing cancellation updates inventory first. The desired follow-up stop is persisted with the trim order, then armed for the actual remainder after the trim is reconciled. Pending trims or cancellations can leave a gap before replacement protection is active; the timeline reports pending, active, blocked or completed status. Uncertain submissions are never automatically submitted twice.
+
+Restart reconciliation resumes accepted protection requests and observes existing broker stops. A historical standalone stop instruction that was never accepted remains review-only; recovered compound exits still require the existing source and position checks. Pause prevents new changes but does not cancel a confirmed native stop. Shadow only records a proposal.
 
 ### Expiry exercise protection
 

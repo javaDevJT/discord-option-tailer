@@ -933,6 +933,39 @@ function relayReadTimeoutSignal() {
     append(body, details);
   }
 
+  function protectionText(evaluation) {
+    if (!evaluation || typeof evaluation !== "object" || Array.isArray(evaluation)) return "";
+    const status = normalized(evaluation.status);
+    const price = firstValue(evaluation.stop_price, evaluation.requested_stop_price);
+    if (!status && price === undefined) return "";
+    const label = {
+      shadow: "Protection shadow",
+      pending: "Protection pending",
+      active: "Protection active",
+      complete: "Protection complete",
+      blocked: "Protection blocked",
+    }[status] || "Protection status unknown";
+    let text = label;
+    if (price !== undefined) text += ` at ${formatMoney(price)}`;
+    if (status === "shadow") text += "; no order submitted";
+    return text;
+  }
+
+  function renderProtection(parent, evaluation) {
+    const text = protectionText(evaluation);
+    if (text) append(parent, node("div", "record-meta", text));
+  }
+
+  function renderStopOrder(parent, order) {
+    const orderType = normalized(order?.order_type);
+    const price = firstValue(order?.stop_price, order?.requested_stop_price);
+    if (!orderType && price === undefined) return;
+    const label = orderType === "stop_market"
+      ? "Native stop market order"
+      : orderType === "market" ? "Protection market exit" : "Protection order";
+    append(parent, node("div", "record-meta", `${label}${price !== undefined ? ` at ${formatMoney(price)}` : ""}`));
+  }
+
   function renderMessages() {
     const list = $("#message-list");
     if (!list) return;
@@ -993,6 +1026,7 @@ function relayReadTimeoutSignal() {
           const contract = firstValue(readDecision(event).contract, event.contract);
           if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
           renderEvaluationTiming(decisionPanel, event);
+          renderProtection(decisionPanel, readDecision(event).stop_evaluation);
         }
       } else {
         append(decisionPanel, node("span", "no-decision", "No interpretation recorded"));
@@ -1034,6 +1068,8 @@ function relayReadTimeoutSignal() {
           append(contract, node("div", "record-meta", `Evaluated ask ${formatMoney(evaluation.ask)} · ${deviation >= 0 ? "+" : ""}${formatNumber(deviation)}% vs alert`));
         }
       }
+      renderProtection(contract, order.stop_evaluation);
+      if (!order.stop_evaluation) renderStopOrder(contract, order);
       const quantity = firstValue(order.quantity, 0);
       const filled = firstValue(order.filled_quantity, order.filledQuantity, 0);
       append(quantities, node("strong", "", `${formatNumber(filled)} / ${formatNumber(quantity)}`), node("div", "record-meta", "filled / requested"));
@@ -1057,6 +1093,7 @@ function relayReadTimeoutSignal() {
       row.setAttribute("role", "listitem");
       const contract = node("div");
       append(contract, node("div", "record-title", formatContract(position.contract)), node("div", "record-meta", firstValue(position.source_group, "Source group unavailable")));
+      renderProtection(contract, position.stop_evaluation);
       const price = node("div", "record-detail");
       append(price, node("strong", "", formatMoney(position.average_price)), node("div", "record-meta", "average recorded price"));
       const quantity = node("div", "position-quantity", formatNumber(position.quantity));
@@ -1223,6 +1260,7 @@ function relayReadTimeoutSignal() {
       if (event.created_at) created.dateTime = event.created_at;
       append(row, stateNode, reason, action, created);
       renderEvaluationTiming(row, event);
+      renderProtection(row, readDecision(event).stop_evaluation);
       list.appendChild(row);
     });
     setText("#events-range", rangeText("events"));

@@ -241,6 +241,41 @@ def _action(value):
     return value if value in ACTION_NAMES else None
 
 
+def _stop_projection(value):
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    status = str(value.get("status", "")).strip().lower()
+    if status in {"shadow", "pending", "active", "complete", "blocked"}:
+        result["status"] = status
+    elif "status" in value:
+        result["status"] = "unknown"
+    price = _number(value.get("stop_price"), positive=True)
+    if price is not None:
+        result["stop_price"] = price
+    if result and "status" not in result:
+        result["status"] = "unknown"
+    return result or None
+
+
+def _order_protection(value):
+    if not isinstance(value, dict):
+        return None
+    order_type = str(value.get("order_type", "")).strip().lower()
+    if order_type not in {"stop_market", "market"}:
+        return None
+    result = {"order_type": order_type}
+    stop_price = _number(value.get("stop_price"), positive=True)
+    requested_stop_price = _number(value.get("requested_stop_price"), positive=True)
+    if stop_price is not None:
+        result["stop_price"] = stop_price
+    if requested_stop_price is not None:
+        result["requested_stop_price"] = requested_stop_price
+    if order_type == "market" and not stop_price and not requested_stop_price:
+        return None
+    return result
+
+
 def _projection(decision, *, fallback_action=None, fallback_contract=None, fallback_quantity=None, fallback_price=None):
     decision = decision if isinstance(decision, dict) else {}
     proposal = decision.get("order_proposal") if isinstance(decision.get("order_proposal"), dict) else {}
@@ -280,6 +315,12 @@ def _projection(decision, *, fallback_action=None, fallback_contract=None, fallb
         ) if (value := _number(evaluation.get(key), signed=key.endswith("deviation_percent"))) is not None}
         if "ask" in clean and "ask_deviation_percent" in clean:
             result["entry_evaluation"] = clean
+    stop_evaluation = _stop_projection(decision.get("stop_evaluation"))
+    if stop_evaluation:
+        result["stop_evaluation"] = stop_evaluation
+    protection = _order_protection(decision) or _order_protection(proposal)
+    if protection:
+        result["protection"] = protection
     return result
 
 
@@ -314,6 +355,30 @@ def _format_projection(projection):
             limit_deviation = evaluation["limit_deviation_percent"]
             limit_deviation = limit_deviation if limit_deviation.startswith("-") else "+" + limit_deviation
             parts.append(f"limit ${evaluation['limit_price']} ({limit_deviation}%)")
+    stop_evaluation = projection.get("stop_evaluation")
+    if isinstance(stop_evaluation, dict):
+        status = stop_evaluation.get("status")
+        label = {
+            "shadow": "Protection shadow",
+            "pending": "Protection pending",
+            "active": "Protection active",
+            "complete": "Protection complete",
+            "blocked": "Protection blocked",
+        }.get(status, "Protection status unknown")
+        stop_text = label
+        if stop_evaluation.get("stop_price"):
+            stop_text += f" at ${stop_evaluation['stop_price']}"
+        if status == "shadow":
+            stop_text += "; no order submitted"
+        parts.append(stop_text)
+    protection = projection.get("protection")
+    if isinstance(protection, dict):
+        order_type = protection.get("order_type")
+        label = "Native stop market order" if order_type == "stop_market" else "Protection market exit"
+        stop_price = protection.get("stop_price") or protection.get("requested_stop_price")
+        if stop_price:
+            label += f" at ${stop_price}"
+        parts.append(label)
     return " ".join(parts) or "an option action"
 
 

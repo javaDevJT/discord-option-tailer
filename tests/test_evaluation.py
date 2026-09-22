@@ -90,6 +90,38 @@ class EvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, [])
         self.assertEqual(codex.calls, ["message-2"])
 
+    async def test_jev_mode_falls_back_for_compound_stop_instruction(self):
+        stop_message = {
+            **MESSAGE,
+            "content": "Took half here - S/L BE",
+            "reply_to": MESSAGE["id"],
+        }
+        codex_result = copy.deepcopy(DECISION) | {
+            "action": "REDUCE",
+            "fraction": .5,
+            "alert_price": None,
+            "stop_price": "breakeven",
+            "reason": "Compound exit and option premium stop.",
+            "evidence": [{"message_id": stop_message["id"], "quote": stop_message["content"]}],
+        }
+        codex = Codex(codex_result)
+        seen = []
+
+        def request(_request, _timeout):
+            seen.append(True)
+            return 200, {}, json.dumps(jev_response()).encode()
+
+        config = {"evaluation": {"mode": "jev", "direct_entries": False, "api_key_file": "/does/not/exist"}}
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "abcdefgh"}, clear=False):
+            router = EvaluationRouter(config, codex=codex)
+            router.jev._request = request
+            result = await router.interpret(stop_message, [MESSAGE], [])
+
+        self.assertEqual(result["evaluation_timing"]["route"], "fallback")
+        self.assertEqual(result["evaluation_timing"]["fallback_reason"], "message_ambiguous")
+        self.assertEqual(seen, [])
+        self.assertEqual(codex.calls, [stop_message["id"]])
+
     async def test_jev_success_has_confidence_mapping_and_no_codex_call(self):
         codex = Codex()
 

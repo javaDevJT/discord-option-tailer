@@ -144,6 +144,15 @@ def _requires_codex_context(text: str, action: str | None) -> bool:
     return action in {"OPEN", "REDUCE", "CLOSE"} and _literal_contextual_text(text)
 
 
+_STOP_INSTRUCTION_RE = re.compile(
+    r"\b(?i:stop(?:[-\s]?loss)?|s\s*[/.]?\s*l|breakeven|break[-\s]?even|b\s*/\s*e)\b|\bBE\b",
+)
+
+
+def _has_stop_instruction(text: str) -> bool:
+    return bool(_STOP_INSTRUCTION_RE.search(text))
+
+
 def _fraction(text: str) -> float | None:
     return _literal_fraction(text)
 
@@ -198,6 +207,9 @@ def _extract_candidates_v2(
     parts = _literal_visible_parts(message)
     text = "\n".join(parts).strip()
     if not text:
+        return CandidateExtraction((), "message_ambiguous")
+    # ponytail: keep the fast path fail-closed until it can preserve compound stop semantics.
+    if _has_stop_instruction(text):
         return CandidateExtraction((), "message_ambiguous")
     evidence = _candidate_evidence(message)
     current_image = _has_image_evidence(message)
@@ -337,9 +349,12 @@ def _json_safe_positions(positions: Sequence[Mapping[str, Any]]) -> list[dict[st
         if contract is None:
             continue
         row = {"contract": contract}
-        for key in ("quantity", "source_group", "entry_message_id"):
+        for key in (
+            "quantity", "average_price", "bot_owned", "source_group",
+            "trader_id", "author_id", "entry_message_id",
+        ):
             value = position.get(key)
-            if isinstance(value, (str, int)):
+            if isinstance(value, (str, int, bool)):
                 row[key] = str(value)[:128] if isinstance(value, str) else value
         result.append(row)
     return result

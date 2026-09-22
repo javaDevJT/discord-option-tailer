@@ -112,16 +112,24 @@ class RecoveryEvaluator:
         if time.monotonic() < self.next_reconcile:
             return
         self.next_reconcile = time.monotonic() + 30
-        rows = self.store.db.execute("""SELECT id,broker_id FROM orders
+        rows = self.store.db.execute("""SELECT id,broker_id,body,action FROM orders
             WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
         for row in rows:
             try:
                 options = {} if self.engine.mode == "paper" else {"broker_order_id": row["broker_id"]}
+                if row["action"] == "UPDATE_STOP":
+                    options["expected_order"] = json.loads(row["body"])
                 result = await self.engine.broker.order_status(row["id"], **options)
                 self.store.apply_result(row["id"], result)
             except Exception:
+                if row["action"] == "UPDATE_STOP":
+                    self.store.mark_unknown(row["id"])
+                    request = self.store.db.execute("SELECT * FROM stop_requests WHERE order_id=?", (row["id"],)).fetchone()
+                    if request:
+                        self.engine.stops.state(request, "pending", "Native protection is awaiting broker status confirmation")
                 # An uncertain submission keeps the existing unresolved-order gate.
                 continue
+        await self.engine.stops.maintain()
 
     def exit_guard(self, message, decision, context, positions):
         engine = self.engine

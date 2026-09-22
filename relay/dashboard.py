@@ -39,7 +39,7 @@ EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
-    "evaluation_timing", "profit_only", "exit_evaluation",
+    "evaluation_timing", "profit_only", "exit_evaluation", "stop_evaluation",
 )
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
@@ -49,6 +49,9 @@ SIZING_FIELDS = (
 ORDER_BODY_FIELDS = (
     "side", "quantity", "limit_price", "position_effect", "quote_timestamp", "account_timestamp", "sizing",
 )
+
+STOP_STATUSES = frozenset({"shadow", "pending", "active", "complete", "blocked"})
+STOP_ORDER_TYPES = frozenset({"stop_market", "market"})
 
 
 class QueryError(ValueError):
@@ -126,6 +129,57 @@ def _account_money(value):
         return str(value) if Decimal(str(value)).is_finite() else None
     except InvalidOperation:
         return None
+
+
+def _positive_money(value):
+    rendered = _account_money(value)
+    if rendered is None:
+        return None
+    try:
+        return rendered if Decimal(rendered) > 0 else None
+    except InvalidOperation:
+        return None
+
+
+def _project_stop_evaluation(value):
+    evaluation = _json_object(value)
+    if not evaluation:
+        return None
+    result = {}
+    status = _safe_text(evaluation.get("status"), 64).lower()
+    if status in STOP_STATUSES:
+        result["status"] = status
+    elif "status" in evaluation:
+        result["status"] = "unknown"
+    stop_price = _positive_money(evaluation.get("stop_price"))
+    if stop_price is not None:
+        result["stop_price"] = stop_price
+    reason = _safe_text(evaluation.get("reason"), 4000)
+    if reason:
+        result["reason"] = reason
+    order_id = _safe_identifier(evaluation.get("order_id"), 256)
+    if order_id:
+        result["order_id"] = order_id
+    if result and "status" not in result:
+        result["status"] = "unknown"
+    return result or None
+
+
+def _project_order_protection(value):
+    body = _json_object(value)
+    result = {}
+    order_type = _safe_text(body.get("order_type"), 32).lower()
+    if order_type in STOP_ORDER_TYPES:
+        result["order_type"] = order_type
+    stop_price = _positive_money(body.get("stop_price"))
+    if stop_price is not None:
+        result["stop_price"] = stop_price
+    requested_stop_price = _positive_money(body.get("requested_stop_price"))
+    if requested_stop_price is not None:
+        result["requested_stop_price"] = requested_stop_price
+    if order_type == "market" and not stop_price and not requested_stop_price:
+        return None
+    return result or None
 
 
 def _project_embeds(value):
@@ -397,6 +451,10 @@ def _project_decision(value):
             result[key] = _project_entry_evaluation(current)
         elif key == "evaluation_timing":
             result[key] = _project_evaluation_timing(current)
+        elif key == "stop_evaluation":
+            projected = _project_stop_evaluation(current)
+            if projected is not None:
+                result[key] = projected
         elif key == "exit_evaluation":
             result[key] = {name: _safe_scalar(value, 128) for name, value in _json_object(current).items()
                            if name in {"owned_quantity", "sell_quantity", "requested_fraction", "default_half", "profit_only",
@@ -489,6 +547,15 @@ def _project_order(row, mode):
         "sizing": _project_sizing(body.get("sizing")),
         "entry_evaluation": _project_entry_evaluation(body.get("entry_evaluation")),
     }
+    protection = _project_order_protection(body)
+    if protection:
+        result["protection"] = protection
+        for key in ("order_type", "stop_price", "requested_stop_price"):
+            if key in protection:
+                result[key] = protection[key]
+    stop_evaluation = _project_stop_evaluation(body.get("stop_evaluation"))
+    if stop_evaluation:
+        result["stop_evaluation"] = stop_evaluation
     return result
 
 
@@ -498,12 +565,23 @@ def _safe_broker_id(value):
 
 
 def _project_position(row):
-    return {
+    result = {
         "source_group": _safe_identifier(row["source_group"]),
         "contract": _project_contract(row["contract"]),
         "quantity": row["quantity"] if type(row["quantity"]) is int and row["quantity"] > 0 else 0,
         "average_price": _safe_scalar(row["average_price"], 256),
     }
+    keys = set(row.keys()) if hasattr(row, "keys") else set(row)
+    if "stop_status" in keys:
+        stop_evaluation = _project_stop_evaluation({
+            "status": row["stop_status"],
+            "reason": row["stop_reason"],
+            "stop_price": row["stop_price"],
+            "order_id": row["stop_order_id"],
+        })
+        if stop_evaluation:
+            result["stop_evaluation"] = stop_evaluation
+    return result
 
 
 def _parse_iso(value):
@@ -1079,7 +1157,20 @@ class DashboardApp:
         def read(connection, tables):
             if "positions" not in tables:
                 return {"items": []}
-            rows = connection.execute("SELECT * FROM positions WHERE quantity > 0 ORDER BY source_group, contract").fetchall()
+            if "stop_requests" in tables:
+                rows = connection.execute(
+                    """
+                    SELECT p.*, s.status AS stop_status, s.reason AS stop_reason,
+                           s.stop_price AS stop_price, s.order_id AS stop_order_id
+                    FROM positions AS p
+                    LEFT JOIN stop_requests AS s
+                      ON s.source_group = p.source_group AND s.contract = p.contract
+                    WHERE p.quantity > 0
+                    ORDER BY p.source_group, p.contract
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM positions WHERE quantity > 0 ORDER BY source_group, contract").fetchall()
             return {"items": [_project_position(row) for row in rows]}
 
         result, _ = self._ledger(config, read, {"items": []})

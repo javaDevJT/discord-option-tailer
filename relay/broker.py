@@ -384,54 +384,126 @@ class PaperBroker:
 
     async def submit(self, order):
         order_id = order.get("client_order_id")
-        if not isinstance(order_id, str) or not order_id:
-            raise BrokerError("Paper order requires client_order_id")
         quantity = order.get("quantity")
         side, effect = order.get("side"), order.get("position_effect")
+        order_type = order.get("order_type", "limit")
+        if not isinstance(order_id, str) or not order_id:
+            raise BrokerError("Paper order requires a client_order_id")
         if type(quantity) is not int or quantity < 1 or (side, effect) not in {("buy", "open"), ("sell", "close")}:
-            raise BrokerError("Paper broker supports positive quantities of long opens and closes")
-        limit = _decimal(order.get("limit_price"), "limit price")
-        order_body = {"contract": _contract_key(order.get("contract")), "side": side,
-                      "position_effect": effect, "quantity": quantity, "limit_price": limit}
+            raise BrokerError("Paper broker supports positive quantities for long opens and closes")
+        if order_type not in {"limit", "market", "stop_market"}:
+            raise BrokerError("Paper broker supports limit, market, and stop_market orders")
+        if order_type == "limit":
+            if order.get("time_in_force", "gfd") != "gfd" or order.get("stop_price") is not None:
+                raise BrokerError("Paper limit orders require gfd and no stop price")
+            limit = _decimal(order.get("limit_price"), "limit price")
+            if limit <= 0:
+                raise BrokerError("Paper limit price must be positive")
+            stop = None
+        elif order_type == "market":
+            if (side, effect) != ("sell", "close") or order.get("limit_price") is not None or order.get("stop_price") is not None:
+                raise BrokerError("Paper market orders only support sell-to-close without prices")
+            if order.get("time_in_force", "gfd") != "gfd":
+                raise BrokerError("Paper market orders require gfd")
+            limit = None
+            stop = None
+        else:
+            if (side, effect) != ("sell", "close") or order.get("limit_price") is not None:
+                raise BrokerError("Paper stop_market orders only support sell-to-close without a limit")
+            if order.get("time_in_force") != "gtc":
+                raise BrokerError("Paper stop_market orders require gtc")
+            stop = _decimal(order.get("stop_price"), "stop price")
+            if stop <= 0:
+                raise BrokerError("Paper stop price must be positive")
+            limit = None
+        order_body = {
+            "contract": _contract_key(order.get("contract")),
+            "side": side,
+            "position_effect": effect,
+            "quantity": quantity,
+            "order_type": order_type,
+            "limit_price": limit,
+            "stop_price": stop,
+            "time_in_force": order.get("time_in_force", "gfd"),
+        }
         if order_id in self.orders:
             if order_body != self.order_bodies[order_id]:
                 raise BrokerError("Paper client_order_id was reused with different order details")
             return dict(self.orders[order_id])
-        position = next((position for position in self.positions
-                         if _contract_key(position["contract"]) == order_body["contract"]), None)
-        if side == "sell" and (position is None or quantity > position["quantity"]):
-            raise BrokerError("Paper sell quantity exceeds simulated holdings")
+        position = next((position for position in self.positions if _contract_key(position["contract"]) == order_body["contract"]), None)
+        if side == "sell":
+            reserved = sum(
+                self.order_bodies[existing_id]["quantity"] - self.orders[existing_id]["filled_quantity"]
+                for existing_id in self.orders
+                if self.order_bodies[existing_id]["contract"] == order_body["contract"]
+                and self.order_bodies[existing_id]["side"] == "sell"
+                and self.order_bodies[existing_id]["position_effect"] == "close"
+                and self.orders[existing_id]["status"] in {"open", "partially_filled"}
+            )
+            if position is None or quantity + reserved > position["quantity"]:
+                raise BrokerError("Paper sell quantity exceeds simulated holdings")
         quote = await self.quote(order["contract"])
-        if self.config.get("market_open") is not True or not quote["tradable"] or limit <= 0:
-            raise BrokerError("Paper market closed, contract untradable, or limit invalid")
+        if self.config.get("market_open") is not True or not quote["tradable"]:
+            raise BrokerError("Paper market closed or contract untradable")
+        if order_type == "stop_market":
+            # ponytail: resting paper stops never self-trigger; add an execution simulator only when paper fills need realism.
+            result = {
+                "id": order_id,
+                "status": "open",
+                "filled_quantity": 0,
+                "fill_price": None,
+                "order_type": "stop_market",
+                "stop_price": str(stop),
+                "time_in_force": "gtc",
+            }
+            self.orders[order_id] = result
+            self.order_bodies[order_id] = order_body
+            return dict(result)
         price = _decimal(quote["ask" if side == "buy" else "bid"], "fill price")
-        crossing = limit >= price if side == "buy" else limit <= price
+        crossing = order_type == "market" or (limit >= price if side == "buy" else limit <= price)
         cost = price * quantity * 100
         fees = self.fee_reserve * quantity
         if crossing and side == "buy" and cost + fees > self.buying_power:
             raise BrokerError("Insufficient simulated buying power")
         # ponytail: immediate all-or-none fixture fills; add an exchange simulator only for execution research.
-        result = {"id": order_id, "status": "filled" if crossing else "open",
-                  "filled_quantity": quantity if crossing else 0,
-                  "fill_price": str(price) if crossing else None}
+        result = {"id": order_id, "status": "filled" if crossing else "open", "filled_quantity": quantity if crossing else 0, "fill_price": str(price) if crossing else None}
         if crossing:
             if side == "buy":
-                self.restore_positions([*self.positions, {"contract": order["contract"],
-                    "quantity": quantity, "average_price": str(price)}])
+                self.restore_positions([*self.positions, {"contract": order["contract"], "quantity": quantity, "average_price": str(price)}])
             else:
                 position["quantity"] -= quantity
                 if not position["quantity"]:
                     self.positions.remove(position)
-            # Configured simulation reserve, not Robinhood's actual commission or fee schedule.
+            # Configured simulation reserve, not Robinhood's actual commission fee schedule.
             self.buying_power += (cost if side == "sell" else -cost) - fees
         self.orders[order_id] = result
         self.order_bodies[order_id] = order_body
         return dict(result)
 
-    async def order_status(self, order_id):
+    async def order_status(self, order_id, *, expected_order=None):
         if order_id not in self.orders:
-            raise BrokerError("Unknown paper order; reconcile with the durable application ledger")
+            raise BrokerError("Unknown paper order; reconcile durable application ledger")
+        if expected_order is not None:
+            body = self.order_bodies[order_id]
+            if _order_kind(expected_order) != body["order_type"] or _contracts(expected_order.get("quantity")) != body["quantity"]:
+                raise BrokerError("Paper order does not match the persisted identity")
+            expected_contract = expected_order.get("contract")
+            if expected_contract is not None and _contract_key(expected_contract) != body["contract"]:
+                raise BrokerError("Paper order contract does not match the persisted identity")
+            if body["order_type"] == "stop_market" and _decimal(expected_order.get("stop_price"), "stop price") != body["stop_price"]:
+                raise BrokerError("Paper stop price does not match the persisted identity")
         return dict(self.orders[order_id])
+
+    async def cancel_order(self, order_id, *, broker_order_id=None, expected_order=None):
+        target = broker_order_id or order_id
+        if target != order_id or target not in self.orders:
+            raise BrokerError("Unknown paper order; cancellation requires a persisted order")
+        result = await self.order_status(target, expected_order=expected_order)
+        if result["status"] in {"filled", "canceled", "rejected"}:
+            return result
+        result["status"] = "canceled"
+        self.orders[target] = result
+        return dict(result)
 
 
 class _OAuthStorage:
@@ -763,6 +835,7 @@ SCHEMA_PINS = {
     "get_option_orders": {"3d1a33c36ac93d9e3dd202f10b7597bf74fb91d491aa00c0b41ed460d7d51277"},
     "review_option_order": {"a3e359eb4e73e46d77f8fc9a3ab90ba4d88f0d36b96d58225fe8fbdde69b4dc0"},
     "place_option_order": {"2b6e3ecd2997e8a58d36b5b77c8a4883b551255d05d39511995a4245d7f37cb3"},
+    "cancel_option_order": {"b6b90ce0d295d72292c699ee6336a8ac9e0f13ed29e8a91acc46ec788c64d104"},
 }
 
 
@@ -781,6 +854,36 @@ def _contracts(value):
     if quantity != quantity.to_integral_value():
         raise BrokerError("Fractional option quantities are unsupported")
     return int(quantity)
+
+
+def _order_kind(order):
+    if not isinstance(order, dict):
+        return None
+    requested = order.get("order_type")
+    if requested in {"limit", "market", "stop_market"}:
+        return requested
+    order_type = order.get("type")
+    trigger = order.get("trigger")
+    if order_type == "limit" and trigger in (None, "immediate"):
+        return "limit"
+    if order_type == "market" and (trigger == "stop" or order.get("stop_price") is not None):
+        return "stop_market"
+    if order_type == "market" and trigger in (None, "immediate"):
+        return "market"
+    return None
+
+
+def _request_order_kind(order):
+    """Return the user-facing kind represented by a provider request body."""
+    if not isinstance(order, dict):
+        return None
+    requested = order.get("order_type")
+    if requested in {"limit", "market", "stop_market"}:
+        return requested
+    request_type = order.get("type")
+    if request_type in {"limit", "market", "stop_market"}:
+        return request_type
+    return _order_kind(order)
 
 
 class RobinhoodBroker(RobinhoodMCP):
@@ -959,6 +1062,7 @@ class RobinhoodBroker(RobinhoodMCP):
         self.instruments = {}
         self.contracts = {}
         self.order_bodies = {}
+        self.order_inputs = {}
         self.order_results = {}
         self.attempted = set()
         self.account_changed = asyncio.Event()
@@ -1298,7 +1402,23 @@ class RobinhoodBroker(RobinhoodMCP):
             if order["state"] not in {"queued", "confirmed", "partially_filled", "pending_cancelled"}:
                 raise BrokerError("An external option order has an unknown lifecycle state")
             legs = order["legs"] or []
-            if len(legs) != 1 or legs[0]["ratio_quantity"] != 1 or order["type"] != "limit" or order["trigger"] != "immediate":
+            if (
+                len(legs) != 1
+                or legs[0]["ratio_quantity"] != 1
+                or not (
+                    (order["type"] == "limit" and order["trigger"] == "immediate")
+                    or (
+                        order["type"] == "market"
+                        and order["trigger"] in {"immediate", "stop"}
+                        and legs[0]["side"] == "sell"
+                        and legs[0]["position_effect"] == "close"
+                        and (
+                            (order["trigger"] == "immediate" and order["time_in_force"] == "gfd" and order.get("stop_price") is None)
+                            or (order["trigger"] == "stop" and order["time_in_force"] == "gtc" and order.get("stop_price") is not None)
+                        )
+                    )
+                )
+            ):
                 raise BrokerError("Complex external option orders require separate risk qualification")
             leg = legs[0]
             if (leg["side"], leg["position_effect"]) not in {("buy", "open"), ("sell", "close")}:
@@ -1533,36 +1653,99 @@ class RobinhoodBroker(RobinhoodMCP):
     async def _order_args(self, order):
         quantity = order.get("quantity")
         side, effect = order.get("side"), order.get("position_effect")
+        order_type = order.get("order_type", "limit")
         if type(quantity) is not int or quantity <= 0 or (side, effect) not in {("buy", "open"), ("sell", "close")}:
             raise BrokerError("Only positive whole-contract long opens and closes are supported")
+        if order_type not in {"limit", "market", "stop_market"}:
+            raise BrokerError("Only limit, market sell-close, and stop_market sell-close orders are supported")
         quote = await self.quote(order["contract"])
         self._fresh_quote(quote)
-        price = _decimal(order.get("limit_price"), "limit price")
         ticks = quote["min_ticks"]
-        tick = _decimal(ticks["above_tick" if price >= _decimal(ticks["cutoff_price"], "tick cutoff") else "below_tick"], "tick")
-        if price <= 0 or tick <= 0 or price % tick:
-            raise BrokerError("Order price does not satisfy the option's tick rule")
-        if side == "buy" and not quote["can_open_position"]:
-            raise BrokerError("This option chain is closed to new positions")
-        args = {"account_number": self.account_number, "legs": [{"option_id": quote["option_id"], "side": side,
-                "position_effect": effect, "ratio_quantity": 1}], "quantity": str(quantity), "type": "limit",
-                "price": format(price, "f"), "time_in_force": "gfd", "market_hours": "regular_hours"}
-        return args, quote
+        cutoff = _decimal(ticks["cutoff_price"], "tick cutoff")
+        if order_type == "limit":
+            if order.get("time_in_force", "gfd") != "gfd" or order.get("stop_price") is not None:
+                raise BrokerError("Limit orders require gfd and no stop price")
+            price = _decimal(order.get("limit_price"), "limit price")
+            tick = _decimal(ticks["above_tick" if price >= cutoff else "below_tick"], "tick")
+            if price <= 0 or tick <= 0 or price % tick:
+                raise BrokerError("Order price does not satisfy the option's tick rule")
+            if side == "buy" and not quote["can_open_position"]:
+                raise BrokerError("This option chain is closed to new positions")
+            return {
+                "account_number": self.account_number,
+                "legs": [{"option_id": quote["option_id"], "side": side, "position_effect": effect, "ratio_quantity": 1}],
+                "quantity": str(quantity),
+                "type": "limit",
+                "price": format(price, "f"),
+                "time_in_force": "gfd",
+                "market_hours": "regular_hours",
+            }, quote
+        if (side, effect) != ("sell", "close"):
+            raise BrokerError("Market and stop_market orders only support sell-to-close")
+        if order.get("limit_price") is not None:
+            raise BrokerError("Market and stop_market orders omit limit_price")
+        if order_type == "market":
+            if order.get("stop_price") is not None or order.get("time_in_force", "gfd") != "gfd":
+                raise BrokerError("Market sell-close orders require gfd and no stop price")
+            return {
+                "account_number": self.account_number,
+                "legs": [{"option_id": quote["option_id"], "side": "sell", "position_effect": "close", "ratio_quantity": 1}],
+                "quantity": str(quantity),
+                "type": "market",
+                "time_in_force": "gfd",
+                "market_hours": "regular_hours",
+            }, quote
+        if order.get("time_in_force") != "gtc":
+            raise BrokerError("stop_market orders require gtc")
+        stop_price = _decimal(order.get("stop_price"), "stop price")
+        tick = _decimal(ticks["above_tick" if stop_price >= cutoff else "below_tick"], "stop tick")
+        if stop_price <= 0 or tick <= 0 or stop_price % tick:
+            raise BrokerError("Stop price does not satisfy the option's tick rule")
+        ask = _decimal(quote.get("ask"), "ask")
+        if stop_price >= ask:
+            raise BrokerError("Sell stop price must be below the current ask")
+        return {
+            "account_number": self.account_number,
+            "legs": [{"option_id": quote["option_id"], "side": "sell", "position_effect": "close", "ratio_quantity": 1}],
+            "quantity": str(quantity),
+            "type": "stop_market",
+            "stop_price": format(stop_price, "f"),
+            "time_in_force": "gtc",
+            "market_hours": "regular_hours",
+        }, quote
 
     async def _review_args(self, args, quote):
         review = await self._data("review_option_order", dict(args, chain_symbol=quote["contract"]["symbol"], underlying_type="equity"))
         if review.get("order_checks") != {}:
             raise BrokerError("Robinhood pre-trade review reported an alert; order was not placed")
-        for key in ("account_number", "type", "time_in_force", "market_hours"):
+        order_kind = args["type"]
+        expected_trigger = "stop" if order_kind == "stop_market" else "immediate"
+        for key in ("account_number", "time_in_force", "market_hours"):
             if review.get(key) != args[key]:
                 raise BrokerError("Robinhood review does not match the intended order")
+        if _order_kind(review) != order_kind:
+            raise BrokerError("Robinhood review order type does not match the intended order")
+        if "trigger" in review and review.get("trigger") != expected_trigger:
+            raise BrokerError("Robinhood review trigger does not match the intended order")
         legs = [dict(leg, ratio_quantity=leg.get("ratio_quantity", 1)) for leg in review.get("legs") or []]
         if legs != args["legs"]:
             raise BrokerError("Robinhood review legs do not match the intended order")
-        if (_contracts(review.get("quantity")) != _contracts(args["quantity"]) or
-                _decimal(review.get("price"), "review price") != _decimal(args["price"], "intended price") or
-                review.get("direction") != ("debit" if args["legs"][0]["side"] == "buy" else "credit")):
-            raise BrokerError("Robinhood review amount or direction does not match the intended order")
+        if (_contracts(review.get("quantity")) != _contracts(args["quantity"])
+                or review.get("direction") != ("debit" if args["legs"][0]["side"] == "buy" else "credit")):
+            raise BrokerError("Robinhood review quantity or direction does not match the intended order")
+        if order_kind == "limit":
+            if _decimal(review.get("price"), "review price") != _decimal(args["price"], "intended price"):
+                raise BrokerError("Robinhood review price does not match the intended order")
+            if review.get("stop_price") is not None:
+                raise BrokerError("Robinhood review unexpectedly supplied a stop price")
+        else:
+            if review.get("price") is not None:
+                raise BrokerError("Robinhood review unexpectedly supplied a limit price")
+            if order_kind == "stop_market":
+                if _decimal(review.get("stop_price"), "review stop price") != _decimal(args["stop_price"], "intended stop price"):
+                    raise BrokerError("Robinhood review stop price does not match the intended order")
+            elif review.get("stop_price") is not None:
+                raise BrokerError("Robinhood review unexpectedly supplied a stop price")
         collateral = review.get("collateral")
         if not collateral or collateral["account_number"] != self.account_number or collateral["cash"]["infinite"]:
             raise BrokerError("Robinhood review has missing or unsupported collateral")
@@ -1590,47 +1773,66 @@ class RobinhoodBroker(RobinhoodMCP):
         client_id = order.get("client_order_id")
         if not isinstance(client_id, str) or not client_id:
             raise BrokerError("A persistent client_order_id is required")
-        # A later quote observation does not change the economic order identity.
-        body = json.dumps(dict({key: value for key, value in order.items() if key != "entry_evaluation"}, contract=_contract_key(order.get("contract")),
-            limit_price=str(_decimal(order.get("limit_price"), "limit price").normalize())), sort_keys=True, separators=(",", ":"))
+        order_type = order.get("order_type", "limit")
+        identity = {
+            key: value for key, value in order.items()
+            if key not in {"entry_evaluation", "limit_price", "stop_price", "time_in_force", "order_type"}
+        }
+        identity["contract"] = _contract_key(order.get("contract"))
+        identity["order_type"] = order_type
+        identity["time_in_force"] = order.get("time_in_force", "gtc" if order_type == "stop_market" else "gfd")
+        if order_type == "limit":
+            identity["limit_price"] = str(_decimal(order.get("limit_price"), "limit price").normalize())
+        elif order_type == "stop_market":
+            identity["stop_price"] = str(_decimal(order.get("stop_price"), "stop price").normalize())
+        body = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         if client_id in self.order_bodies and self.order_bodies[client_id] != body:
             raise BrokerError("client_order_id was reused with different order details")
         if client_id in self.order_results:
             return dict(self.order_results[client_id])
         if client_id in self.attempted:
             raise BrokerError("Prior submission outcome is unknown; reconcile without resubmitting")
-        if self.currency is None:
-            snapshot = await self.snapshot()
-            args, quote = await self._order_args(order)
-        else:
-            snapshot_task = asyncio.create_task(self.snapshot())
-            order_args_task = asyncio.create_task(self._order_args(order))
-            try:
-                snapshot, order_result = await asyncio.gather(snapshot_task, order_args_task)
-            except BaseException:
-                snapshot_task.cancel()
-                order_args_task.cancel()
-                await asyncio.gather(snapshot_task, order_args_task, return_exceptions=True)
-                raise
-            args, quote = order_result
-        if snapshot["restrictions"] or not snapshot["market_open"]:
-            raise BrokerError("Account restrictions or closed market prevent order placement")
-        if order["side"] == "sell":
-            available = sum(position["available_quantity"] for position in snapshot["positions"]
-                            if position["option_id"] == quote["option_id"])
-            if order["quantity"] > available:
-                raise BrokerError("Order would exceed available long option inventory")
-        review, fee = await self._review_args(args, quote)
-        if order["side"] == "buy" and _decimal(args["price"], "price") * 100 * order["quantity"] + max(fee, Decimal(0)) > _decimal(snapshot["buying_power"], "buying power"):
-            raise BrokerError("Actual review fees and premium exceed available buying power")
-        self._fresh_quote(quote)
-        for position in snapshot["positions"]:
-            self._check_quote_age(position["quote_timestamp"])
-        self._live_enabled()
-        if not self._market_open():
-            raise BrokerError("Regular session ended before dispatch")
-        ref_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "discord-options-relay:" + self.account_number + ":" + client_id))
         self.order_bodies[client_id] = body
+        self.order_inputs[client_id] = copy.deepcopy(order)
+        try:
+            if self.currency is None:
+                snapshot = await self.snapshot()
+                args, quote = await self._order_args(order)
+            else:
+                snapshot_task = asyncio.create_task(self.snapshot())
+                order_args_task = asyncio.create_task(self._order_args(order))
+                try:
+                    snapshot, order_result = await asyncio.gather(snapshot_task, order_args_task)
+                except BaseException:
+                    snapshot_task.cancel()
+                    order_args_task.cancel()
+                    await asyncio.gather(snapshot_task, order_args_task, return_exceptions=True)
+                    raise
+                args, quote = order_result
+            if snapshot["restrictions"] or not snapshot["market_open"]:
+                raise BrokerError("Account restrictions or closed market prevent order placement")
+            if order["side"] == "sell":
+                available = sum(
+                    position["available_quantity"]
+                    for position in snapshot["positions"]
+                    if position["option_id"] == quote["option_id"]
+                )
+                if order["quantity"] > available:
+                    raise BrokerError("Order would exceed available long option inventory")
+            review, fee = await self._review_args(args, quote)
+            if order["side"] == "buy" and _decimal(args["price"], "price") * 100 * order["quantity"] + max(fee, Decimal(0)) > _decimal(snapshot["buying_power"], "buying power"):
+                raise BrokerError("Actual review fees and premium exceed available buying power")
+            self._fresh_quote(quote)
+            for position in snapshot["positions"]:
+                self._check_quote_age(position["quote_timestamp"])
+            self._live_enabled()
+            if not self._market_open():
+                raise BrokerError("Regular session ended before dispatch")
+        except BrokerPreflightHold:
+            raise
+        except BrokerError as exc:
+            raise BrokerPreflightHold(f"Order preflight validation held the order: {exc}") from exc
+        ref_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "discord-options-relay:" + self.account_number + ":" + client_id))
         if before_submit is not None:
             try:
                 await before_submit(snapshot, quote)
@@ -1641,7 +1843,7 @@ class RobinhoodBroker(RobinhoodMCP):
                 if not self._market_open():
                     raise BrokerError("Regular session ended before dispatch")
             except Exception as exc:
-                raise BrokerPreflightHold("Final dispatch validation held this order; nothing was submitted") from None
+                raise BrokerPreflightHold("Final dispatch validation held the order; nothing was submitted") from exc
         self.attempted.add(client_id)
         try:
             result = await self._data("place_option_order", dict(args, ref_id=ref_id))
@@ -1654,44 +1856,133 @@ class RobinhoodBroker(RobinhoodMCP):
         return dict(normalized)
 
     def _order_result(self, raw, client_id, expected=None):
-        if not isinstance(raw, dict) or _decimal(raw["trade_value_multiplier"], "multiplier") != 100:
+        if not isinstance(raw, dict) or _decimal(raw.get("trade_value_multiplier"), "multiplier") != 100:
             raise BrokerError("Missing or unsupported submitted order response")
-        legs = raw["legs"] or []
-        if len(legs) != 1 or legs[0]["ratio_quantity"] != 1 or raw["type"] != "limit" or raw["trigger"] != "immediate":
-            raise BrokerError("Broker order differs from the supported single-leg limit strategy")
-        if (legs[0]["side"], legs[0]["position_effect"]) not in {("buy", "open"), ("sell", "close")} or raw["direction"] != ("debit" if legs[0]["side"] == "buy" else "credit"):
-            raise BrokerError("Broker order has an unexpected option strategy or cash direction")
+        legs = raw.get("legs") or []
+        if len(legs) != 1 or legs[0].get("ratio_quantity") != 1:
+            raise BrokerError("Broker order differs from the supported single-leg strategy")
+        kind = _order_kind(raw)
+        if kind is None:
+            raise BrokerError("Broker order has an unsupported type or trigger")
+        leg = legs[0]
+        if (leg.get("side"), leg.get("position_effect")) not in {("buy", "open"), ("sell", "close")}:
+            raise BrokerError("Broker order has an unexpected option strategy")
+        if raw.get("direction") != ("debit" if leg.get("side") == "buy" else "credit"):
+            raise BrokerError("Broker order has an unexpected cash direction")
+        trigger = raw.get("trigger")
+        broker_tif = raw.get("time_in_force") or ("gfd" if kind in {"limit", "market"} else None)
+        if kind == "limit":
+            if trigger not in (None, "immediate") or raw.get("stop_price") is not None or broker_tif != "gfd":
+                raise BrokerError("Broker order differs from the supported single-leg limit strategy")
+            if _decimal(raw.get("price"), "order price") <= 0:
+                raise BrokerError("Broker limit order has an invalid price")
+        elif kind == "market":
+            if (leg.get("side"), leg.get("position_effect")) != ("sell", "close") or trigger not in (None, "immediate") or raw.get("stop_price") is not None or raw.get("price") is not None or broker_tif != "gfd":
+                raise BrokerError("Broker market order differs from the supported sell-close strategy")
+        else:
+            if (leg.get("side"), leg.get("position_effect")) != ("sell", "close") or trigger != "stop" or raw.get("price") is not None or raw.get("time_in_force") != "gtc":
+                raise BrokerError("Broker stop order differs from the supported sell-close strategy")
+            if _decimal(raw.get("stop_price"), "stop price") <= 0:
+                raise BrokerError("Broker stop order has an invalid stop price")
+        expected_kind = _request_order_kind(expected) if expected else None
+        if expected_kind is not None and expected_kind != kind:
+            raise BrokerError("Broker order type does not match the persisted order")
         if expected:
-            leg = expected["legs"][0]
-            if any(legs[0].get(key) != leg[key] for key in ("option_id", "side", "position_effect", "ratio_quantity")) or _contracts(raw["quantity"]) != _contracts(expected["quantity"]) or _decimal(raw["price"], "order price") != _decimal(expected["price"], "expected price"):
-                raise BrokerError("Broker order does not match the reviewed order")
-        states = {"queued": "open", "confirmed": "open", "partially_filled": "partially_filled", "filled": "filled",
-                  "rejected": "rejected", "cancelled": "canceled", "failed": "rejected", "voided": "rejected", "pending_cancelled": "open"}
-        if raw["state"] not in states:
+            expected_quantity = expected.get("quantity")
+            if expected_quantity is not None and _contracts(raw.get("quantity")) != _contracts(expected_quantity):
+                raise BrokerError("Broker order quantity does not match the persisted order")
+            expected_tif = expected.get("time_in_force")
+            if expected_tif is None:
+                expected_tif = "gtc" if kind == "stop_market" else "gfd"
+            if broker_tif != expected_tif:
+                raise BrokerError("Broker order time_in_force does not match the persisted order")
+            expected_leg = None
+            expected_legs = expected.get("legs")
+            if isinstance(expected_legs, list) and len(expected_legs) == 1:
+                expected_leg = expected_legs[0]
+            expected_option_id = expected.get("option_id") or expected.get("instrument_id") or (expected_leg or {}).get("option_id")
+            expected_contract = expected.get("contract")
+            if expected_contract is not None:
+                raw_contract_fields = {
+                    "symbol": raw.get("chain_symbol"),
+                    "expiry": leg.get("expiration_date"),
+                    "strike": leg.get("strike_price"),
+                    "option_type": leg.get("option_type"),
+                }
+                if all(value is not None for value in raw_contract_fields.values()):
+                    if _contract_key(raw_contract_fields) != _contract_key(expected_contract):
+                        raise BrokerError("Broker order contract does not match the persisted order")
+                elif expected_option_id is None:
+                    cached = self.contracts.get(_contract_key(expected_contract))
+                    expected_option_id = cached.get("option_id") if cached else None
+                    if expected_option_id is None:
+                        raise BrokerError("Persisted order lacks exact option instrument identity")
+            if expected_option_id is not None and leg.get("option_id") != expected_option_id:
+                raise BrokerError("Broker order option instrument does not match the persisted order")
+            expected_price = expected.get("price", expected.get("limit_price"))
+            if kind == "limit":
+                if expected_price is None or _decimal(raw.get("price"), "order price") != _decimal(expected_price, "expected price"):
+                    raise BrokerError("Broker order price does not match the persisted order")
+            elif expected_price is not None:
+                raise BrokerError("Persisted market order unexpectedly has a limit price")
+            expected_stop = expected.get("stop_price")
+            if kind == "stop_market":
+                if expected_stop is None or _decimal(raw.get("stop_price"), "stop price") != _decimal(expected_stop, "expected stop price"):
+                    raise BrokerError("Broker stop price does not match the persisted order")
+            elif expected_stop is not None:
+                raise BrokerError("Persisted immediate order unexpectedly has a stop price")
+            if expected_leg is not None:
+                for key in ("option_id", "side", "position_effect", "ratio_quantity"):
+                    if expected_leg.get(key) is not None and leg.get(key) != expected_leg[key]:
+                        raise BrokerError("Broker order leg does not match the persisted order")
+        states = {
+            "queued": "open",
+            "confirmed": "open",
+            "partially_filled": "partially_filled",
+            "filled": "filled",
+            "rejected": "rejected",
+            "cancelled": "canceled",
+            "canceled": "canceled",
+            "failed": "rejected",
+            "voided": "rejected",
+            "pending_cancelled": "open",
+        }
+        if raw.get("state") not in states:
             raise BrokerError("Unknown Robinhood order status; reconciliation is required")
-        filled = _contracts(raw["processed_quantity"])
-        premium = _decimal(raw["processed_premium"], "filled premium")
-        if filled > _contracts(raw["quantity"]) or (not filled and premium):
+        filled = _contracts(raw.get("processed_quantity"))
+        premium = _decimal(raw.get("processed_premium"), "filled premium")
+        if filled > _contracts(raw.get("quantity")) or (not filled and premium):
             raise BrokerError("Inconsistent cumulative Robinhood fills")
         if (raw["state"] == "filled" and filled != _contracts(raw["quantity"])) or (filled and not premium):
             raise BrokerError("Robinhood fill quantity or premium is inconsistent with its status")
-        return {"id": raw["id"], "client_order_id": client_id, "broker_order_id": raw["id"], "status": states[raw["state"]], "filled_quantity": filled,
-                "fill_price": str(premium / 100 / filled) if filled else None,
-                "timestamp": raw.get("updated_at") or raw["created_at"]}
+        return {
+            "id": raw["id"],
+            "client_order_id": client_id,
+            "broker_order_id": raw["id"],
+            "status": states[raw["state"]],
+            "filled_quantity": filled,
+            "fill_price": str(premium / 100 / filled) if filled else None,
+            "timestamp": raw.get("updated_at") or raw["created_at"],
+        }
 
-    async def order_status(self, order_id, *, broker_order_id=None):
+    async def order_status(self, order_id, *, broker_order_id=None, expected_order=None):
         known = self.order_results.get(order_id)
+        persisted = expected_order or self.order_inputs.get(order_id)
         broker_id = broker_order_id or (known or {}).get("broker_order_id")
+        if persisted and persisted.get("broker_order_id") and broker_id != persisted["broker_order_id"]:
+            raise BrokerError("Persisted broker order identity does not match the requested broker order")
+        if known and broker_order_id and known.get("broker_order_id") != broker_order_id:
+            raise BrokerError("Requested broker order does not match the persisted order")
         if not broker_id:
             try:
                 broker_id = str(uuid.UUID(order_id))
             except (ValueError, TypeError):
                 raise BrokerError("Persisted broker order UUID is required; unknown submissions must not be repeated") from None
         rows = await self._pages("get_option_orders", {"account_number": self.account_number, "order_id": broker_id}, "orders")
-        if len(rows) != 1 or rows[0]["id"] != broker_id:
+        if len(rows) != 1 or rows[0].get("id") != broker_id:
             raise BrokerError("Broker order could not be reconciled on the bound account")
         previous = self.order_results.get(order_id)
-        result = self._order_result(rows[0], order_id)
+        result = self._order_result(rows[0], order_id, persisted)
         self.order_results[order_id] = result
         if previous is None or (
             result["filled_quantity"] != previous.get("filled_quantity")
@@ -1700,3 +1991,22 @@ class RobinhoodBroker(RobinhoodMCP):
             self.account_changed.set()
             self._invalidate_execution_scope()
         return result
+
+    async def cancel_order(self, order_id, *, broker_order_id=None, expected_order=None):
+        self._live_enabled()
+        known = self.order_results.get(order_id)
+        persisted = expected_order or self.order_inputs.get(order_id)
+        broker_id = broker_order_id or (known or {}).get("broker_order_id")
+        if persisted and persisted.get("broker_order_id") and broker_id != persisted["broker_order_id"]:
+            raise BrokerError("Persisted broker order identity does not match the requested broker order")
+        if known and broker_order_id and known.get("broker_order_id") != broker_order_id:
+            raise BrokerError("Requested broker order does not match the persisted order")
+        if not known and not broker_order_id:
+            raise BrokerError("Cancellation requires a persisted broker order identity")
+        current = await self.order_status(order_id, broker_order_id=broker_id, expected_order=persisted)
+        if current["status"] in {"filled", "canceled", "rejected"}:
+            return current
+        acknowledged = await self._data("cancel_option_order", {"account_number": self.account_number, "order_id": broker_id})
+        if not isinstance(acknowledged.get("accepted"), bool):
+            raise BrokerError("Robinhood cancellation response omitted accepted")
+        return await self.order_status(order_id, broker_order_id=broker_id, expected_order=persisted)
