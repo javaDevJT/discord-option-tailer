@@ -60,6 +60,13 @@ _SYMBOL = r"[A-Z]{1,6}(?:[.]?[A-Z])?"
 _STRIKE = r"(?:\d{1,5}(?:\.\d+)?|\.\d+)"
 _OPTION_WORDS = {"call": "call", "c": "call", "put": "put", "p": "put"}
 _STOP_WORDS = {"buy", "sell", "open", "close", "reduce", "trim", "call", "put", "exp", "expiry", "at", "entry", "premium", "price", "expiring", "expires"}
+_COMMENTARY_CLOSE_RE = re.compile(
+    r"\b(?:market|session|day|trading|regular|after[- ]hours?|before|after|at|near|by|into|heading\s+into)\s+(?:the\s+)?close\b"
+    r"|\b(?:market|session|trading|regular)\s+(?:is|was|will\s+be)?\s*closed\b"
+    r"|\b(?:closing[- ]bell|closing\s+time|close\s+time)\b"
+    r"|\b(?:close|closing)\s+well\b",
+    re.I,
+)
 _SAFE_REASON = {
     "candidate_ambiguity": "message has several plausible option contracts",
     "contract_missing": "message does not contain a complete option contract",
@@ -133,7 +140,7 @@ def _normalize_expiry(text: str, message: Mapping[str, Any]) -> str | None:
 
 
 def _action(text: str) -> str | None:
-    return _literal_action(text)
+    return _literal_action(_COMMENTARY_CLOSE_RE.sub(" ", text))
 
 
 def _unsupported_effect(text: str) -> bool:

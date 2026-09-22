@@ -159,8 +159,9 @@ source_group can link approved authors; matching names alone cannot link them.
 Unowned holdings are context only and cannot authorize selling or changing stops.
 For a reply, use its explicit referenced message when present and consistent.
 If multiple positions or competing theses fit, WAIT with ambiguous=true.
-REDUCE means an explicit partial exit or a high-confidence contextual CURRENT
-success/closing signal on one exact relay-owned position; UPDATE_STOP needs an
+REDUCE requires CURRENT partial-exit intent, including an optional profit-taking
+suggestion or a current author sale report, on one exact relay-owned position.
+Identifying the position does not authorize reducing it. UPDATE_STOP needs an
 explicit OPTION PREMIUM stop, not a stock or underlying-price
 support/resistance number. The stop_price field is either null, a positive
 decimal string containing the option premium, or exactly the canonical literal
@@ -179,19 +180,27 @@ Preserve every stated quantity and fraction exactly. Add the boolean profit_only
 field to every decision. Set profit_only=true only for a CURRENT, discretionary
 or optional profit-taking suggestion tied to the one resolved same-source,
 bot-owned contract, such as "you can trim or take profits if you'd like".
-The same REDUCE/profit_only=true interpretation is allowed without imperative
-wording when the CURRENT message uses confident success or closing language
-about one exact contract in the supplied relay-owned positions (for example,
-that exact contract is green, paid, a winner, or closing well). This requires
-an unambiguous match on source_group, symbol, expiry, strike and option_type;
-do not use a ticker mention or a recently watched contract as a match. Treat
-generic victory or gains recaps, account-wide or flat-account statements,
-unrelated pictures, uncertain or missing contracts, and future or conditional
-language as non-actionable IGNORE or WAIT context. If the message states an
+Non-imperative wording still needs current exit intent, such as "locking in
+this win" or "taking some off here". Profitability alone never authorizes an
+exit: "up $50", "green", "paid", "winner", and "closing well" are status
+updates, even when they match one exact relay-owned position. Context may
+resolve source_group, symbol, expiry, strike and option_type only after an exit
+trigger exists. Do not use a ticker mention or a recently watched contract as
+the match. Generic victory or gains recaps, account-wide flat-account
+statements, unrelated pictures, uncertain or missing contracts, and future or
+conditional language remain non-actionable IGNORE or WAIT context.
+"Market close" means session timing, not closing an option. An unreached
+future target is not a sale trigger. For example, "$DRAM calls up +$50 per
+contract heading into market close. I am looking for $65 as my first target"
+must be WAIT with no sale, even with one matching profitable owned contract.
+An independent explicit trim in the same message still applies: "up $50,
+took 50% here; looking for $65 on the rest" authorizes exactly that 50% trim.
+Quote the words supporting CURRENT exit intent, not just the profit update or
+an older entry. If the message states an
 explicit quantity or fraction, preserve it; if it explicitly says all out,
 close remaining, or otherwise directs a full exit, use CLOSE with
-profit_only=false. The contextual success rule supplies only an optional
-partial REDUCE when no explicit exit size or full-exit direction is given.
+profit_only=false. An optional partial-exit suggestion supplies a partial
+REDUCE when no explicit exit size or full-exit direction was given.
 An optional explicit all-profits or full-exit suggestion is CLOSE with
 profit_only=true. An unquantified optional partial suggestion is REDUCE with
 quantity=null and fraction=null; the deterministic engine chooses its guarded
@@ -274,7 +283,10 @@ path or underlying data, acknowledge uncertainty instead of inventing it.
 
 Missing, stale, closed, non-tradable or mismatched market and broker facts, or
 any facts.blockers, cannot support status=viable. Broker facts are observations,
-not permission to trade. Use elapsed time and the original timestamp; never
+not permission to trade. Profit/status updates, unreached targets and approaching market close cannot
+make an exit viable without an actual exit trigger. Knowing which contract
+is meant is insufficient; confidence and profit do not supply exit intent.
+Use elapsed time and the original timestamp; never
 reset signal age from a later message. Evidence must quote exact text supplied
 in current_message or later same-group context. Always quote current_message;
 quote later messages when they support invalidation or continued uncertainty.
@@ -569,6 +581,30 @@ def _decimal(value, field):
         raise InterpretationError(f"{field} must be a positive decimal string")
 
 
+def _profit_update_without_exit_intent(text):
+    """Veto status-only exits; the model still resolves intent, contract and size."""
+    text = re.sub(r"<[^>]*>|https?://\S+", " ", text.lower())
+    if not re.search(r"\b(?:up|green|paid|winners?|winning|profits?|gains?|targets?|market|session)\b", text):
+        return False
+    # Session timing and a position 'closing well' are not option-close verbs.
+    text = re.sub(
+        r"\b(?:market|session|day)(?:\s+is)?\s+clos(?:e[ds]?|ing)\b"
+        r"|\bclos(?:e[ds]?|ing)\s+(?:bell|well|green|red|strong|higher|lower|above|below)\b"
+        r"|\b(?:into|towards?|near(?:ing)?|before|after|at|by|until)\s+(?:the\s+)?close\b",
+        " ", text,
+    )
+    exit_words = (
+        r"\b(?:sell(?:ing)?|sold|trim(?:med|ming)?|reduc(?:e[ds]?|ing)|clos(?:e[ds]?|ing)"
+        r"|exit(?:ed|ing)?|liquidat(?:e[ds]?|ing)|offload(?:ed|ing)?)\b"
+        r"|\b(?:tak(?:e|ing)|took|book(?:ed|ing)?|lock(?:ed|ing)?|bank(?:ed|ing)?"
+        r"|secur(?:e[ds]?|ing)|realiz(?:e[ds]?|ing))\b[^.!?\n]{0,40}"
+        r"(?:\b(?:profits?|gains?|wins?|loss(?:es)?|some|half|quarter|off)\b|\d+(?:\.\d+)?\s*%)"
+        r"|\b(?:all|half|fully|completely|some|rest|remaining)\s+(?:out|off)\b"
+        r"|\b(?:done|out)\s+(?:here|with\s+(?:this|these|it))\b"
+    )
+    return re.search(exit_words, text) is None
+
+
 def validate_decision(decision, message, context):
     """Validate model output locally, including evidence against transmitted text."""
     if not isinstance(decision, dict) or set(decision) != set(DECISION_SCHEMA["required"]):
@@ -655,6 +691,13 @@ def validate_decision(decision, message, context):
             raise InterpretationError("Trading proposals require current-message evidence")
     if action == "UPDATE_STOP" and decision["stop_price"] is None:
         raise InterpretationError("Stop updates require an explicit price")
+    if action in {"REDUCE", "CLOSE"} and _profit_update_without_exit_intent("\n".join(sources[current["id"]])):
+        return decision | {
+            "action": "WAIT", "origin_message_id": None, "quantity": None,
+            "fraction": None, "alert_price": None, "stop_price": None, "profit_only": False,
+            "reason": f"{action} withheld: the source reports profits or a target without current exit intent. "
+                      "Status updates and market-close timing do not authorize a sale.",
+        }
     return decision
 
 
@@ -1189,9 +1232,21 @@ class CodexInterpreter:
         origin_id = decision.get("origin_message_id") if isinstance(decision, dict) else None
         current, history = _recovery_context(message, context, origin_id)
         recovery_decision = _decision_for_recovery(decision)
-        validate_decision(recovery_decision, current, history)
+        recovery_decision = validate_decision(recovery_decision, current, history)
         if decision["action"] not in TRADE_ACTIONS:
             raise InterpretationError("Recovery requires an actionable original decision")
+        if recovery_decision["action"] not in TRADE_ACTIONS:
+            self.last_attempts = 0
+            self.last_usage = self.last_authentication = self.last_model = None
+            self.last_notices = []
+            self.last_timing = _evaluation_timing(
+                current, evaluation_started_monotonic, 0, path="recovery",
+            ) | {"attempts": 0, "model_duration_seconds": 0.0}
+            return {
+                "status": "invalidated", "confidence": 1.0,
+                "reason": recovery_decision["reason"], "evidence": recovery_decision["evidence"],
+                "evaluation_timing": self.last_timing,
+            }
         origin = current if decision["origin_message_id"] == current["id"] else next(
             (record for record in history if record["id"] == decision["origin_message_id"]), None
         )

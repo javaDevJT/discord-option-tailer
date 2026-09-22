@@ -12,6 +12,7 @@ The [account monitoring guide](docs/container.md#account-balances-and-holdings) 
 - [TrueNAS deployment](docs/truenas.md): deploy the published image with persistent private storage.
 - [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.
 - [Broker integration](docs/robinhood-integration.md): authorization, account inspection, and execution checks.
+- [Exit intent and profit-taking](docs/container.md#exit-intent-and-profit-taking): distinguish status updates from authorized trims and preserve whole-contract rounding.
 - [Agent-directed stops](docs/container.md#agent-directed-stop-losses): compound trims, breakeven protection, cancellation and restart behavior.
 - [Fast entry evaluation design](docs/jev-evaluation-design.md): watch preparation, capped limit entries, direct entry rules, JEV/Codex boundaries, and timing checks.
 - [Configuration template](config.example.json): CLI and offline-rehearsal defaults.

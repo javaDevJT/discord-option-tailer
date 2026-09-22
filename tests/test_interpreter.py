@@ -362,44 +362,98 @@ class InterpreterChecks(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, SYSTEM_PROMPT)
 
-    def test_contextual_success_prompt_requires_exact_current_relay_position(self):
+    def test_profit_updates_cannot_authorize_exits_even_for_a_resolved_owned_contract(self):
+        contract = {"symbol": "DRAM", "expiry": "2026-10-16", "strike": "65", "option_type": "call"}
+        entry = MESSAGE | {"id": "dram-entry", "content": "OPEN **$DRAM $65 call 10/16 @ 2.95** (swing)"}
+        updates = (
+            "$DRAM calls up +$50 per contract heading into market close. <a:check:123>\n\n"
+            "I am looking for $65 🎯 as my first target <@&456>",
+            "DRAM 65 call 10/16 is green and closing well.",
+            "DRAM calls up $50. Looking for $65 as the first target.",
+            "DRAM calls paid! What a winner. <a:sell_now:123>",
+        )
+        for content in updates:
+            message = MESSAGE | {"id": "dram-update", "content": content}
+            proposal = DECISION | {
+                "action": "REDUCE", "origin_message_id": message["id"], "contract": contract,
+                "quantity": None, "fraction": None, "alert_price": None, "profit_only": True,
+                "confidence": .93, "ambiguous": False,
+                "reason": "Current profit signal resolves through the entry to the single same-source "
+                          "bot-owned DRAM contract, supporting an optional partial reduction.",
+                "evidence": [
+                    {"message_id": message["id"], "quote": content},
+                    {"message_id": entry["id"], "quote": entry["content"]},
+                ],
+            }
+            for action, profit_only in (("REDUCE", True), ("CLOSE", True), ("CLOSE", False)):
+                with self.subTest(content=content, action=action, profit_only=profit_only):
+                    result = validate_decision(proposal | {"action": action, "profit_only": profit_only}, message, [entry])
+                    self.assertEqual(result["action"], "WAIT")
+                    self.assertIsNone(result["origin_message_id"])
+                    self.assertIsNone(result["quantity"])
+                    self.assertIsNone(result["fraction"])
+                    self.assertFalse(result["profit_only"])
+                    self.assertIn("without current exit intent", result["reason"])
+                    self.assertEqual(result["evidence"], proposal["evidence"])
+                    self.assertEqual(proposal["action"], "REDUCE")  # Input stays intact.
+            with self.subTest(content=content, origin="older entry"):
+                result = validate_decision(proposal | {"origin_message_id": entry["id"]}, message, [entry])
+                self.assertEqual(result["action"], "WAIT")
+
+    def test_recovery_invalidates_persisted_profit_update_exit_without_model_request(self):
+        message = MESSAGE | {"content": "DRAM calls up $50 heading into market close. Looking for $65 as the first target."}
+        contract = {"symbol": "DRAM", "expiry": "2026-10-16", "strike": "65", "option_type": "call"}
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        for action in ("REDUCE", "CLOSE"):
+            proposal = DECISION | {
+                "action": action, "contract": contract, "alert_price": None, "profit_only": True,
+                "evidence": [{"message_id": message["id"], "quote": message["content"]}],
+            }
+            with self.subTest(action=action), patch.object(interpreter, "_interpret") as model:
+                result = asyncio.run(interpreter.assess_recovery(message, [], [], proposal, RECOVERY_FACTS))
+                self.assertEqual(result["status"], "invalidated")
+                self.assertIn("without current exit intent", result["reason"])
+                self.assertEqual(result["evaluation_timing"]["attempts"], 0)
+                self.assertEqual(result["evaluation_timing"]["path"], "recovery")
+                model.assert_not_called()
+
+    def test_current_exit_intent_survives_profit_and_future_target_context(self):
+        examples = (
+            ("Up $50; you can trim or take profits if you'd like. Looking for $65 on the rest.", "REDUCE", True, None),
+            ("Up $50; took 50% here. Looking for $65 on the rest.", "REDUCE", False, .5),
+            ("Up $50; locking in this win.", "REDUCE", True, None),
+            ("Up $50; taking some off here.", "REDUCE", True, None),
+            ("Up $50; sold the rest heading into market close.", "CLOSE", False, None),
+            ("Green here; all out.", "CLOSE", False, None),
+            ("Up $50; close remaining.", "CLOSE", False, None),
+        )
+        for content, action, profit_only, fraction in examples:
+            message = MESSAGE | {"content": content}
+            proposal = DECISION | {
+                "action": action, "profit_only": profit_only, "fraction": fraction,
+                "evidence": [{"message_id": message["id"], "quote": content}],
+            }
+            with self.subTest(content=content):
+                self.assertEqual(validate_decision(proposal, message, []), proposal)
+            entry = MESSAGE | {"id": "older-entry", "content": MESSAGE["content"] + "; up $10, looking for a $350 target."}
+            with self.subTest(content=content, origin="older entry with target"):
+                contextual_proposal = proposal | {
+                    "origin_message_id": entry["id"],
+                    "evidence": proposal["evidence"] + [{"message_id": entry["id"], "quote": entry["content"]}],
+                }
+                self.assertEqual(validate_decision(contextual_proposal, message, [entry]), contextual_proposal)
+
+    def test_exit_prompt_requires_intent_before_contract_resolution(self):
         prompt = " ".join(SYSTEM_PROMPT.split())
         for phrase in (
-            "without imperative wording",
-            "confident success or closing language",
-            "one exact contract",
-            "relay-owned positions",
-            "source_group, symbol, expiry, strike and option_type",
-            "generic victory or gains recaps",
-            "account-wide or flat-account statements",
-            "unrelated pictures",
-            "uncertain or missing contracts",
-            "future or conditional language",
-            "optional partial REDUCE",
+            "Identifying the position does not authorize reducing it",
+            "Profitability alone never authorizes an exit",
+            '"Market close" means session timing',
+            "must be WAIT with no sale",
+            "took 50% here; looking for $65 on the rest",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prompt)
-
-        current_success = MESSAGE | {
-            "id": "success",
-            "content": "TSLA 352.5 put is green and closing well.",
-        }
-        contextual_reduce = DECISION | {
-            "action": "REDUCE",
-            "origin_message_id": "success",
-            "quantity": None,
-            "fraction": None,
-            "profit_only": True,
-            "evidence": [{"message_id": "success", "quote": current_success["content"]}],
-        }
-        self.assertEqual(validate_decision(contextual_reduce, current_success, []), contextual_reduce)
-
-        explicit_full_exit = contextual_reduce | {
-            "action": "CLOSE",
-            "profit_only": False,
-            "reason": "Explicit full exit.",
-        }
-        self.assertEqual(validate_decision(explicit_full_exit, current_success, []), explicit_full_exit)
 
     def test_rejects_malformed_decisions(self):
         alterations = [
@@ -505,7 +559,7 @@ class InterpreterChecks(unittest.TestCase):
             "average option premium",
             "stock or underlying-price",
             'REDUCE with fraction 0.5 and stop_price "breakeven"',
-            "do not",
+            "Do not invent a numeric stop",
             "unowned position",
         ):
             with self.subTest(phrase=phrase):

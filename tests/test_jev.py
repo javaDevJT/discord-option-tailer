@@ -96,6 +96,35 @@ class JEVTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(set(question), {"type", "instructions", "criteria"})
                 self.assertNotIn("win_probability", json.dumps(decision["_jev_result"].decision))
 
+    def test_market_close_commentary_is_not_an_exit_candidate(self):
+        message = dict(
+            MESSAGE,
+            id="dram-commentary",
+            content=(
+                "DRAM 65 call expiring 2026-10-16 up +$50 per contract "
+                "heading into market close. I am looking for $65 as my first target"
+            ),
+        )
+        result = extract_candidates(message, [])
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.candidates[0]["action"], "WAIT")
+        self.assertFalse(result.candidates[0]["profit_only"])
+
+    def test_explicit_close_forms_remain_exit_candidates(self):
+        for content in (
+            "Close SPY 500 call expiring 2026-09-04",
+            "Closed SPY 500 call expiring 2026-09-04",
+            "Close remaining SPY 500 call expiring 2026-09-04",
+            "Time to close SPY 500 call expiring 2026-09-04",
+            "All out SPY 500 call expiring 2026-09-04",
+            "SPY 500 call expiring 2026-09-04 - closed",
+            "SPY 500 call expiring 2026-09-04\nCLOSED",
+        ):
+            with self.subTest(content=content):
+                result = extract_candidates(dict(MESSAGE, content=content), [])
+                self.assertIsNone(result.reason)
+                self.assertEqual(result.candidates[0]["action"], "CLOSE")
+
     async def test_invalid_native_answers_never_accept_an_action(self):
         malformed = []
         response = response_for(); response["answers"]["candidate"].pop("type"); malformed.append(response)

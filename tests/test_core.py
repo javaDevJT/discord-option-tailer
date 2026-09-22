@@ -3,6 +3,7 @@
 import copy
 import json
 import tempfile
+import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from relay.core import Engine, Hold, Store, canonical_contract, channel_allows_author, contract_key, entry_size, load_config
 from relay.broker import BrokerPreflightHold
 from relay.ingest import normalize
-from relay.interpreter import InterpretationError
+from relay.interpreter import CodexInterpreter, InterpretationError
 
 
 NOW = datetime(2026, 9, 8, 14, tzinfo=timezone.utc)
@@ -284,6 +285,57 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.broker.submissions[-1]["quantity"], expected)
                 remaining = sum(p["quantity"] for p in self.store.positions())
                 self.assertEqual(remaining, owned - expected)
+
+    async def test_profit_update_cannot_sell_owned_contract_even_if_model_repeats_bad_decision(self):
+        contract = {"symbol": "DRAM", "expiry": "2026-10-16", "strike": "65", "option_type": "call"}
+        self.owned(1, contract=contract)
+        self.config["risk"]["min_confidence"] = .90
+        self.broker.quotes.update(bid="3.40", ask="3.45")
+        entry = self.message(content="OPEN **$DRAM $65 call 10/16 @ 2.95** (swing)") | {"source_group": "source-a"}
+        self.store.observe(entry)
+        message = self.message(content="$DRAM calls up +$50 per contract heading into market close. "
+                               "I am looking for $65 🎯 as my first target")
+        bad_decision = {
+            "action": "REDUCE", "origin_message_id": message["id"], "contract": contract,
+            "quantity": None, "fraction": None, "alert_price": None, "stop_price": None,
+            "confidence": .93, "ambiguous": False, "profit_only": True,
+            "reason": "Current profit signal supports an optional partial reduction.",
+            "evidence": [{"message_id": message["id"], "quote": message["content"]},
+                         {"message_id": entry["id"], "quote": entry["content"]}],
+        }
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        self.engine.interpreter = interpreter
+        with patch.object(interpreter, "_interpret", return_value=bad_decision) as model:
+            result = await self.engine.handle(message)
+        model.assert_called_once()
+        self.assertEqual(result["state"], "wait", result)
+        self.assertIn("without current exit intent", result["reason"])
+        self.assertEqual(self.broker.submissions, [])
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
+        self.assertEqual(self.store.positions()[0]["quantity"], 1)
+
+    async def test_validated_optional_and_explicit_trims_preserve_rounding(self):
+        interpreter = CodexInterpreter({"llm": {"executable": sys.executable}})
+        self.engine.interpreter = interpreter
+        self.broker.quotes.update(bid="1.00", ask="1.03")
+        for owned, text, profit_only, fraction in (
+            (1, "Up $50; you can trim or take profits if you'd like. Looking for $65 on the rest.", True, None),
+            (2, "Up $50; took 50% here. Looking for $65 on the rest.", False, .5),
+        ):
+            self.owned(owned)
+            message = self.message(content=text)
+            decision = {
+                "action": "REDUCE", "origin_message_id": message["id"], "contract": CONTRACT,
+                "quantity": None, "fraction": fraction, "alert_price": None, "stop_price": None,
+                "confidence": .99, "ambiguous": False, "profit_only": profit_only,
+                "reason": "Current profit-taking instruction.",
+                "evidence": [{"message_id": message["id"], "quote": text}],
+            }
+            with self.subTest(owned=owned), patch.object(interpreter, "_interpret", return_value=decision):
+                result = await self.engine.handle(message)
+                self.assertEqual(result["state"], "paper_order", result)
+                self.assertEqual(self.broker.submissions[-1]["quantity"], 1)
+                self.assertEqual(sum(p["quantity"] for p in self.store.positions()), owned - 1)
 
     async def test_optional_trim_defaults_half_and_requires_net_profit(self):
         self.owned(3)
