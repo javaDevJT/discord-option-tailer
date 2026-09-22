@@ -26,7 +26,10 @@ class RecoveryEvaluator:
         self.scan_complete = False
         self.exit_scan_cursor = 0
         self.exit_scan_complete = False
+        self._exit_position_signature = None
         self.next_reconcile = 0
+        self._reconcile_lock = asyncio.Lock()
+        self._reconcile_seen_rowid = 0
         self.retry_due = {}
         self.deferred_exits = {}
         with self.store.db:
@@ -89,8 +92,14 @@ class RecoveryEvaluator:
         return entries
 
     def recover_position_context(self):
-        if self.exit_scan_complete or self.engine.interpreter is None:
+        if self.engine.interpreter is None:
             return
+        position_signature = json.dumps(self.store.positions(), sort_keys=True, default=str)
+        if self.exit_scan_complete and position_signature == self._exit_position_signature:
+            return
+        if self.exit_scan_complete:
+            self.exit_scan_cursor = 0
+            self.exit_scan_complete = False
         rows = self.store.db.execute("""SELECT e.id,e.state,m.body FROM events e JOIN messages m
             ON m.id=e.message_id AND m.revision=e.revision WHERE e.id>?
             AND EXISTS (SELECT 1 FROM positions p WHERE p.source_group=m.source_group AND p.quantity>0)
@@ -107,29 +116,114 @@ class RecoveryEvaluator:
                    for entry in self.current_entries(group).values()):
                 self.store.record(message, "recovery_pending", "Checking owned positions for a missed exit; historical entries remain review-only")
         self.exit_scan_complete = len(rows) < 100
+        if self.exit_scan_complete:
+            self._exit_position_signature = position_signature
 
-    async def reconcile_orders(self):
-        if time.monotonic() < self.next_reconcile:
-            return
-        self.next_reconcile = time.monotonic() + 30
-        rows = self.store.db.execute("""SELECT id,broker_id,body,action FROM orders
+    @staticmethod
+    def _entry_cancel_due(order, now):
+        if order["action"] != "OPEN":
+            return False
+        body = json.loads(order["body"])
+        deadline = body.get("entry_cancel_at")
+        if not deadline:
+            return False
+        try:
+            return instant(deadline) <= now
+        except Hold:
+            return False
+
+    async def _reconcile_order(self, row):
+        body = json.loads(row["body"])
+        if "created_at" not in body:
+            body["created_at"] = row["created_at"]
+        options = {} if self.engine.mode == "paper" else {"broker_order_id": row["broker_id"]}
+        options["expected_order"] = body
+        if not self.engine.observe_only and self.engine.mode != "shadow" and self._entry_cancel_due(row, self.engine.clock()):
+            cancel = getattr(self.engine.broker, "cancel_order", None)
+            if cancel is not None:
+                try:
+                    result = await cancel(row["id"], **options)
+                    self.store.apply_result(row["id"], result)
+                    return
+                except Exception:
+                    # A fill can win the cancel race; ask the broker for the final state.
+                    pass
+        result = await self.engine.broker.order_status(row["id"], **options)
+        self.store.apply_result(row["id"], result)
+
+    async def reconcile_orders(self, *, force=False):
+        async with self._reconcile_lock:
+            return await self._reconcile_orders_once(force=force)
+
+    def _has_urgent_orders(self):
+        now = self.engine.clock()
+        rows = self.store.db.execute("""SELECT status,action,body FROM orders
             WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
         for row in rows:
+            if row["status"] in {"unknown", "submitting", "pending"}:
+                return True
+            if row["action"] == "OPEN":
+                try:
+                    deadline = json.loads(row["body"]).get("entry_cancel_at")
+                    if deadline and instant(deadline) <= now:
+                        return True
+                except (Hold, TypeError, ValueError):
+                    pass
+        return False
+
+    async def _reconcile_orders_once(self, *, force=False):
+        """Reconcile unresolved orders, canceling only persisted expired entries."""
+        now_mono = time.monotonic()
+        if not force and now_mono < self.next_reconcile:
+            newest = self.store.db.execute("""SELECT COALESCE(MAX(rowid),0) FROM orders
+                WHERE status NOT IN ('filled','canceled','rejected','expired')""").fetchone()[0]
+            if newest <= self._reconcile_seen_rowid and not self._has_urgent_orders():
+                return 0
+        rows = self.store.db.execute("""SELECT rowid AS ledger_rowid,id,broker_id,body,action,status,created_at FROM orders
+            WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
+        if rows:
+            self._reconcile_seen_rowid = max(self._reconcile_seen_rowid, *(row["ledger_rowid"] for row in rows))
+        for row in rows:
             try:
-                options = {} if self.engine.mode == "paper" else {"broker_order_id": row["broker_id"]}
-                if row["action"] == "UPDATE_STOP":
-                    options["expected_order"] = json.loads(row["body"])
-                result = await self.engine.broker.order_status(row["id"], **options)
-                self.store.apply_result(row["id"], result)
+                await self._reconcile_order(row)
             except Exception:
                 if row["action"] == "UPDATE_STOP":
                     self.store.mark_unknown(row["id"])
                     request = self.store.db.execute("SELECT * FROM stop_requests WHERE order_id=?", (row["id"],)).fetchone()
                     if request:
-                        self.engine.stops.state(request, "pending", "Native protection is awaiting broker status confirmation")
-                # An uncertain submission keeps the existing unresolved-order gate.
-                continue
-        await self.engine.stops.maintain()
+                        self.engine.stops.state(request, "pending", "Native protection awaiting broker status confirmation")
+        if not self.engine.observe_only:
+            await self.engine.stops.maintain()
+        pending = self.store.db.execute("""SELECT status,action,body FROM orders
+            WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
+        now = self.engine.clock()
+        delay = 30.0
+        for row in pending:
+            if row["status"] in {"unknown", "submitting", "pending"}:
+                delay = min(delay, 1.0)
+            if row["action"] == "OPEN":
+                try:
+                    deadline = json.loads(row["body"]).get("entry_cancel_at")
+                    if deadline:
+                        delay = min(delay, max(0.05, (instant(deadline) - now).total_seconds()))
+                except (Hold, TypeError, ValueError):
+                    pass
+        self.next_reconcile = time.monotonic() + delay
+        return len(rows)
+
+    async def reconcile_loop(self, emit=None):
+        """Keep broker order state current independently of message recovery."""
+        del emit
+        while True:
+            try:
+                async with self.engine.lock:
+                    await self.reconcile_orders()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The next pass retries; unresolved orders remain fail-closed.
+                self.next_reconcile = time.monotonic() + 1
+            await asyncio.sleep(min(1.0, max(0.05, self.next_reconcile - time.monotonic())))
 
     def exit_guard(self, message, decision, context, positions):
         engine = self.engine
@@ -386,8 +480,6 @@ class RecoveryEvaluator:
             await asyncio.sleep(1)
             if self.engine.evaluations_active or not fresh_queue.empty() or self.engine.lock.locked() or Path(self.engine.config["kill_switch"]).exists():
                 continue
-            async with self.engine.lock:
-                await self.reconcile_orders()
             self.recover_saved()
             self.recover_position_context()
             rows = self.store.db.execute("""SELECT m.id,m.body FROM events e JOIN messages m ON m.id=e.message_id AND m.revision=e.revision

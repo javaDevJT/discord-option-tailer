@@ -1,0 +1,168 @@
+"""Watch preparation is advisory; only a fresh matched ENTRY can spend."""
+import asyncio
+import copy
+from datetime import timedelta
+from decimal import Decimal
+from pathlib import Path
+import unittest
+from unittest.mock import AsyncMock
+
+from tests import test_core as fixtures
+from relay.core import Engine, Hold, Store
+from relay.watch import watch_candidate
+
+
+class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        fixtures.CoreChecks.setUp(self)
+        self.store.close()
+        self.config = copy.deepcopy(self.config)
+        self.config["mode"] = "live"
+        self.config["robinhood"].update(account_number="00012345", enable_live_orders=True)
+        self.config["risk"]["max_chase_fraction"] = ".20"
+        self.broker.account["account_id"] = "00012345"
+        live_store = Store(Path(self.temp.name) / "live-watch.sqlite3")
+        self.addCleanup(live_store.close)
+        self.engine = Engine(self.config, live_store, self.interpreter, self.broker, lambda: self.now)
+        self.store = live_store
+        self.addAsyncCleanup(self.engine.watches.close)
+        self.broker.prewarm_entry = AsyncMock()
+        self.broker.nearest_expiry = AsyncMock(return_value=fixtures.CONTRACT)
+        self.broker.prepared_entry = lambda contract, price: dict(
+            contract=contract, tradable=True, multiplier=100, currency="USD",
+            asset_type="equity_option", tick_size=".05", prepared_at=self.now.isoformat())
+
+    message = fixtures.CoreChecks.message
+
+    async def warm(self, content="On watch: BAC $63C"):
+        message = self.message(content=content)
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(message)
+        self.engine.watches.note(message)
+        await asyncio.gather(*list(self.engine.watches.tasks))
+        return message
+
+    def test_watch_requires_one_contract_and_preserves_expiry(self):
+        message = self.message(content="On watch: BAC $63C")
+        self.assertEqual(watch_candidate(message), fixtures.CONTRACT | {"expiry": "nearest"})
+        explicit = self.message(content="Eyes on BAC $63 calls 9/18")
+        self.assertEqual(watch_candidate(explicit), fixtures.CONTRACT)
+        with_purchase_time = self.message(content="Eyes on BAC $63C 9/18, money into these calls at the ask today")
+        self.assertEqual(watch_candidate(with_purchase_time), fixtures.CONTRACT)
+        for content in ("BAC on watch", "Test: BAC $0C on watch", "BAC $63C and QQQ $700P on watch",
+                        "ENTRY BAC $63C @ .80, was on watch", "Eyes on BAC $63C 9/18 0DTE"):
+            self.assertIsNone(watch_candidate(self.message(content=content)))
+
+    async def test_watch_prepares_without_order_and_resolves_entry_without_rpc(self):
+        await self.warm()
+        self.assertEqual(self.broker.submissions, [])
+        entry = self.message(content="ENTRY BAC $63C @ .80")
+        decision = self.interpreter.decision | {"contract": fixtures.CONTRACT | {"expiry": "nearest"}}
+        entry["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(entry)
+        decision["origin_message_id"] = entry["id"]
+        decision["evidence"] = [{"message_id": entry["id"], "quote": entry["content"]}]
+        resolved = await self.engine.resolve_expiry(entry, decision)
+        self.assertEqual(resolved["contract"], fixtures.CONTRACT)
+        self.assertEqual(self.broker.nearest_expiry.await_count, 1)
+
+    async def test_prepared_plan_sizes_at_downward_rounded_cap_without_quote(self):
+        await self.warm()
+        entry = self.message()
+        entry["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(entry)
+        self.broker.quote = AsyncMock(side_effect=AssertionError("standalone quote on prepared path"))
+        decision = copy.deepcopy(self.interpreter.decision)
+        decision["origin_message_id"] = entry["id"]
+        order = await self.engine.plan(entry, decision)
+        self.assertEqual(Decimal(order["limit_price"]), Decimal(".95"))
+        self.assertTrue(order["prepared_entry"])
+        self.assertEqual(order["entry_cancel_after_seconds"], 3)
+        self.assertIsNone(order["quote_timestamp"])
+        self.assertLessEqual(Decimal(order["limit_price"]), Decimal(".8") * Decimal("1.2"))
+        self.broker.quote.assert_not_awaited()
+
+    async def test_watch_edits_other_group_and_explicit_expiry_do_not_match(self):
+        watch = await self.warm()
+        decision = self.interpreter.decision | {"contract": fixtures.CONTRACT | {"expiry": "nearest"}}
+        self.assertIsNone(self.engine.watches.match(self.message(channel=1), decision))
+        self.engine.observations[watch["id"]] = "changed"
+        self.assertIsNone(self.engine.watches.match(self.message(), decision))
+        self.engine.watches.entries.clear()
+        await self.warm("On watch BAC $63C 9/18")
+        self.assertIsNone(self.engine.watches.match(self.message(), decision))
+
+    async def test_preparation_failure_and_stale_metadata_fall_back(self):
+        self.broker.prewarm_entry.side_effect = RuntimeError("offline")
+        await self.warm()
+        self.assertIsNone(self.engine.watches.match(self.message(), self.interpreter.decision))
+        self.broker.prewarm_entry.side_effect = None
+        await self.warm()
+        self.broker.prepared_entry = lambda contract, price: None
+        self.broker.quote = AsyncMock(wraps=self.broker.quote)
+        entry = self.message()
+        entry["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(entry)
+        order = await self.engine.plan(entry, self.interpreter.decision)
+        self.assertNotIn("prepared_entry", order)
+        self.broker.quote.assert_awaited_once()
+
+    async def test_review_can_observe_ask_above_limit_without_raising_price(self):
+        await self.warm()
+        entry = self.message()
+        entry["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(entry)
+        decision = copy.deepcopy(self.interpreter.decision)
+        decision.update(origin_message_id=entry["id"], evidence=[{"message_id": entry["id"], "quote": entry["content"]}])
+        order = await self.engine.plan(entry, decision)
+        quote = await self.broker.quote(fixtures.CONTRACT)
+        quote.update(bid="1.00", ask="1.05")
+        await self.engine.verify_dispatch(entry, decision, order, self.broker.account, quote)
+        self.assertEqual(Decimal(order["limit_price"]), Decimal(".95"))
+        self.assertEqual(decision["entry_evaluation"]["ask"], "1.05")
+
+    async def test_prepared_entry_reaches_final_guard_and_records_fill(self):
+        await self.warm()
+        self.config["require_source_verification"] = True
+        self.engine.verify_current = AsyncMock(return_value=True)
+        self.broker.result = dict(id="fixture-broker-order", status="filled", filled_quantity=1, fill_price=".80")
+        self.config["risk"]["buying_power_reserve_fraction"] = "0"
+        # Fixture sizing uses its configured entry cap; pin the buying power to one contract.
+        self.broker.account["buying_power"] = "100"
+        result = await self.engine.handle(self.message())
+        self.assertEqual(result["state"], "broker_order", result)
+        self.assertEqual(len(self.broker.submissions), 1)
+        self.assertTrue(self.broker.submissions[0]["prepared_entry"])
+        self.engine.verify_current.assert_awaited_once()
+        self.assertEqual(self.store.positions()[0]["quantity"], 1)
+
+    async def test_expired_entry_window_cannot_submit_after_slow_review(self):
+        await self.warm()
+        message = self.message()
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(message)
+        decision = self.interpreter.decision | {"origin_message_id": message["id"],
+                                                  "evidence": [{"message_id": message["id"], "quote": message["content"]}]}
+        order = await self.engine.plan(message, decision)
+        order["entry_cancel_at"] = (self.now - timedelta(seconds=1)).isoformat()
+        with self.assertRaisesRegex(Hold, "validity window"):
+            await self.engine.verify_dispatch(message, decision, order, self.broker.account,
+                                              await self.broker.quote(fixtures.CONTRACT))
+
+    async def test_changed_watch_cannot_dispatch_an_already_planned_entry(self):
+        watch = await self.warm()
+        message = self.message()
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(message)
+        decision = self.interpreter.decision | {"origin_message_id": message["id"],
+                                                  "evidence": [{"message_id": message["id"], "quote": message["content"]}]}
+        order = await self.engine.plan(message, decision)
+        self.store.reserve(message, decision, order, self.now)
+        self.engine.observations[watch["id"]] = "changed"
+        with self.assertRaisesRegex(Hold, "prepared watch"):
+            await self.engine.verify_dispatch(message, decision, order, self.broker.account,
+                                              await self.broker.quote(fixtures.CONTRACT))
+
+
+if __name__ == "__main__":
+    unittest.main()

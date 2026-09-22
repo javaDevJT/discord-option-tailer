@@ -10,7 +10,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import AsyncExitStack, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -452,7 +452,22 @@ class Store:
             AND NOT (action='UPDATE_STOP' AND json_extract(body,'$.order_type')='stop_market'
                      AND status IN ('open','partially_filled'))""").fetchone()[0]
 
+    @staticmethod
+    def _entry_deadline(order, now):
+        """Persist the short entry window from the reservation timestamp."""
+        if not isinstance(order, dict) or not isinstance(now, datetime):
+            return order
+        seconds = order.get("entry_cancel_after_seconds")
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+            return order
+        if order.get("entry_cancel_at"):
+            return order
+        order["entry_cancel_at"] = (now + timedelta(seconds=seconds)).isoformat()
+        return order
+
     def reserve(self, message, decision, order, now):
+        if decision["action"] == "OPEN":
+            order = self._entry_deadline(order, now)
         with self.db:
             if decision["action"] in {"OPEN", "REDUCE"} and decision.get("stop_price") is not None:
                 self.save_stop_request(message, decision, entry_order=order if decision["action"] == "OPEN" else None)
@@ -483,7 +498,42 @@ class Store:
 
     def mark_unknown(self, order_id):
         with self.db:
-            self.db.execute("UPDATE orders SET status='unknown' WHERE id=?", (order_id,))
+            changed = self.db.execute(
+                "UPDATE orders SET status='unknown' WHERE id=? AND status NOT IN ('filled','canceled','rejected','expired')",
+                (order_id,),
+            )
+            row = self.db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            if changed.rowcount and row:
+                self._sync_order_event(row, "unknown", row["filled_quantity"])
+
+    def _sync_order_event(self, order, status, filled_quantity, result=None):
+        """Keep the latest order result visible on the originating event."""
+        event = self.db.execute(
+            "SELECT id,decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1",
+            (order["message_id"],),
+        ).fetchone()
+        if not event:
+            return
+        try:
+            decision = json.loads(event["decision"]) if event["decision"] else {}
+        except (TypeError, ValueError):
+            decision = {}
+        decision["order_reconciliation"] = {
+            "status": status,
+            "filled_quantity": filled_quantity,
+            "requested_quantity": json.loads(order["body"]).get("quantity"),
+            "broker_order_id": order["broker_id"] if order["broker_id"] else (result or {}).get("id"),
+        }
+        if result and result.get("fill_price") is not None:
+            decision["order_reconciliation"]["fill_price"] = result["fill_price"]
+        if status == "unknown":
+            reason = "Order status unknown; reconciliation pending"
+        else:
+            reason = f"Order reconciled: {status}; filled {filled_quantity}/{decision['order_reconciliation']['requested_quantity']}"
+        self.db.execute(
+            "UPDATE events SET reason=?,decision=? WHERE id=?",
+            (reason, json.dumps(decision), event["id"]),
+        )
 
     def reject_before_submission(self, order_id):
         with self.db:
@@ -540,6 +590,7 @@ class Store:
                     qty -= delta
                 self.db.execute("INSERT OR REPLACE INTO positions VALUES (?,?,?,?)", (row["source_group"], row["contract"], qty, str(average)))
             self.db.execute("UPDATE orders SET status=?,broker_id=?,filled_quantity=?,filled_notional=? WHERE id=?", (status, result["id"], count, str(total), order_id))
+            self._sync_order_event(row, status, count, result)
 
     def report(self):
         return {
@@ -561,12 +612,15 @@ class Engine:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lock = asyncio.Lock()
         self.evaluations_active = 0
+        self.observe_only = False
         self.channels = {c["id"]: c for c in config["channels"]}
         self.observations = {}
         self.source_latest = {}
         self.verify_current = None
         from .stops import StopLoss
         self.stops = StopLoss(self)
+        from .watch import WatchEntries
+        self.watches = WatchEntries(self)
 
     def check_execution_mode(self):
         if self.mode not in {"paper", "shadow", "live"} or self.config.get("mode") != self.mode:
@@ -652,7 +706,14 @@ class Engine:
             self.check_execution_mode()
             if Path(self.config["kill_switch"]).exists():
                 raise Hold("kill switch is present")
-            self.check_quote_age(quote if quote is not None else {"timestamp": order["quote_timestamp"]}, now)
+            if order.get("prepared_entry") and order.get("entry_cancel_at") and instant(order["entry_cancel_at"]) <= now:
+                raise Hold("prepared entry validity window elapsed before submission")
+            if order.get("prepared_entry"):
+                watched = self.watches.match(message, decision, with_source=True)
+                if watched is None or watched != order.get("prepared_watch"):
+                    raise Hold("prepared watch changed or expired before submission")
+            if quote is not None or not order.get("prepared_entry"):
+                self.check_quote_age(quote if quote is not None else {"timestamp": order["quote_timestamp"]}, now)
             self.check_quote_age(snapshot if snapshot is not None else {"timestamp": order["account_timestamp"]}, now, "account snapshot")
             if snapshot is not None:
                 if snapshot.get("account_id") != self.account or snapshot.get("market_open") is not True:
@@ -672,7 +733,10 @@ class Engine:
                     with self.store.db:
                         self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
                                               (json.dumps(order), order["client_order_id"]))
-                    if not entry_chase_within_cap(evaluation):
+                    within_cap = (money(order["limit_price"], positive=True)
+                                  <= money(decision["alert_price"], positive=True)
+                                  * (1 + money(self.config["risk"]["max_chase_fraction"])))
+                    if not within_cap or (not order.get("prepared_entry") and not entry_chase_within_cap(evaluation)):
                         raise Hold(entry_chase_reason("current ask exceeds permitted chase during broker review", evaluation))
                     quantity, _ = entry_size(self.config["risk"], snapshot, order["contract"], decision["confidence"], order["limit_price"], message["source_group"])
                     if quantity < order["quantity"]:
@@ -703,7 +767,15 @@ class Engine:
         if source_day != self.clock().astimezone(EASTERN).date():
             raise Hold("an older entry without an explicit expiry cannot roll into a new contract")
         requested = canonical_contract(dict(contract, expiry=source_day.isoformat()))
-        resolved = canonical_contract(await self.measure(decision, "contract_resolution_seconds", self.broker.nearest_expiry(requested)))
+        warmed = self.watches.match(message, decision)
+        if warmed:
+            prepare = getattr(self.broker, "prepared_entry", None)
+            ceiling = money(decision.get("alert_price"), positive=True) * (1 + money(self.config["risk"]["max_chase_fraction"]))
+            if not callable(prepare) or prepare(warmed, ceiling) is None:
+                warmed = None
+        resolved = warmed or canonical_contract(await self.measure(decision, "contract_resolution_seconds", self.broker.nearest_expiry(requested)))
+        if warmed:
+            decision.setdefault("evaluation_timing", {})["watch_contract_prepared"] = True
         if any(resolved[key] != requested[key] for key in ("symbol", "strike", "option_type")) or resolved["expiry"] < requested["expiry"]:
             raise Hold("broker expiry resolution changed the intended option")
         return decision | {"contract": resolved, "reason": (decision["reason"][:3800] +
@@ -758,8 +830,9 @@ class Engine:
             if not context_only:
                 self.fresh(message, self.clock())
                 self.unchanged(message)
-            if Path(self.config["kill_switch"]).exists():
-                raise Hold("kill switch is present")
+                if Path(self.config["kill_switch"]).exists():
+                    raise Hold("kill switch is present")
+                self.watches.note(message)
             context = self.store.context(message, self.config.get("llm", {}).get("context_messages", 60))
             attempt = self.store.begin_evaluation(message)
             if attempt is None:
@@ -1003,7 +1076,32 @@ class Engine:
             raise Hold("quantity must be a positive whole contract")
         side = "buy" if action == "OPEN" else "sell"
 
+        prepared = None
+        watched = self.watches.match(message, decision, with_source=True) if action == "OPEN" else None
+        if self.mode == "live" and action == "OPEN" and watched:
+            ceiling = money(decision.get("alert_price"), positive=True) * (1 + money(risk["max_chase_fraction"]))
+            prepare = getattr(self.broker, "prepared_entry", None)
+            if callable(prepare):
+                prepared = prepare(contract, ceiling)
+            if prepared is not None:
+                if (canonical_contract(prepared.get("contract")) != contract or prepared.get("tradable") is not True
+                        or prepared.get("multiplier") != 100 or prepared.get("currency") != "USD"
+                        or prepared.get("asset_type") != "equity_option"):
+                    raise Hold("prepared entry does not identify a standard tradable option")
+                tick = money(prepared.get("tick_size"), positive=True)
+                capped_price = (ceiling / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                # Recheck the schedule when rounding crosses a premium threshold.
+                prepared = prepare(contract, capped_price)
+                if prepared is not None:
+                    tick = money(prepared.get("tick_size"), positive=True)
+                    capped_price = (capped_price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                    if capped_price <= 0 or capped_price > ceiling:
+                        raise Hold("entry chase ceiling does not permit a valid limit price")
+                    decision.setdefault("evaluation_timing", {})["watch_contract_prepared"] = True
+
         async def checked_quote():
+            if prepared is not None:
+                return prepared, capped_price
             quote = await self.measure(decision, "quote_seconds", self.broker.quote(contract))
             if canonical_contract(quote.get("contract")) != contract or quote.get("tradable") is not True:
                 raise Hold("quote does not identify the requested tradable contract")
@@ -1045,16 +1143,20 @@ class Engine:
         sizing = None
         if action == "OPEN":
             qty, sizing = entry_size(risk, snapshot, contract, decision["confidence"], price, message["source_group"])
-        self.check_quote_age(quote, self.clock())
+        if prepared is None:
+            self.check_quote_age(quote, self.clock())
         identity = message["id"] + ":" + message["revision"]
         order = dict(contract=contract, side=side, quantity=qty, limit_price=str(price), position_effect="open" if side == "buy" else "close",
                      client_order_id=hashlib.sha256(identity.encode()).hexdigest(),
                      origin_message_id=decision.get("origin_message_id"),
-                     quote_timestamp=quote["timestamp"], account_timestamp=snapshot["timestamp"],
+                     quote_timestamp=quote.get("timestamp"), account_timestamp=snapshot["timestamp"],
                      signal_fingerprint=signal_fingerprint)
+        if prepared is not None:
+            order.update(prepared_entry=True, prepared_watch=watched, entry_cancel_after_seconds=3)
         if sizing:
             order["sizing"] = sizing
-            order["entry_evaluation"] = decision["entry_evaluation"]
+            if decision.get("entry_evaluation"):
+                order["entry_evaluation"] = decision["entry_evaluation"]
         if side == "sell":
             self.check_exit_profit(message, decision, order, price)
         if expiry_guard is not None:

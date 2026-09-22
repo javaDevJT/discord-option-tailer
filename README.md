@@ -13,7 +13,7 @@ The [account monitoring guide](docs/container.md#account-balances-and-holdings) 
 - [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.
 - [Broker integration](docs/robinhood-integration.md): authorization, account inspection, and execution checks.
 - [Agent-directed stops](docs/container.md#agent-directed-stop-losses): compound trims, breakeven protection, cancellation and restart behavior.
-- [Fast entry and evaluation design](docs/jev-evaluation-design.md): direct entry rules, JEV/Codex boundaries, timing targets, and qualification checks.
+- [Fast entry evaluation design](docs/jev-evaluation-design.md): watch preparation, capped limit entries, direct entry rules, JEV/Codex boundaries, and timing checks.
 - [Configuration template](config.example.json): CLI and offline-rehearsal defaults.
 - [Container environment](.env.example): dashboard binding and password settings.
 - [Relay source](relay/): Gateway and browser readers, interpreter, ledger, broker adapter, dashboard, and worker.

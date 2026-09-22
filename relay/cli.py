@@ -153,8 +153,11 @@ async def run(config, *, observe_only=False, on_status=None):
         if interpreter is not None:
             connections.push_async_callback(interpreter.aclose)
         engine = Engine(config, store, interpreter, broker)
+        engine.observe_only = observe_only
         from .recovery import RecoveryEvaluator
         recovery = RecoveryEvaluator(engine)
+        # Restore confirmed inventory before a new message is interpreted against it.
+        await recovery.reconcile_orders()
         from .expiry import ExpiryExits
         expiry = ExpiryExits(engine, recovery.reconcile_orders)
         queue = asyncio.Queue(maxsize=config["risk"]["max_pending_messages"])
@@ -225,6 +228,8 @@ async def run(config, *, observe_only=False, on_status=None):
         async with asyncio.TaskGroup() as tasks:
             consumer = tasks.create_task(consume())
             recovery_consumer = tasks.create_task(recovery.consume(queue, emit))
+            order_reconciler = tasks.create_task(recovery.reconcile_loop(emit))
+            watch_preparer = tasks.create_task(engine.watches.run())
             expiry_consumer = tasks.create_task(expiry.run(emit))
             if config["mode"] != "paper":
                 from .account import AccountCache
@@ -238,6 +243,8 @@ async def run(config, *, observe_only=False, on_status=None):
                 finally:
                     consumer.cancel()
                     recovery_consumer.cancel()
+                    order_reconciler.cancel()
+                    watch_preparer.cancel()
                     expiry_consumer.cancel()
                     if account_reader is not None:
                         account_reader.cancel()

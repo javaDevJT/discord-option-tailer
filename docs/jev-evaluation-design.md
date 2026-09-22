@@ -1,6 +1,6 @@
 # Fast entry rules, JEV, and Codex fallback
 
-Local verification on September 22, 2026 passed all 490 tests, including the real HTTP key-save flow, broker read-scope checks, expiry ordering, concurrent reads, and corrected evidence retries. Tests did not use a live trade or model-provider call. Local parsing results and simulated broker delays do not establish live submission latency.
+Local verification on September 22, 2026 passed all 555 tests, including prepared entries using review quotes, bounded order matching after a lost response, durable restart ownership and later sells, cancellation deadlines, observe-only behavior, and the existing rendered UI checks. Tests used fixture broker and model responses. They do not establish live submission or fill latency.
 
 ## Routing boundaries
 
@@ -25,6 +25,16 @@ JEV credentials remain optional for direct code. When JEV is selected, its TypeS
 Parsing confidence describes certainty about the explicit instruction. It is not a forecast of trading profit and does not become a Kelly win probability. Direct entries supply 1.0 parsing confidence, selecting the upper configured confidence-sizing reference before the other deterministic sizing adjustments. Existing affordability, maximum chase, whole-contract trim rounding, and expiry-protection rules continue to run.
 
 ## Execution and timing
+
+### Watch preparation and capped entries
+
+A fresh, authorized `on watch`, `eyes on`, or `watching` message naming one option can prepare its exact broker instrument before ENTRY. Preparation is bounded to eight candidates for one hour in the current New York session, refreshes metadata every 30 seconds, and never places an order. An omitted watch expiry uses the existing nearest-listed rule. A later ENTRY must match the source group, symbol, strike, side and expiry semantics; an explicit watch expiry cannot silently override an undated ENTRY. Edited, historical, ambiguous and ticker-only watch messages do not authorize this path. Missing or stale preparation falls back to normal discovery and quote retrieval.
+
+For a matched live ENTRY, the limit is the ENTRY premium multiplied by one plus the configured chase allowance, rounded down to the applicable trading increment. Sizing uses that limit and the fee reserve. The prepared path obtains its timestamped quote from broker review instead of a separate quote call. Current spread, quote age, session, account, source and ownership checks remain required. An ask above the capped limit can leave an order resting briefly without increasing the limit.
+
+Prepared entry orders carry a persistent three-second cancellation deadline. Reconciliation cancels any unfilled remainder after the deadline and applies cumulative fills exactly once, including fills racing cancellation. Cancellation is asynchronous: three seconds is the target before requesting cancellation, not a guaranteed exchange-side expiry. Restart recovers that deadline and reconciles before accepting fresh signals. Review and placement remain provider requests; fixture tests cannot establish subsecond live submission or fill latency.
+
+### Existing execution path
 
 ```mermaid
 flowchart LR

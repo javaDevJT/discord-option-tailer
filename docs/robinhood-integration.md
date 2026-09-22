@@ -27,6 +27,12 @@ The account and portfolio schemas observed on September 9, 2026 changed only the
 
 Account equity uses the portfolio total, not only the stock/ETF component. Spendable funds are constrained by reported and unleveraged buying power. Account snapshot age starts at the beginning of its fetch; option quotes use the provider's timestamp. Session gating uses the installed exchange calendar and conservatively stops at 16:00 New York time.
 
+## Uncertain orders and restart recovery
+
+Uncertain buys are reconciled before startup accepts fresh messages and by a separate background worker while running. A known broker UUID is looked up directly. A lost placement response can instead be resolved only when one agentic broker order matches the persisted contract, side/effect, quantity, limit, order type and submission window on the bound account. Matching does not resend the buy. Manual holdings alone do not establish source ownership; missing or ambiguous evidence keeps the order blocked.
+
+Confirmed cumulative fills update the durable source-owned position and the message's order result together. Repeated reconciliation cannot add the same fill twice. Recovered inventory also restarts missed-exit scanning, so a later sell can use the original source and entry lifetime after restart. Prepared entries persist their cancellation deadline; a restart cancels an expired remainder and reconciles any fill that raced cancellation.
+
 ## Modes and allocation
 
 To permit 0DTE entries, enable **Allow same-day (0DTE) entries** in Setup and select **Save permission**. When the relay is running, the button reads **Pause and save** and pauses before saving. Wait for the saved confirmation, then select **Resume relay** when ready. Editing the checkbox does not change the saved permission until you save; the selected mode, credentials and other risk rules remain intact.

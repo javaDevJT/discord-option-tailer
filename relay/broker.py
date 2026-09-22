@@ -33,6 +33,8 @@ READ_TOOLS = frozenset({
 })
 _BROKER_READ_CONCURRENCY = 4
 _EXECUTION_READ_REUSE_SECONDS = 1.0
+_PREPARED_ENTRY_TTL_SECONDS = 60.0
+_PREPARED_ENTRY_CACHE_LIMIT = 64
 
 
 class BrokerError(RuntimeError):
@@ -886,6 +888,15 @@ def _request_order_kind(order):
     return _order_kind(order)
 
 
+def _order_ref_id(account_number, client_order_id):
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "discord-options-relay:" + account_number + ":" + client_order_id,
+        )
+    )
+
+
 class RobinhoodBroker(RobinhoodMCP):
     """Normalized Agentic account reads and explicitly enabled single-leg limit orders."""
 
@@ -1064,6 +1075,7 @@ class RobinhoodBroker(RobinhoodMCP):
         self.order_bodies = {}
         self.order_inputs = {}
         self.order_results = {}
+        self._prepared_entries = {}
         self.attempted = set()
         self.account_changed = asyncio.Event()
         self._portfolio_task = None
@@ -1632,6 +1644,239 @@ class RobinhoodBroker(RobinhoodMCP):
         self._remember_execution_quote(target, result)
         return result
 
+    async def _resolve_prepared_entry(self, contract):
+        """Resolve contract identity and trading metadata without reading a quote."""
+        target = _contract_key(contract)
+        queries = [
+            (
+                "get_option_chains",
+                {"underlying_symbol": target[0]},
+                "chains",
+            ),
+            (
+                "get_option_instruments",
+                {
+                    "chain_symbol": target[0],
+                    "expiration_dates": target[1],
+                    "strike_price": format(Decimal(target[2]), "f"),
+                    "type": target[3],
+                    "state": "active",
+                    "tradability": "tradable",
+                },
+                "instruments",
+            ),
+        ]
+        chains, instruments = await self._bounded_reads(
+            lambda query: self._pages(*query), queries
+        )
+        matching_chains = [
+            chain
+            for chain in chains
+            if chain.get("symbol") == target[0]
+            and target[1] in (chain.get("expiration_dates") or [])
+        ]
+        candidates = [
+            (chain, instrument)
+            for chain in matching_chains
+            for instrument in instruments
+            if instrument.get("chain_id") == chain.get("id")
+            and _contract_key(self._instrument_contract(instrument)) == target
+        ]
+        if len(candidates) != 1:
+            raise BrokerError("Exact option contract missing or ambiguous across chains")
+        chain, instrument = candidates[0]
+
+        underlyings = chain.get("underlying_instruments") or []
+        if (
+            chain.get("cash_component") is not None
+            and _decimal(chain["cash_component"], "cash component") != 0
+        ) or len(underlyings) != 1:
+            raise BrokerError("Adjusted or non-equity chains unsupported")
+        underlying = underlyings[0]
+        if underlying.get("symbol") != target[0]:
+            if underlying.get("symbol"):
+                raise BrokerError("Underlying equity symbol conflicts with option chain")
+            try:
+                underlying_id = str(
+                    uuid.UUID(urlsplit(underlying["instrument"]).path.rstrip("/").split("/")[-1])
+                )
+            except (ValueError, TypeError, KeyError):
+                raise BrokerError("Underlying equity identity unavailable") from None
+            search = await self._data(
+                "search", {"query": target[0], "asset_type": "instrument", "limit": 20}
+            )
+            matches = [
+                row
+                for row in search.get("results") or []
+                if row.get("symbol") == target[0] and row.get("instrument_id") == underlying_id
+            ]
+            if len(matches) != 1:
+                raise BrokerError("Official equity search could not verify chain's underlying instrument")
+
+        if _decimal(chain.get("trade_value_multiplier"), "chain multiplier") != 100:
+            raise BrokerError("Nonstandard chain multiplier")
+        if instrument.get("state") != "active" or instrument.get("tradability") != "tradable":
+            raise BrokerError("Option contract is inactive or untradable")
+        ticks = instrument.get("min_ticks") or chain.get("min_ticks")
+        if not isinstance(ticks, dict):
+            raise BrokerError("Option tick metadata is missing")
+        for field in ("above_tick", "below_tick", "cutoff_price"):
+            if _decimal(ticks.get(field), f"tick {field}") <= 0:
+                raise BrokerError("Option tick metadata is invalid")
+        if self.currency is None:
+            await self._portfolio()
+        if self.currency != "USD":
+            raise BrokerError("Prepared option entries require a USD account")
+
+        canonical = self._instrument_contract(instrument)
+        metadata = {
+            "contract": canonical,
+            "option_id": instrument["id"],
+            "chain_id": chain["id"],
+            "min_ticks": copy.deepcopy(ticks),
+            "tradable": True,
+            "can_open_position": chain.get("can_open_position") is True,
+            "multiplier": 100,
+            "currency": "USD",
+            "asset_type": "equity_option",
+            "sellout_datetime": instrument.get("sellout_datetime"),
+            "prepared_at": self.clock().astimezone(timezone.utc).isoformat(),
+            "source": "Robinhood Agentic MCP",
+        }
+        self.instruments[instrument["id"]] = copy.deepcopy(instrument)
+        self.contracts[target] = {"option_id": instrument["id"], "chain_id": chain["id"]}
+        return metadata
+
+    async def prewarm_entry(self, contract):
+        """Cache bounded contract metadata for a short-lived prepared entry."""
+        metadata = await self._resolve_prepared_entry(contract)
+        target = _contract_key(metadata["contract"])
+        self._prepared_entries[target] = (time.monotonic(), metadata)
+        while len(self._prepared_entries) > _PREPARED_ENTRY_CACHE_LIMIT:
+            oldest = min(self._prepared_entries, key=lambda key: self._prepared_entries[key][0])
+            self._prepared_entries.pop(oldest, None)
+        return copy.deepcopy(metadata)
+
+    def prepared_entry(self, contract, price):
+        """Return prepared entry metadata with the price-specific tick, if fresh."""
+        try:
+            target = _contract_key(contract)
+            cached = self._prepared_entries.get(target)
+            if cached is None:
+                return None
+            cached_at, metadata = cached
+            prepared_at = _instant(metadata.get("prepared_at"))
+            age = (self.clock().astimezone(timezone.utc) - prepared_at).total_seconds()
+            if age < 0 or age > _PREPARED_ENTRY_TTL_SECONDS or (
+                time.monotonic() - cached_at > _PREPARED_ENTRY_TTL_SECONDS
+            ):
+                self._prepared_entries.pop(target, None)
+                return None
+            if (
+                _contract_key(metadata.get("contract")) != target
+                or metadata.get("tradable") is not True
+                or metadata.get("multiplier") != 100
+                or metadata.get("currency") != "USD"
+                or metadata.get("asset_type") != "equity_option"
+            ):
+                return None
+            entry_price = _decimal(price, "entry price")
+            if entry_price <= 0 or metadata.get("can_open_position") is not True:
+                return None
+            ticks = metadata.get("min_ticks")
+            cutoff = _decimal(ticks.get("cutoff_price"), "tick cutoff")
+            tick = _decimal(
+                ticks["above_tick" if entry_price >= cutoff else "below_tick"],
+                "tick",
+            )
+            if tick <= 0:
+                return None
+            prepared = copy.deepcopy(metadata)
+            prepared["tick_size"] = format(tick, "f")
+            return prepared
+        except (BrokerError, AttributeError, KeyError, TypeError, ValueError):
+            return None
+
+    def _prepared_order_args(self, order):
+        if (
+            order.get("order_type", "limit") != "limit"
+            or order.get("side") != "buy"
+            or order.get("position_effect") != "open"
+        ):
+            raise BrokerError("Prepared entries only support buy-open limit orders")
+        if order.get("time_in_force", "gfd") != "gfd" or order.get("stop_price") is not None:
+            raise BrokerError("Prepared entry limit orders require gfd and no stop price")
+        quantity = order.get("quantity")
+        if type(quantity) is not int or quantity <= 0:
+            raise BrokerError("Prepared entry quantity must be a positive whole number")
+        metadata = self.prepared_entry(order.get("contract"), order.get("limit_price"))
+        if metadata is None:
+            raise BrokerError("Prepared entry metadata is absent or stale")
+        if metadata["can_open_position"] is not True:
+            raise BrokerError("This option chain is closed to new positions")
+        if _decimal(order["limit_price"], "limit price") % _decimal(metadata["tick_size"], "tick"):
+            raise BrokerError("Prepared entry price does not satisfy the option's tick rule")
+        return {
+            "account_number": self.account_number,
+            "legs": [{
+                "option_id": metadata["option_id"],
+                "side": "buy",
+                "position_effect": "open",
+                "ratio_quantity": 1,
+            }],
+            "quantity": str(quantity),
+            "type": "limit",
+            "price": format(_decimal(order["limit_price"], "limit price"), "f"),
+            "time_in_force": "gfd",
+            "market_hours": "regular_hours",
+        }, metadata
+
+    def _review_option_quote(self, review, metadata):
+        quotes = review.get("option_quotes") if isinstance(review, dict) else None
+        if not isinstance(quotes, list) or len(quotes) != 1 or not isinstance(quotes[0], dict):
+            raise BrokerError("Robinhood review did not supply one option quote")
+        raw = quotes[0]
+        if raw.get("instrument_id") != metadata["option_id"]:
+            raise BrokerError("Robinhood review quote does not match the prepared option")
+        try:
+            bid = _decimal(raw.get("bid_price"), "review bid")
+            ask = _decimal(raw.get("ask_price"), "review ask")
+            bid_size = raw.get("bid_size")
+            ask_size = raw.get("ask_size")
+            if bid <= 0 or ask <= 0 or bid > ask:
+                raise BrokerError("Robinhood review quote has invalid bid or ask")
+            if type(bid_size) is not int or bid_size <= 0 or type(ask_size) is not int or ask_size <= 0:
+                raise BrokerError("Robinhood review quote has invalid book sizes")
+            timestamp = _instant(raw.get("updated_at"))
+            max_spread = _decimal(
+                self.runtime.get("risk", {}).get("max_spread_fraction", "0.15"),
+                "spread limit",
+            )
+            if max_spread <= 0 or (ask - bid) / ask > max_spread:
+                raise BrokerError("Robinhood review quote spread exceeds configured limit")
+        except (InvalidOperation, TypeError, ValueError):
+            raise BrokerError("Robinhood review quote is malformed") from None
+        return {
+            "contract": copy.deepcopy(metadata["contract"]),
+            "option_id": metadata["option_id"],
+            "chain_id": metadata["chain_id"],
+            "bid": str(bid),
+            "ask": str(ask),
+            "tick_size": metadata["tick_size"],
+            "min_ticks": copy.deepcopy(metadata["min_ticks"]),
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "mark": raw.get("adjusted_mark_price") or raw.get("mark_price"),
+            "timestamp": timestamp.isoformat(),
+            "currency": "USD",
+            "multiplier": 100,
+            "tradable": metadata["tradable"],
+            "can_open_position": metadata["can_open_position"],
+            "asset_type": "equity_option",
+            "sellout_datetime": metadata.get("sellout_datetime"),
+            "source": "Robinhood review_option_order",
+        }
+
     def _live_enabled(self):
         if self.runtime.get("mode") != "live" or self.config.get("enable_live_orders") is not True:
             raise BrokerError("Live Robinhood orders require live mode and explicit enable_live_orders")
@@ -1714,8 +1959,12 @@ class RobinhoodBroker(RobinhoodMCP):
             "market_hours": "regular_hours",
         }, quote
 
-    async def _review_args(self, args, quote):
-        review = await self._data("review_option_order", dict(args, chain_symbol=quote["contract"]["symbol"], underlying_type="equity"))
+    async def _review_args(self, args, quote, *, review=None):
+        if review is None:
+            review = await self._data(
+                "review_option_order",
+                dict(args, chain_symbol=quote["contract"]["symbol"], underlying_type="equity"),
+            )
         if review.get("order_checks") != {}:
             raise BrokerError("Robinhood pre-trade review reported an alert; order was not placed")
         order_kind = args["type"]
@@ -1795,7 +2044,25 @@ class RobinhoodBroker(RobinhoodMCP):
         self.order_bodies[client_id] = body
         self.order_inputs[client_id] = copy.deepcopy(order)
         try:
-            if self.currency is None:
+            prepared_entry = order.get("prepared_entry") is True
+            if prepared_entry:
+                snapshot = await self.snapshot()
+                args, metadata = self._prepared_order_args(order)
+                review_payload = await self._data(
+                    "review_option_order",
+                    dict(
+                        args,
+                        chain_symbol=metadata["contract"]["symbol"],
+                        underlying_type="equity",
+                    ),
+                )
+                quote = self._review_option_quote(review_payload, metadata)
+                review, fee = await self._review_args(
+                    args,
+                    metadata,
+                    review=review_payload,
+                )
+            elif self.currency is None:
                 snapshot = await self.snapshot()
                 args, quote = await self._order_args(order)
             else:
@@ -1819,7 +2086,8 @@ class RobinhoodBroker(RobinhoodMCP):
                 )
                 if order["quantity"] > available:
                     raise BrokerError("Order would exceed available long option inventory")
-            review, fee = await self._review_args(args, quote)
+            if not prepared_entry:
+                review, fee = await self._review_args(args, quote)
             if order["side"] == "buy" and _decimal(args["price"], "price") * 100 * order["quantity"] + max(fee, Decimal(0)) > _decimal(snapshot["buying_power"], "buying power"):
                 raise BrokerError("Actual review fees and premium exceed available buying power")
             self._fresh_quote(quote)
@@ -1832,7 +2100,7 @@ class RobinhoodBroker(RobinhoodMCP):
             raise
         except BrokerError as exc:
             raise BrokerPreflightHold(f"Order preflight validation held the order: {exc}") from exc
-        ref_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "discord-options-relay:" + self.account_number + ":" + client_id))
+        ref_id = _order_ref_id(self.account_number, client_id)
         if before_submit is not None:
             try:
                 await before_submit(snapshot, quote)
@@ -1854,6 +2122,88 @@ class RobinhoodBroker(RobinhoodMCP):
         normalized["ref_id"] = ref_id
         self.order_results[client_id] = normalized
         return dict(normalized)
+
+    def _order_matches_expected(self, raw, expected):
+        if not isinstance(raw, dict) or not isinstance(expected, dict):
+            return False
+        if (
+            raw.get("account_number") is not None
+            and expected.get("account_number") is not None
+            and raw.get("account_number") != expected.get("account_number")
+        ):
+            return False
+        if raw.get("placed_agent") not in (None, "agentic"):
+            return False
+        try:
+            if expected.get("quantity") is not None and _contracts(raw.get("quantity")) != _contracts(expected["quantity"]):
+                return False
+        except BrokerError:
+            return False
+        legs = raw.get("legs") or []
+        if len(legs) != 1:
+            return False
+        leg = legs[0]
+        expected_leg = None
+        if isinstance(expected.get("legs"), list) and len(expected["legs"]) == 1:
+            expected_leg = expected["legs"][0]
+        expected_option_id = expected.get("option_id") or expected.get("instrument_id") or (expected_leg or {}).get("option_id")
+        if expected_option_id is None and expected.get("contract") is not None:
+            cached = self.contracts.get(_contract_key(expected["contract"]))
+            expected_option_id = cached.get("option_id") if cached else None
+        if expected.get("contract") is not None and expected_option_id is None:
+            if any(value is None for value in (raw.get("chain_symbol"), leg.get("expiration_date"),
+                                               leg.get("strike_price"), leg.get("option_type"))):
+                return False
+        if expected_option_id is not None and leg.get("option_id") != expected_option_id:
+            return False
+        if expected.get("side") is not None and leg.get("side") != expected.get("side"):
+            return False
+        if expected.get("position_effect") is not None and leg.get("position_effect") != expected.get("position_effect"):
+            return False
+        if expected_leg is not None:
+            for key in ("option_id", "side", "position_effect", "ratio_quantity"):
+                if expected_leg.get(key) is not None and leg.get(key) != expected_leg.get(key):
+                    return False
+        contract = expected.get("contract")
+        if contract is not None:
+            fields = {
+                "symbol": raw.get("chain_symbol"),
+                "expiry": leg.get("expiration_date"),
+                "strike": leg.get("strike_price"),
+                "option_type": leg.get("option_type"),
+            }
+            if any(value is None for value in fields.values()):
+                if expected_option_id is None:
+                    return False
+            else:
+                try:
+                    if _contract_key(fields) != _contract_key(contract):
+                        return False
+                except BrokerError:
+                    return False
+        expected_kind = _request_order_kind(expected)
+        if expected_kind is not None and _order_kind(raw) != expected_kind:
+            return False
+        expected_price = expected.get("price", expected.get("limit_price"))
+        if expected_kind == "limit" and expected_price is not None:
+            try:
+                if _decimal(raw.get("price"), "order price") != _decimal(expected_price, "expected price"):
+                    return False
+            except BrokerError:
+                return False
+        try:
+            kind = _request_order_kind(expected) or "limit"
+            if _order_kind(raw) != kind:
+                return False
+            tif = expected.get("time_in_force", "gtc" if kind == "stop_market" else "gfd")
+            if raw.get("time_in_force", tif) != tif:
+                return False
+            hours = expected.get("market_hours", "regular_hours")
+            if raw.get("market_hours", hours) != hours:
+                return False
+        except (BrokerError, TypeError, ValueError):
+            return False
+        return True
 
     def _order_result(self, raw, client_id, expected=None):
         if not isinstance(raw, dict) or _decimal(raw.get("trade_value_multiplier"), "multiplier") != 100:
@@ -1966,24 +2316,124 @@ class RobinhoodBroker(RobinhoodMCP):
         }
 
     async def order_status(self, order_id, *, broker_order_id=None, expected_order=None):
-        known = self.order_results.get(order_id)
-        persisted = expected_order or self.order_inputs.get(order_id)
+        direct_known = self.order_results.get(order_id)
+        known = direct_known
+        client_id = order_id
+        if known is None:
+            for candidate_id, candidate in self.order_results.items():
+                if candidate.get("broker_order_id") == order_id:
+                    client_id, known = candidate_id, candidate
+                    break
+        if known is not None and known.get("client_order_id") in self.order_inputs:
+            client_id = known["client_order_id"]
+        persisted = expected_order or self.order_inputs.get(client_id) or self.order_inputs.get(order_id)
+        persisted = copy.deepcopy(persisted) if persisted else None
+        known_ref = (known or {}).get("ref_id")
+        persisted_ref = (persisted or {}).get("ref_id")
+        if known_ref and persisted_ref and known_ref != persisted_ref:
+            raise BrokerError("Persisted order ref_id does not match the known order")
+        expected_ref = known_ref or persisted_ref or _order_ref_id(self.account_number, client_id)
         broker_id = broker_order_id or (known or {}).get("broker_order_id")
         if persisted and persisted.get("broker_order_id") and broker_id != persisted["broker_order_id"]:
             raise BrokerError("Persisted broker order identity does not match the requested broker order")
         if known and broker_order_id and known.get("broker_order_id") != broker_order_id:
             raise BrokerError("Requested broker order does not match the persisted order")
+        matched_row = None
         if not broker_id:
-            try:
-                broker_id = str(uuid.UUID(order_id))
-            except (ValueError, TypeError):
-                raise BrokerError("Persisted broker order UUID is required; unknown submissions must not be repeated") from None
-        rows = await self._pages("get_option_orders", {"account_number": self.account_number, "order_id": broker_id}, "orders")
+            if expected_ref:
+                lookup = {"account_number": self.account_number, "placed_agent": "agentic"}
+                created_at_floor = None
+                anchor = (persisted or {}).get("created_at") or (persisted or {}).get("submitted_at")
+                if anchor is None and persisted and persisted.get("entry_cancel_at"):
+                    try:
+                        seconds = _decimal(persisted.get("entry_cancel_after_seconds"), "entry cancel window")
+                        anchor = (
+                            _instant(persisted["entry_cancel_at"]) - timedelta(seconds=float(seconds))
+                        ).isoformat()
+                    except (BrokerError, TypeError, ValueError):
+                        anchor = None
+                if anchor is not None:
+                    try:
+                        created_at_floor = _instant(anchor) - timedelta(seconds=5)
+                        lookup["created_at_gte"] = (
+                            created_at_floor
+                        ).isoformat()
+                    except BrokerError:
+                        pass
+                rows = await self._pages(
+                    "get_option_orders",
+                    lookup,
+                    "orders",
+                )
+                def in_submission_window(row):
+                    if created_at_floor is None:
+                        return False
+                    try:
+                        created = _instant(row.get("created_at"))
+                        ceiling = min(created_at_floor + timedelta(seconds=125),
+                                      self.clock().astimezone(timezone.utc) + timedelta(seconds=5))
+                        return created_at_floor <= created <= ceiling
+                    except (BrokerError, TypeError, ValueError):
+                        return False
+
+                matches = [
+                    row
+                    for row in rows
+                    if row.get("placed_agent") == "agentic"
+                    and row.get("ref_id") == expected_ref
+                ]
+                if not matches:
+                    matches = [
+                        row
+                        for row in rows
+                        if row.get("placed_agent") == "agentic"
+                        and in_submission_window(row)
+                        and all(row.get(key) is not None for key in ("type", "trigger", "time_in_force", "market_hours"))
+                        and self._order_matches_expected(row, persisted or {})
+                    ]
+                if len(matches) != 1:
+                    raise BrokerError("Broker order could not be uniquely reconciled on the bound account")
+                if created_at_floor is not None:
+                    try:
+                        created_at = _instant(matches[0].get("created_at"))
+                        if created_at < created_at_floor or created_at > min(created_at_floor + timedelta(seconds=125), self.clock().astimezone(timezone.utc) + timedelta(seconds=5)):
+                            raise BrokerError("Broker order is outside the persisted reconciliation window")
+                    except (BrokerError, TypeError, ValueError):
+                        raise BrokerError("Broker order timestamp is outside the persisted reconciliation window") from None
+                matched_row = matches[0]
+                broker_id = matched_row.get("id")
+            else:
+                try:
+                    broker_id = str(uuid.UUID(order_id))
+                except (ValueError, TypeError):
+                    raise BrokerError("Persisted broker order UUID is required; unknown submissions must not be repeated") from None
+        rows = [matched_row] if matched_row is not None else await self._pages(
+            "get_option_orders",
+            {"account_number": self.account_number, "order_id": broker_id},
+            "orders",
+        )
         if len(rows) != 1 or rows[0].get("id") != broker_id:
             raise BrokerError("Broker order could not be reconciled on the bound account")
-        previous = self.order_results.get(order_id)
-        result = self._order_result(rows[0], order_id, persisted)
-        self.order_results[order_id] = result
+        if rows[0].get("account_number") not in (None, self.account_number):
+            raise BrokerError("Broker order account does not match the bound account")
+        if rows[0].get("placed_agent") not in (None, "agentic"):
+            raise BrokerError("Broker order is not an agentic order")
+        if expected_ref and rows[0].get("ref_id") not in (None, expected_ref):
+            raise BrokerError("Broker order ref_id does not match the persisted order")
+        if persisted is None:
+            persisted = {}
+        if expected_ref:
+            persisted["ref_id"] = expected_ref
+        persisted["broker_order_id"] = broker_id
+        if persisted and not self._order_matches_expected(rows[0], persisted):
+            raise BrokerError("Broker order does not match the persisted contract and quantity")
+        previous = direct_known if direct_known is not None else (
+            self.order_results.get(client_id) if order_id == client_id else None
+        )
+        result = self._order_result(rows[0], client_id, persisted)
+        self.order_results[client_id] = result
+        if order_id != client_id:
+            self.order_results[order_id] = result
         if previous is None or (
             result["filled_quantity"] != previous.get("filled_quantity")
             or result["status"] != previous.get("status")
