@@ -308,10 +308,31 @@ class SetupManager:
             return self._action_response_locked("discovery_requested")
 
     def robinhood_schemas(self) -> dict:
-        """Read cached tool contracts from setup's authenticated discovery; no account values."""
+        """Expose cached schema metadata, including after dashboard restarts."""
         with self._lock:
             job = self._jobs.get("robinhood")
-            return {"tools": copy.deepcopy(job.schema_catalog) if job else []}
+            if job and job.schema_catalog:
+                return {"tools": copy.deepcopy(job.schema_catalog)}
+            raw = self._read_raw_locked(allow_missing=True)
+            cache = self._configured_path(
+                raw, "token_store", self.config_path.parent / "state" / "robinhood-oauth.json",
+                section="robinhood",
+            ).with_name("robinhood-schemas.json")
+            try:
+                if cache.is_symlink() or cache.stat().st_size > 2 * 1024 * 1024:
+                    return {"tools": []}
+                value = json.loads(cache.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return {"tools": []}
+            tools = value.get("tools") if isinstance(value, dict) else None
+            if not isinstance(tools, list):
+                return {"tools": []}
+            return {"tools": [
+                {key: copy.deepcopy(tool.get(key)) for key in ("name", "inputSchema", "outputSchema")}
+                for tool in tools[:len(SCHEMA_PINS)]
+                if isinstance(tool, dict) and tool.get("name") in SCHEMA_PINS
+                and isinstance(tool.get("inputSchema"), dict) and isinstance(tool.get("outputSchema"), dict)
+            ]}
 
     def complete_robinhood_callback(self, payload: dict) -> dict:
         """Forward a user-pasted callback to the active, state-bound local listener."""
@@ -899,7 +920,7 @@ class SetupManager:
     @staticmethod
     def _runtime_is_failed(runtime: object) -> bool:
         return isinstance(runtime, dict) and str(runtime.get("state", "")).lower() in {
-            "unavailable", "error", "failed", "needs_attention"
+            "unavailable", "error", "failed", "needs_attention", "schema_incompatible"
         }
 
     @staticmethod

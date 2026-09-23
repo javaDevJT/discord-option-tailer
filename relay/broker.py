@@ -576,6 +576,8 @@ class RobinhoodMCP:
         self.session = None
         self.schemas = {}
         self.catalog = {}
+        self._schema_incompatible = False
+        self._schema_incompatible_tools = ()
         self.server = None
         self.callback = None
         self.oauth_state = None
@@ -719,6 +721,37 @@ class RobinhoodMCP:
         self.session = None
         await self.stack.aclose()
 
+    @staticmethod
+    def _schema_digest(tool):
+        schemas = {key: tool.get(key) for key in ("inputSchema", "outputSchema")}
+        return hashlib.sha256(json.dumps(schemas, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _persist_schema_cache(self, tools):
+        temporary = None
+        try:
+            path = Path(self.config.get("token_store", "state/robinhood-oauth.json")).expanduser().with_name("robinhood-schemas.json")
+            schemas = [
+                {key: tool.get(key) for key in ("name", "inputSchema", "outputSchema")}
+                for tool in tools if isinstance(tool, dict) and tool.get("name") in SCHEMA_PINS
+            ]
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump({"observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "tools": schemas}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        except Exception:
+            pass  # Cache failures must not affect broker operations.
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
     async def discover(self):
         if self.session is None:
             raise BrokerError("Open RobinhoodMCP using async with before discovery")
@@ -734,6 +767,15 @@ class RobinhoodMCP:
             seen.add(cursor)
         self.schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
         self.catalog = {tool["name"]: tool for tool in tools}
+        self._persist_schema_cache(tools)
+        incompatible = [
+            name for name, accepted in SCHEMA_PINS.items()
+            if not self.catalog.get(name) or self._schema_digest(self.catalog[name]) not in accepted
+        ]
+        self._schema_incompatible_tools = tuple(incompatible)
+        self._schema_incompatible = bool(self._schema_incompatible_tools)
+        if incompatible:
+            publish_status(self.on_status, "broker", "schema_incompatible", detail="Unaccepted pinned tools: " + ", ".join(incompatible))
         return tools
 
     async def call(self, name, args):
@@ -774,6 +816,9 @@ class RobinhoodMCP:
         if result.isError:
             detail = ("Robinhood rejected the operation because authorization needs attention [auth_required]. Use Robinhood sign-in and verify account access."
                       if state == "auth_required" else "Robinhood reported an operation error [tool_error]. Check the transaction's recorded reason and account permissions before retrying.")
+        if state == "connected" and self._schema_incompatible:
+            state = "schema_incompatible"
+            detail = "Unaccepted pinned tools: " + ", ".join(self._schema_incompatible_tools)
         publish_status(self.on_status, "broker", state, detail=detail)
         return result
 
@@ -831,11 +876,13 @@ def broker_credentials_state(config):
 # Authenticated official schemas observed 2026-09-06; changes require renewed qualification.
 SCHEMA_PINS = {
     "search": {"577c2e161dec698d9efdb2d203a42d99798057035a277cbbb349c26477e7b28e"},
-    # Reviewed 2026-09-09: only guide.description changed in these two outputs.
+    # Reviewed 2026-09-09: guide text only; 2026-09-23: caller permissions and portfolio text.
     "get_accounts": {"3df90562b040c920c73ba68b1685508a9db806266b0e98903bef0b9b04c83042",
-                     "4ae8734970c9dd300d627ea117b185fb5744e1af16970d6f79267e55acf97603"},
+                     "4ae8734970c9dd300d627ea117b185fb5744e1af16970d6f79267e55acf97603",
+                     "6502644731a3f3d9002eae39e3efdad4848ec1d77ed36f275e5c4b88fe5bd0b1"},
     "get_portfolio": {"b1d5f51ec0e84c8a62181dee3daa7a5d2ab93c7ece8d0c8373d482715455a2f5",
-                      "a0b873691e9b5e7f8843f94f02073e56b9958f59b540fd4efac5cc3347af960a"},
+                      "a0b873691e9b5e7f8843f94f02073e56b9958f59b540fd4efac5cc3347af960a",
+                      "2cf447c73a813f2a1119d0a9ffddc9cb98595df62d378842e138dd45b6994ecc"},
     "get_equity_quotes": {"6a64ff3f6ae5e6e3a536177b74e58e65ed538a771ff7c0cd9f23b472707d567f"},
     "get_option_chains": {"661824e1e339fdc16e61a5192a37ebb664de935fc493887f9825e16fbcc119ba"},
     "get_option_instruments": {"e27cf1cb98aeecf5940b23c6ff02dada0f07f5e90866d77e63a843b983f8d503"},
@@ -846,6 +893,22 @@ SCHEMA_PINS = {
     "place_option_order": {"2b6e3ecd2997e8a58d36b5b77c8a4883b551255d05d39511995a4245d7f37cb3"},
     "cancel_option_order": {"b6b90ce0d295d72292c699ee6336a8ac9e0f13ed29e8a91acc46ec788c64d104"},
 }
+
+
+def _caller_option_restriction(account):
+    """Trust callers need their own approval at least equal to the account level."""
+    if "user_option_level" not in account:
+        if account.get("brokerage_account_type") == "trust_revocable":
+            return "caller options approval is missing for trust account"
+        return None
+    levels = {"": 0, "option_level_0": 0, "option_level_2": 2, "option_level_3": 3}
+    caller = account.get("user_option_level")
+    approved = account.get("option_level")
+    if caller not in {"option_level_2", "option_level_3"} or approved not in levels:
+        return "caller options approval is unrecognized or unavailable"
+    if levels[caller] < levels[approved]:
+        return "caller is view-only for options on this account"
+    return None
 
 
 def _instant(value):
@@ -1101,11 +1164,13 @@ class RobinhoodBroker(RobinhoodMCP):
     def _qualified(self, name):
         tool = self.catalog.get(name)
         if not tool or name not in SCHEMA_PINS:
-            raise BrokerError("Required broker tool is missing from the qualified catalog")
-        schemas = {key: tool.get(key) for key in ("inputSchema", "outputSchema")}
-        digest = hashlib.sha256(json.dumps(schemas, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        if digest not in SCHEMA_PINS[name]:
-            raise BrokerError("Robinhood schema changed; qualify the new schema before continuing")
+            error = BrokerError(f"Required broker tool {name} missing from qualified catalog")
+            annotate_failure(error, tool=name, code="schema_incompatible")
+            raise error
+        if self._schema_digest(tool) not in SCHEMA_PINS[name]:
+            error = BrokerError(f"schema changed for {name}; qualify before continuing")
+            annotate_failure(error, tool=name, code="schema_incompatible")
+            raise error
         return tool
 
     async def _data(self, name, args):
@@ -1472,6 +1537,9 @@ class RobinhoodBroker(RobinhoodMCP):
             restrictions.append("account is not active")
         if account.get("option_level") not in {"option_level_2", "option_level_3"}:
             restrictions.append("long options approval is missing")
+        caller_restriction = _caller_option_restriction(account)
+        if caller_restriction:
+            restrictions.append(caller_restriction)
         for position in normalized:
             self._check_quote_age(position["quote_timestamp"])
         result = {"account_id": self.account_number, "equity": str(_decimal(portfolio["total_value"], "total equity")),
@@ -2463,6 +2531,13 @@ class RobinhoodBroker(RobinhoodMCP):
         current = await self.order_status(order_id, broker_order_id=broker_id, expected_order=persisted)
         if current["status"] in {"filled", "canceled", "rejected"}:
             return current
+        accounts = (await self._data("get_accounts", {}))["accounts"] or []
+        matches = [account for account in accounts if account["account_number"] == self.account_number]
+        if len(matches) != 1:
+            raise BrokerError("Bound Robinhood account is missing or ambiguous")
+        restriction = _caller_option_restriction(matches[0])
+        if restriction:
+            raise BrokerError(f"Cancellation blocked: {restriction}")
         acknowledged = await self._data("cancel_option_order", {"account_number": self.account_number, "order_id": broker_id})
         if not isinstance(acknowledged.get("accepted"), bool):
             raise BrokerError("Robinhood cancellation response omitted accepted")

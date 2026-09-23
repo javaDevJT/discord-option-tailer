@@ -25,6 +25,10 @@ The adapter pins the schemas of its qualified broker tools. A changed schema blo
 
 The account and portfolio schemas observed on September 9, 2026 changed only their display guidance about limited-margin features. Both original and reviewed hashes are accepted; input fields, output structure, order schemas and response validation are unchanged. Unreviewed changes still stop the affected operation. The offline regression fixtures contain schema metadata only, without account responses or credentials.
 
+On September 23, 2026, Robinhood added optional caller-specific `user_option_level` and clarified trust-account permissions. The relay accepts that exact account schema and the portfolio schema with revised crypto buying-power guidance. Trust callers must have recognized options approval at least equal to the account level; missing, unknown, or lower caller approval blocks placement and cancellation. Individual and joint accounts without this field retain the existing account-level checks. Cancellation checks these caller rights without depending on a full trading snapshot.
+
+Discovery stores only qualified-tool schema metadata in owner-only `robinhood-schemas.json` beside the OAuth store, so **Setup** can expose it after restart. Unknown schemas produce `schema_incompatible` with the affected tool names, remain visible after successful read calls, and appear in execution diagnostics. Cache write failure does not change broker results. This cache contains no account responses or credentials.
+
 Account equity uses the portfolio total, not only the stock/ETF component. Spendable funds are constrained by reported and unleveraged buying power. Account snapshot age starts at the beginning of its fetch; option quotes use the provider's timestamp. Session gating uses the installed exchange calendar and conservatively stops at 16:00 New York time.
 
 ## Uncertain orders and restart recovery

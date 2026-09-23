@@ -141,14 +141,50 @@ class NativeStopBrokerChecks(unittest.IsolatedAsyncioTestCase):
             [broker_order("partially_filled", "1", "95.00")],
             [broker_order("filled", "2", "190.00")],
         ])
-        broker._data = AsyncMock(return_value={"accepted": True})
+        broker._data = AsyncMock(side_effect=[
+            {"accounts": [{"account_number": "12345", "brokerage_account_type": "individual"}]},
+            {"accepted": True},
+        ])
 
         result = await broker.cancel_order("client-stop", broker_order_id=BROKER_ID, expected_order=expected)
 
         self.assertEqual(result["status"], "filled")
         self.assertEqual(result["filled_quantity"], 2)
-        broker._data.assert_awaited_once_with("cancel_option_order", {"account_number": "12345", "order_id": BROKER_ID})
+        broker._data.assert_any_await("cancel_option_order", {"account_number": "12345", "order_id": BROKER_ID})
+        self.assertEqual(broker._data.await_count, 2)
         self.assertEqual(broker._pages.await_count, 2)
+
+    async def test_cancellation_checks_caller_rights_without_full_snapshot(self):
+        for caller, blocked in [(None, True), ("unknown", True), ("option_level_2", True), ("option_level_3", False)]:
+            with self.subTest(caller=caller):
+                broker = self.make_broker()
+                account = {"account_number": "12345", "brokerage_account_type": "trust_revocable",
+                           "option_level": "option_level_3", "state": "restricted"}
+                if caller is not None:
+                    account["user_option_level"] = caller
+                broker.order_status = AsyncMock(side_effect=[{"status": "submitted"}, {"status": "canceled"}])
+                broker.snapshot = AsyncMock(side_effect=AssertionError("Cancellation must not use full snapshot"))
+                broker._data = AsyncMock(side_effect=[{"accounts": [account]}, {"accepted": True}])
+                if blocked:
+                    with self.assertRaisesRegex(BrokerError, "Cancellation blocked"):
+                        await broker.cancel_order("client-stop", broker_order_id=BROKER_ID)
+                    broker._data.assert_awaited_once_with("get_accounts", {})
+                else:
+                    self.assertEqual((await broker.cancel_order("client-stop", broker_order_id=BROKER_ID))["status"], "canceled")
+                    broker._data.assert_any_await("cancel_option_order", {"account_number": "12345", "order_id": BROKER_ID})
+                broker.snapshot.assert_not_awaited()
+
+        for accounts in ([], [{"account_number": "other"}], [{"account_number": "12345"}] * 2):
+            broker = self.make_broker()
+            broker.order_status = AsyncMock(return_value={"status": "submitted"})
+            broker._data = AsyncMock(return_value={"accounts": accounts})
+            with self.assertRaisesRegex(BrokerError, "missing or ambiguous"):
+                await broker.cancel_order("client-stop", broker_order_id=BROKER_ID)
+            broker._data.assert_awaited_once_with("get_accounts", {})
+        broker.order_status = AsyncMock(return_value={"status": "filled"})
+        broker._data.reset_mock()
+        self.assertEqual((await broker.cancel_order("client-stop", broker_order_id=BROKER_ID))["status"], "filled")
+        broker._data.assert_not_awaited()
 
     async def test_order_status_restart_checks_contract_and_stop_price(self):
         broker = self.make_broker()

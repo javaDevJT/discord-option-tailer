@@ -22,6 +22,42 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SetupManagerTests(unittest.TestCase):
+    def test_schema_incompatibility_overrides_saved_credential_readiness(self):
+        self.config["robinhood"]["account_number"] = "12345678"
+        self.path.write_text(json.dumps(self.config))
+        runtime = self.base / "state/runtime-status.json"
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text(json.dumps({"broker": {
+            "state": "schema_incompatible",
+            "detail": "Robinhood schema incompatible: get_accounts; update the reviewed adapter.",
+        }}))
+        with patch.object(self.manager, "_token_store_ready", return_value=True):
+            status = self.manager.status()["robinhood"]
+            self.assertEqual(status["state"], "failed")
+            self.assertIn("get_accounts", status["detail"])
+            self.assertTrue(status["token_present"])
+            runtime.write_text(json.dumps({"broker": {"state": "connected"}}))
+            self.assertEqual(self.manager.status()["robinhood"]["state"], "connected")
+
+    def test_robinhood_schema_metadata_survives_restart_without_credential_fields(self):
+        schema = {"name": "get_accounts", "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"}}
+        cache = self.base / "state/robinhood-schemas.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"tokens": "private-token", "tools": [
+            schema | {"access_token": "private-token"},
+            {"name": "unrelated", "inputSchema": {}, "outputSchema": {}},
+        ]}))
+        self.manager.close()
+        self.manager = SetupManager(self.path)
+        self.assertEqual(self.manager.robinhood_schemas(), {"tools": [schema]})
+        cache.write_text("invalid")
+        self.assertEqual(self.manager.robinhood_schemas(), {"tools": []})
+        cache.unlink()
+        target = cache.with_name("robinhood-oauth.json")
+        target.write_text(json.dumps({"tools": [schema]}))
+        cache.symlink_to(target)
+        self.assertEqual(self.manager.robinhood_schemas(), {"tools": []})
+
     def test_runtime_reauth_overrides_saved_credential_presence(self):
         self.config["robinhood"]["account_number"] = "12345678"
         self.path.write_text(json.dumps(self.config))

@@ -37,14 +37,14 @@ _FAILURE_EXCEPTIONS = frozenset(
     "McpError", "ValidationError", "SchemaError", "SSLError", "gaierror",
 })
 _FAILURE_CODES = frozenset({
-    "internal_error", "broker_error", "dns_failed", "tls_failed", "timeout",
+    "internal_error", "broker_error", "schema_incompatible", "dns_failed", "tls_failed", "timeout",
     "browser_profile_busy", "runtime_missing", "local_permission", "network_unavailable",
 })
 
 
 def annotate_failure(error, **fields):
     """Keep provenance on the exception, not shared concurrent task state."""
-    allowed = {"stage": _FAILURE_STAGES, "broker_operation": _BROKER_OPERATIONS, "tool": _FAILURE_TOOLS}
+    allowed = {"stage": _FAILURE_STAGES, "broker_operation": _BROKER_OPERATIONS, "tool": _FAILURE_TOOLS, "code": _FAILURE_CODES}
     try:
         details = dict(getattr(error, "_relay_failure", {}))
         for key, value in fields.items():
@@ -115,8 +115,9 @@ def execution_failure(error, *, stage="execution"):
                 path = Path(frame.f_code.co_filename)
                 if path.parent.resolve() == Path(__file__).parent.resolve():
                     frames.append(f"relay/{path.name}:{line}:{frame.f_code.co_name}")
-            items.append(project_execution_diagnostic(dict(getattr(current, "_relay_failure", {})) | {
-                "exception": name, "code": code, "frames": frames[-8:],
+            attached = project_execution_diagnostic(getattr(current, "_relay_failure", {}))
+            items.append(project_execution_diagnostic(attached | {
+                "exception": name, "code": attached.get("code", code), "frames": frames[-8:],
             }))
             if isinstance(current, BaseExceptionGroup):
                 pending.extend(current.exceptions[:4])

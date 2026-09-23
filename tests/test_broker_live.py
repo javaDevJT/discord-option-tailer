@@ -83,6 +83,34 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(name)
         self.broker._data = AsyncMock(side_effect=data)
 
+    async def test_caller_options_permissions_gate_placement(self):
+        cases = [
+            ("individual", "option_level_2", None, False),
+            ("joint", "option_level_3", None, False),
+            ("trust_revocable", "option_level_2", None, True),
+            ("trust_revocable", "option_level_3", "option_level_2", True),
+            ("trust_revocable", "option_level_2", "unknown", True),
+            ("trust_revocable", "option_level_2", "option_level_0", True),
+            ("trust_revocable", "option_level_2", "option_level_2", False),
+            ("trust_revocable", "option_level_3", "option_level_3", False),
+            ("trust_revocable", "option_level_2", "option_level_3", False),
+            ("individual", "option_level_2", "unknown", True),
+            ("individual", "option_level_0", None, True),
+        ]
+        for ownership, approved, caller, blocked in cases:
+            with self.subTest(ownership=ownership, approved=approved, caller=caller):
+                self.setUp()
+                self.account.update(brokerage_account_type=ownership, option_level=approved)
+                if caller is not None:
+                    self.account["user_option_level"] = caller
+                self.assertEqual(bool((await self.broker.snapshot())["restrictions"]), blocked)
+                if blocked:
+                    with self.assertRaisesRegex(BrokerPreflightHold, "Account restrictions"):
+                        await self.broker.submit(self.order)
+                    self.assertFalse(any(name == "place_option_order" for name, _ in self.calls))
+                else:
+                    self.assertEqual((await self.broker.submit(self.order))["status"], "filled")
+
     async def test_actual_total_value_cash_cap_and_exact_quote(self):
         snapshot = await self.broker.snapshot()
         self.assertEqual(snapshot["equity"], "1000")
