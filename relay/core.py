@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from .broker import BrokerPreflightHold
 from .interpreter import InterpretationError, safe_interpretation_reason
+from .status import annotate_failure, execution_failure, failure_stage
 
 UTC = timezone.utc
 EASTERN = ZoneInfo("America/New_York")
@@ -899,7 +900,8 @@ class Engine:
                 return self.store.record(message, "error", safe_interpretation_reason(
                     InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False),
                 ), {"evaluation_timing": timing})
-            return self.store.record(message, "error", "internal execution failure; no retry submitted", decision)
+            detail = self.diagnose_failure(decision, exc)
+            return self.store.record(message, "error", f"Execution failed; {detail}; no retry submitted", decision)
         finally:
             if prepared_snapshot is not None:
                 if not prepared_snapshot.done():
@@ -913,9 +915,17 @@ class Engine:
         started = time.monotonic()
         try:
             return await operation
+        except Exception as error:
+            annotate_failure(error, stage=stage.removesuffix("_seconds"))
+            raise
         finally:
             timing = decision.setdefault("evaluation_timing", {})
             timing[stage] = round(timing.get(stage, 0) + time.monotonic() - started, 6)
+
+    def diagnose_failure(self, decision, error, *, stage="execution"):
+        detail, diagnostic = execution_failure(error, stage=stage)
+        decision["execution_diagnostic"] = diagnostic
+        return detail
 
     async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         if decision["action"] == "UPDATE_STOP":
@@ -946,7 +956,8 @@ class Engine:
             self.fresh(origin, self.clock())
         else:
             recovery_guard()
-        order = await self.plan(message, decision, recovery_guard=recovery_guard, expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+        with failure_stage("planning"):
+            order = await self.plan(message, decision, recovery_guard=recovery_guard, expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
         if decision["action"] in {"REDUCE", "CLOSE"} and self.mode != "shadow":
             await self.stops.before_exit(message, decision)
             if message.get("_evaluation_claim") is not None:
@@ -957,7 +968,8 @@ class Engine:
         if self.mode == "shadow":
             return self.store.record(message, "shadow_order", reason("account-sized proposal; no order submitted"),
                                      decision | {"order_proposal": order})
-        self.store.reserve(message, decision, order, self.clock())
+        with failure_stage("order_reservation"):
+            self.store.reserve(message, decision, order, self.clock())
         if message.get("_evaluation_claim") is not None:
             # The reservation is our own serialized mutation, not competing inventory.
             message["_evaluation_claim"]["position_generation"] = self.store.position_generation(message["source_group"])
@@ -979,7 +991,8 @@ class Engine:
             # This is the observed response time, not an exchange fill timestamp.
             decision["evaluation_timing"]["broker_result_at"] = datetime.now(UTC).isoformat()
             decision["evaluation_timing"]["broker_result_status"] = result["status"]
-            self.store.apply_result(order["client_order_id"], result)
+            with failure_stage("result_recording"):
+                self.store.apply_result(order["client_order_id"], result)
         except BrokerPreflightHold as exc:
             self.store.reject_before_submission(order["client_order_id"])
             evaluation = decision.get("entry_evaluation")
@@ -987,9 +1000,10 @@ class Engine:
             if evaluation and not entry_chase_within_cap(evaluation):
                 detail = "no order submitted: current ask or rounded limit exceeds permitted chase during broker review"
             return self.store.record(message, "held", reason(detail), decision | {"order_proposal": order})
-        except Exception:
+        except Exception as exc:
             self.store.mark_unknown(order["client_order_id"])
-            return self.store.record(message, "unknown", "submission or fill result is uncertain; all new orders are blocked pending reconciliation", decision)
+            detail = self.diagnose_failure(decision, exc, stage="submission")
+            return self.store.record(message, "unknown", f"Submission or fill result uncertain; {detail}; all new orders blocked pending reconciliation", decision)
         state = "paper_order" if self.mode == "paper" else "broker_order"
         label = "simulated order: " if self.mode == "paper" else "broker order: "
         protection = None

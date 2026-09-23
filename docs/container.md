@@ -196,6 +196,16 @@ docker compose start
 
 Pausing and stopping are safe operational controls for new work. Preserve the Docker volume when restarting or moving the service; it contains the browser profile, Codex subscription state, Robinhood OAuth state, configuration, and mode-specific ledgers.
 
+### Execution failure diagnostics
+
+Unexpected execution failures retain an `execution_diagnostic` on the message decision, visible in the dashboard's message details and emitted to the worker log. The event reason includes the failing stage, exception class, safe error code, broker operation/tool when known, and last internal source location. The structured field adds up to eight internal frames and three causes.
+
+For example, `stage=quote; exception=BrokerError; code=broker_error; tool=get_option_quotes` identifies a quote failure before submission. A `submission` or `result_recording` failure can leave an uncertain order: reconciliation still blocks new orders until its outcome is known. Diagnostics never retry or replay a trade. Expiry protection, missed-signal recovery, and native stop failures also report safe stage details; stop details are retained in their reason.
+
+When reporting a failure, include the message ID, event reason, decision JSON, and deployed revision. Timing alone does not prove an operation succeeded: durations are recorded even when it raises. Historical generic failures cannot recover exception details that were never saved.
+
+Diagnostics exclude exception messages, provider responses, credentials, absolute paths, source text, and local variables. Only bounded, allowlisted metadata and internal `relay/file.py:line:function` locations are exposed.
+
 ### Entry price diagnostics
 
 Entry diagnostics show the evaluated ask, cited alert premium, signed percentage deviation, configured chase cap, and rounded order limit. Chase uses `(price / alert premium - 1) × 100`: at a 15% setting, a $1.00 alert permits up to $1.15, including the boundary. Both the ask and the limit after tick rounding must fit the cap, and the check runs again on the final broker-review quote. Exits are not subject to entry chase limits.

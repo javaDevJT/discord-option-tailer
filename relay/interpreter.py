@@ -706,7 +706,7 @@ def _decision_for_recovery(decision):
     if not isinstance(decision, dict):
         return decision
     normalized = {key: value for key, value in decision.items()
-                  if key not in {"evaluation_timing", "entry_evaluation", "exit_evaluation"}}
+                  if key not in {"evaluation_timing", "entry_evaluation", "exit_evaluation", "execution_diagnostic"}}
     # Decisions persisted before profit_only was added remain recoverable.  Keep
     # all other keys so validate_decision still rejects arbitrary extra fields.
     normalized.setdefault("profit_only", False)

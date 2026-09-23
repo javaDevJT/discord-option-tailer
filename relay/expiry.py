@@ -131,9 +131,10 @@ class ExpiryExits:
                 if "underlying_price" in facts:
                     detail += f"; underlying ${facts['underlying_price']}; strike ${position['contract']['strike']}; close {facts['close_at']}"
                 results.append(self.store.record(message, "held", detail, decision))
-            except Exception:
+            except Exception as exc:
                 decision["expiry_exit"]["status"] = "unavailable"
-                results.append(self.store.record(message, "error", "Expiry protection could not verify broker quotes or account state; check provider diagnostics", decision))
+                detail = engine.diagnose_failure(decision, exc, stage="expiry")
+                results.append(self.store.record(message, "error", f"Expiry protection could not verify broker quotes or account state; {detail}", decision))
         return results
 
     async def run(self, emit):

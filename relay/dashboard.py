@@ -13,6 +13,7 @@ import sqlite3
 import threading
 import tempfile
 from .account import AUTH_ERROR, CACHE_KEY, REFRESH_ERROR, REFRESH_SECONDS
+from .status import project_execution_diagnostic
 from .images import collect_images, download_images, ImageTransportError, MAX_IMAGES
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
@@ -40,6 +41,7 @@ DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
     "evaluation_timing", "profit_only", "exit_evaluation", "stop_evaluation", "order_reconciliation",
+    "execution_diagnostic",
 )
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
@@ -472,6 +474,8 @@ def _project_decision(value):
             result[key] = _project_recovery(current)
         elif key == "entry_evaluation":
             result[key] = _project_entry_evaluation(current)
+        elif key == "execution_diagnostic":
+            result[key] = project_execution_diagnostic(current)
         elif key == "evaluation_timing":
             result[key] = _project_evaluation_timing(current)
         elif key == "stop_evaluation":

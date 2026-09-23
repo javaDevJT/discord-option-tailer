@@ -1,8 +1,137 @@
 """Connection telemetry must not change provider results or order outcomes."""
+import builtins
 import json
 import logging
 import re
+import traceback
+from contextlib import contextmanager
 from pathlib import Path
+
+
+_FAILURE_STAGES = frozenset({
+    "execution", "planning", "snapshot", "quote", "contract_resolution",
+    "source_verification", "order_reservation", "submission", "result_recording",
+    "recovery", "expiry", "stop", "stop_submission", "reconciliation",
+})
+_BROKER_OPERATIONS = frozenset({
+    "snapshot", "quote", "nearest_expiry", "prepare_contract", "prepare_entry",
+    "submit", "order_status", "cancel_order", "underlying_quote", "account_overview",
+})
+_FAILURE_TOOLS = frozenset({
+    "search",
+    "get_accounts", "get_portfolio", "get_option_chains", "get_option_instruments",
+    "get_option_quotes", "get_option_positions", "get_option_orders", "get_equity_quotes",
+    "get_realized_pnl", "get_pnl_trade_history", "review_option_order", "place_option_order",
+    "cancel_option_order",
+})
+_FAILURE_EXCEPTIONS = frozenset(
+    name for name, value in vars(builtins).items()
+    if isinstance(value, type) and issubclass(value, BaseException)
+) | frozenset({
+    "BrokerError", "BrokerPreflightHold", "InterpretationError", "Hold", "RetryHold",
+    "SourceContextChanged", "ImageTransportError", "JEVError", "InvalidOperation",
+    "OperationalError", "IntegrityError", "DatabaseError", "InterfaceError",
+    "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    "ConnectError", "ReadError", "WriteError", "HTTPStatusError", "HTTPError", "URLError",
+    "RemoteProtocolError", "LocalProtocolError", "ProtocolError", "TransportError",
+    "McpError", "ValidationError", "SchemaError", "SSLError", "gaierror",
+})
+_FAILURE_CODES = frozenset({
+    "internal_error", "broker_error", "dns_failed", "tls_failed", "timeout",
+    "browser_profile_busy", "runtime_missing", "local_permission", "network_unavailable",
+})
+
+
+def annotate_failure(error, **fields):
+    """Keep provenance on the exception, not shared concurrent task state."""
+    allowed = {"stage": _FAILURE_STAGES, "broker_operation": _BROKER_OPERATIONS, "tool": _FAILURE_TOOLS}
+    try:
+        details = dict(getattr(error, "_relay_failure", {}))
+        for key, value in fields.items():
+            if key in allowed and isinstance(value, str) and value in allowed[key]:
+                details.setdefault(key, value)
+        error._relay_failure = details
+    except Exception:
+        pass  # Diagnostics must never replace the original failure.
+
+
+@contextmanager
+def failure_stage(stage):
+    try:
+        yield
+    except Exception as error:
+        annotate_failure(error, stage=stage)
+        raise
+
+
+def project_execution_diagnostic(value):
+    """Project bounded metadata only; never accept exception text or provider bodies."""
+    def project(item):
+        if not isinstance(item, dict):
+            return {}
+        result = {}
+        for key, choices in (("stage", _FAILURE_STAGES), ("broker_operation", _BROKER_OPERATIONS), ("tool", _FAILURE_TOOLS)):
+            if isinstance(item.get(key), str) and item[key] in choices:
+                result[key] = item[key]
+        if isinstance(item.get("exception"), str):
+            result["exception"] = item["exception"] if item["exception"] in _FAILURE_EXCEPTIONS else "Exception"
+        code = item.get("code")
+        if isinstance(code, str) and (code in _FAILURE_CODES or re.fullmatch(r"http_[45][0-9]{2}", code)):
+            result["code"] = code
+        frames = item.get("frames", [])
+        if isinstance(frames, list):
+            result["frames"] = [frame for frame in frames[:8] if isinstance(frame, str) and re.fullmatch(
+                r"relay/[a-z_]+\.py:[1-9][0-9]{0,5}:[A-Za-z_][A-Za-z0-9_]{0,79}", frame
+            )]
+        return result
+    result = project(value)
+    if isinstance(value, dict) and isinstance(value.get("causes"), list):
+        result["causes"] = [project(item) for item in value["causes"][:3] if isinstance(item, dict)]
+    return result
+
+
+def execution_failure(error, *, stage="execution"):
+    """Return and log safe diagnostics without messages, source text, locals, or paths."""
+    annotate_failure(error, stage=stage)
+    pending, seen, items = [error], set(), []
+    try:
+        while pending and len(items) < 4:
+            current = pending.pop(0)
+            if not isinstance(current, BaseException) or id(current) in seen:
+                continue
+            seen.add(id(current))
+            kind = type(current)
+            trusted = kind.__module__.split(".")[0] in {
+                "builtins", "relay", "sqlite3", "decimal", "json", "asyncio", "httpx",
+                "httpcore", "anyio", "mcp", "jsonschema", "urllib", "ssl", "socket",
+            }
+            name = kind.__name__ if trusted else "Exception"
+            detail = failure_detail(current, provider="Robinhood", phase="operation")
+            code = re.search(r"\[([a-z0-9_]+)\]", detail).group(1)
+            if code == "operation_failed":
+                code = "broker_error" if name in {"BrokerError", "BrokerPreflightHold"} else "internal_error"
+            frames = []
+            for frame, line in traceback.walk_tb(current.__traceback__):
+                path = Path(frame.f_code.co_filename)
+                if path.parent.resolve() == Path(__file__).parent.resolve():
+                    frames.append(f"relay/{path.name}:{line}:{frame.f_code.co_name}")
+            items.append(project_execution_diagnostic(dict(getattr(current, "_relay_failure", {})) | {
+                "exception": name, "code": code, "frames": frames[-8:],
+            }))
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions[:4])
+            pending.extend(item for item in (current.__cause__, current.__context__) if isinstance(item, BaseException))
+        diagnostic = items[0] | ({"causes": items[1:]} if len(items) > 1 else {})
+    except Exception:
+        diagnostic = {"stage": stage if stage in _FAILURE_STAGES else "execution", "exception": "Exception", "code": "internal_error", "frames": []}
+    parts = [f"{key}={diagnostic[key]}" for key in ("stage", "exception", "code", "broker_operation", "tool") if key in diagnostic]
+    if diagnostic.get("frames"):
+        parts.append("at=" + diagnostic["frames"][-1])
+    try:
+        logging.getLogger(__name__).error("Execution diagnostic %s", json.dumps(diagnostic, sort_keys=True))
+    except Exception:
+        pass
+    return "; ".join(parts), diagnostic
 
 
 PROVIDER_COMPONENTS = frozenset({"discord", "codex", "broker", "jev"})

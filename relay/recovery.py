@@ -9,7 +9,7 @@ from decimal import ROUND_CEILING
 from pathlib import Path
 
 from .core import EASTERN, Hold, RetryHold, canonical_contract, contract_key, channel_allows_author, entry_size, instant, money, entry_chase_evaluation, entry_chase_reason, entry_chase_within_cap
-from .interpreter import safe_interpretation_reason
+from .interpreter import InterpretationError, safe_interpretation_reason
 
 
 class SourceContextChanged(Hold):
@@ -472,7 +472,13 @@ class RecoveryEvaluator:
                     decision = {"evaluation_timing": timing}
                 else:
                     decision = decision | {"recovery": {"evaluation_timing": timing}}
-            return self.store.record(message, "recovery_error", safe_interpretation_reason(exc), decision)
+            if isinstance(exc, InterpretationError):
+                reason = safe_interpretation_reason(exc)
+            else:
+                if decision is None:
+                    decision = {}
+                reason = "Recovery failed; " + engine.diagnose_failure(decision, exc, stage="recovery")
+            return self.store.record(message, "recovery_error", reason, decision)
 
     async def consume(self, fresh_queue, emit):
         while True:

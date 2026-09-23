@@ -8,6 +8,7 @@ from decimal import ROUND_CEILING
 from pathlib import Path
 
 from .broker import BrokerPreflightHold
+from .status import execution_failure, failure_stage
 from .core import EASTERN, Hold, RetryHold, TERMINAL, canonical_contract, contract_key, money
 
 
@@ -153,7 +154,11 @@ class StopLoss:
             return await self._arm(row, source_guard=source_guard)
         except Exception as exc:
             # Provider response bodies and credentials never enter events or webhooks.
-            reason = str(exc) if isinstance(exc, Hold) else "Native stop operation failed; inspect broker connection and reconcile orders"
+            if isinstance(exc, Hold):
+                reason = str(exc)
+            else:
+                detail, _ = execution_failure(exc, stage="stop")
+                reason = f"Native stop operation failed; {detail}; reconcile orders"
             return self.state(row, "pending" if isinstance(exc, RetryHold) else "blocked", reason)
 
     async def _arm(self, row, *, source_guard=None):
@@ -254,7 +259,8 @@ class StopLoss:
 
         try:
             result = await engine.broker.submit(order, **({"before_submit": before_submit} if engine.mode == "live" else {}))
-            store.apply_result(order["client_order_id"], result)
+            with failure_stage("result_recording"):
+                store.apply_result(order["client_order_id"], result)
         except BrokerPreflightHold as exc:
             store.reject_before_submission(order["client_order_id"])
             if source_failed:
@@ -262,7 +268,8 @@ class StopLoss:
             raise RetryHold("Native stop held before submission; no stop installed") from exc
         except Exception as exc:
             store.mark_unknown(order["client_order_id"])
-            raise Hold("Native stop submission is uncertain; reconcile before submitting another order") from exc
+            detail, _ = execution_failure(exc, stage="stop_submission")
+            raise Hold(f"Native stop submission uncertain; {detail}; reconcile before submitting another order") from exc
         if result["status"] == "filled":
             return self.state(row, "complete", f"Stop level ${price} already reached; remaining contracts sold", order["client_order_id"])
         if result["status"] in {"open", "partially_filled"} and order["order_type"] == "stop_market":

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 import webbrowser
 import uuid
 
-from .status import failure_detail, publish_status
+from .status import annotate_failure, failure_detail, publish_status
 
 
 ROBINHOOD_ENDPOINT = "https://agent.robinhood.com/mcp/trading"
@@ -64,8 +64,10 @@ def _scope_operation(method):
     async def wrapped(self, *args, **kwargs):
         try:
             return await method(self, *args, **kwargs)
-        except BaseException:
+        except BaseException as error:
             self._invalidate_execution_scope()
+            if isinstance(error, Exception):
+                annotate_failure(error, broker_operation=method.__name__)
             raise
 
     return wrapped
@@ -747,16 +749,21 @@ class RobinhoodMCP:
         try:
             jsonschema.validate(args, self.schemas[name])
         except (jsonschema.ValidationError, jsonschema.SchemaError):
-            raise BrokerError("Arguments do not satisfy the authenticated tool schema") from None
+            error = BrokerError("Arguments do not satisfy the authenticated tool schema")
+            annotate_failure(error, tool=name)
+            raise error from None
         result = await self._call_tool(name, args)
         if result.isError:
-            raise BrokerError("Robinhood returned a tool error; no result has been accepted")
+            error = BrokerError("Robinhood returned a tool error; no result has been accepted")
+            annotate_failure(error, tool=name)
+            raise error
         return result.model_dump(mode="json", exclude_none=True)
 
     async def _call_tool(self, name, args):
         try:
             result = await self.session.call_tool(name, arguments=args)
         except Exception as exc:
+            annotate_failure(exc, tool=name)
             self._connection_failed(exc)
             raise
         if result.isError:
