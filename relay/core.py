@@ -365,8 +365,12 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?)", (
                 message["id"], message["channel_id"], message["source_group"], message["timestamp"],
                 message["revision"], json.dumps({k: v for k, v in message.items() if k not in {"_received_monotonic", "_evaluation_claim", "_execution_started"}})))
-            self.db.execute("INSERT OR IGNORE INTO events(message_id,revision,state,reason,created_at) VALUES (?,?,?,?,?)", (
+            event = self.db.execute("INSERT OR IGNORE INTO events(message_id,revision,state,reason,created_at) VALUES (?,?,?,?,?)", (
                 message["id"], message["revision"], "observed", "awaiting interpretation", datetime.now(UTC).isoformat()))
+        # History can restore an older revision. Refresh current source state,
+        # but never re-evaluate or overwrite that revision's recorded outcome.
+        if not event.rowcount:
+            return "same"
         return "edit" if old else "new"
 
 

@@ -170,6 +170,34 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.interpreter.calls, [])
         self.assertEqual(self.broker.submissions, [])
 
+    async def test_restart_baseline_preserves_evaluated_revision_without_replay(self):
+        message = self.message() | {"source_group": self.config["channels"][0]["source_group"]}
+        self.store.observe(message)
+        self.store.record(message, "held", "the original action message was revised",
+                          self.interpreter.decision.copy())
+        original = dict(self.store.db.execute(
+            "SELECT * FROM events WHERE message_id=? AND revision=?",
+            (message["id"], message["revision"])).fetchone())
+        edited = message | {"revision": "synthetic-edit",
+                            "edited_timestamp": NOW.isoformat()}
+        self.assertEqual((await self.engine.handle(edited))["state"], "context")
+        self.store.close()
+        self.store = Store(self.config["database"])
+        self.engine = Engine(self.config, self.store, self.interpreter, self.broker, lambda: self.now)
+        baseline = message | {"ingestion": "baseline"}
+        generation = self.store.source_generation(message["source_group"])
+        self.assertEqual((await self.engine.handle(baseline))["state"], "duplicate")
+        self.assertEqual(self.store.source_generation(message["source_group"]), generation + 1)
+        self.assertEqual(self.store.db.execute(
+            "SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()[0], message["revision"])
+        restored = dict(self.store.db.execute(
+            "SELECT * FROM events WHERE message_id=? AND revision=?",
+            (message["id"], message["revision"])).fetchone())
+        self.assertEqual(restored, original)
+        self.assertEqual((await self.engine.handle(message))["state"], "duplicate")
+        self.assertEqual(self.interpreter.calls, [])
+        self.assertEqual(self.broker.submissions, [])
+
     async def test_context_reasons_identify_the_actual_gate(self):
         cases = [
             (self.message() | {"ingestion": "baseline"}, "signals", "history baseline"),
