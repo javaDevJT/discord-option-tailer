@@ -35,15 +35,49 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(BrokerError, "schema changed"):
                 self.broker._qualified(name)
 
-    def test_september_23_schemas_accept_only_exact_reviewed_versions(self):
-        fixtures = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
-        for name, tool in fixtures.items():
-            with self.subTest(tool=name):
-                self.broker.catalog[name] = copy.deepcopy(tool)
-                self.assertIs(self.broker._qualified(name), self.broker.catalog[name])
-                self.broker.catalog[name]["outputSchema"]["properties"]["guide"]["description"] += " Unreviewed."
-                with self.assertRaisesRegex(BrokerError, "schema changed"):
-                    self.broker._qualified(name)
+    def test_reviewed_schemas_accept_only_exact_versions(self):
+        account = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+        options = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())
+        for fixtures in (account, options["legacy"], options["current"]):
+            for name, tool in fixtures.items():
+                with self.subTest(tool=name):
+                    self.broker.catalog[name] = copy.deepcopy(tool)
+                    self.assertIs(self.broker._qualified(name), self.broker.catalog[name])
+                    self.broker.catalog[name]["outputSchema"]["properties"]["guide"]["description"] += " Unreviewed."
+                    with self.assertRaisesRegex(BrokerError, "schema changed"):
+                        self.broker._qualified(name)
+
+    async def test_option_pagination_preserves_opaque_cursors_and_legacy_urls(self):
+        arguments = {"account_number": "TEST0001", "nonzero": True}
+        options = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())
+        for version, next_value, expected in (
+            ("current", "cursor+/=%2Bopaque", "cursor+/=%2Bopaque"),
+            ("current", "https://opaque.example/token", "https://opaque.example/token"),
+            ("current", "https://opaque.example/?cursor=a%2Bb", "https://opaque.example/?cursor=a%2Bb"),
+            ("legacy", "https://api.robinhood.com/options/positions/?cursor=a%2Bb%2F%3D", "a+b/="),
+        ):
+            with self.subTest(version=version, next_value=next_value):
+                self.broker.catalog = options[version]
+                self.broker._data = AsyncMock(side_effect=[
+                    {"results": [1], "next": next_value}, {"results": [2], "next": ""},
+                ])
+                self.assertEqual(await self.broker._pages("get_option_positions", arguments, "results"), [1, 2])
+                self.assertEqual(self.broker._data.call_args_list[1].args[1], arguments | {"cursor": expected})
+                self.assertNotIn("cursor", arguments)
+                self.broker._data = AsyncMock(return_value={"results": [], "next": next_value})
+                with self.assertRaisesRegex(BrokerError, "pagination"):
+                    await self.broker._pages("get_option_positions", arguments, "results")
+                self.assertEqual(self.broker._data.await_count, 2)
+        for version, malformed in (
+            ("current", 12), ("legacy", 12),
+            ("legacy", "https://api.robinhood.com/options/positions/"),
+            ("legacy", "https://api.robinhood.com/options/positions/?cursor=a&cursor=b"),
+        ):
+            with self.subTest(version=version, malformed=malformed):
+                self.broker.catalog = options[version]
+                self.broker._data = AsyncMock(return_value={"results": [], "next": malformed})
+                with self.assertRaisesRegex(BrokerError, "pagination"):
+                    await self.broker._pages("get_option_positions", arguments, "results")
 
     async def test_reviewed_schema_still_validates_requests_and_responses(self):
         latest = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())

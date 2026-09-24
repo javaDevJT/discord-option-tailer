@@ -873,6 +873,12 @@ def broker_credentials_state(config):
     return "configured" if isinstance(access_token, str) and bool(access_token.strip()) else "auth_required"
 
 
+OPTION_OPAQUE_CURSOR_SCHEMAS = {
+    "get_option_instruments": "74ac033a0f387f1974c946796ff7ab451906c87b7db9b9b4aa9cb857c95a1eee",
+    "get_option_orders": "646acf3c2f551e6366ca43d1636d6a90c1fdae1ea1fca3dcc6a4da93c352cfb5",
+    "get_option_positions": "b1bda4a09b2269883ed89f7f679491c3ae6a226bfdf3137670cd9d1155fe684b",
+}
+
 # Authenticated official schemas observed 2026-09-06; changes require renewed qualification.
 SCHEMA_PINS = {
     "search": {"577c2e161dec698d9efdb2d203a42d99798057035a277cbbb349c26477e7b28e"},
@@ -884,11 +890,11 @@ SCHEMA_PINS = {
                       "a0b873691e9b5e7f8843f94f02073e56b9958f59b540fd4efac5cc3347af960a",
                       "2cf447c73a813f2a1119d0a9ffddc9cb98595df62d378842e138dd45b6994ecc"},
     "get_equity_quotes": {"6a64ff3f6ae5e6e3a536177b74e58e65ed538a771ff7c0cd9f23b472707d567f"},
-    "get_option_chains": {"661824e1e339fdc16e61a5192a37ebb664de935fc493887f9825e16fbcc119ba"},
-    "get_option_instruments": {"e27cf1cb98aeecf5940b23c6ff02dada0f07f5e90866d77e63a843b983f8d503"},
+    "get_option_chains": {"661824e1e339fdc16e61a5192a37ebb664de935fc493887f9825e16fbcc119ba", "df9363f6018ff922b653e694af7a40c614f24a80ca05112345dce037ce83b503"},
+    "get_option_instruments": {"e27cf1cb98aeecf5940b23c6ff02dada0f07f5e90866d77e63a843b983f8d503", OPTION_OPAQUE_CURSOR_SCHEMAS["get_option_instruments"]},
     "get_option_quotes": {"ac069476d02f1b401fc9f2f1a65d402a5d7cb352df2f4b06cff87307fb846508"},
-    "get_option_positions": {"f9ee54d7cee627f491189d66330d1662954d6ef7b9ae889e90a27e8dea11cabd"},
-    "get_option_orders": {"3d1a33c36ac93d9e3dd202f10b7597bf74fb91d491aa00c0b41ed460d7d51277"},
+    "get_option_positions": {"f9ee54d7cee627f491189d66330d1662954d6ef7b9ae889e90a27e8dea11cabd", OPTION_OPAQUE_CURSOR_SCHEMAS["get_option_positions"]},
+    "get_option_orders": {"3d1a33c36ac93d9e3dd202f10b7597bf74fb91d491aa00c0b41ed460d7d51277", OPTION_OPAQUE_CURSOR_SCHEMAS["get_option_orders"]},
     "review_option_order": {"a3e359eb4e73e46d77f8fc9a3ab90ba4d88f0d36b96d58225fe8fbdde69b4dc0"},
     "place_option_order": {"2b6e3ecd2997e8a58d36b5b77c8a4883b551255d05d39511995a4245d7f37cb3"},
     "cancel_option_order": {"b6b90ce0d295d72292c699ee6336a8ac9e0f13ed29e8a91acc46ec788c64d104"},
@@ -1199,14 +1205,21 @@ class RobinhoodBroker(RobinhoodMCP):
             if page is not None and not isinstance(page, list):
                 raise BrokerError("Unexpected broker result page")
             rows.extend(page or [])
-            next_url = data.get("next")
-            if not next_url:
+            cursor = data.get("next")
+            if not cursor:
                 return rows
-            cursors = parse_qs(urlsplit(next_url).query).get("cursor", [])
-            if len(cursors) != 1 or cursors[0] in seen:
+            if not isinstance(cursor, str):
+                raise BrokerError("Unexpected broker pagination cursor")
+            # The qualified schema defines cursor semantics, even for URL-shaped tokens.
+            if self._schema_digest(self.catalog.get(name, {})) != OPTION_OPAQUE_CURSOR_SCHEMAS.get(name):
+                cursors = parse_qs(urlsplit(cursor).query).get("cursor", [])
+                if len(cursors) != 1:
+                    raise BrokerError("Broker pagination is incomplete or cyclic")
+                cursor = cursors[0]
+            if cursor in seen:
                 raise BrokerError("Broker pagination is incomplete or cyclic")
-            seen.add(cursors[0])
-            args = dict(args, cursor=cursors[0])
+            seen.add(cursor)
+            args = dict(args, cursor=cursor)
 
     def _market_open(self):
         now = self.clock().astimezone(timezone.utc)

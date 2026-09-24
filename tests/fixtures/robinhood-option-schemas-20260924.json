@@ -1,0 +1,1704 @@
+{
+  "legacy": {
+    "get_option_chains": {
+      "name": "get_option_chains",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "type": "string",
+            "description": "Comma-separated chain UUIDs."
+          },
+          "underlying_symbol": {
+            "type": "string",
+            "description": "Ticker filter; covers equity and index underlyings (e.g. 'AAPL', 'SPX')."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "chains": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Chain UUID; pass to get_option_instruments as chain_id."
+                    },
+                    "symbol": {
+                      "type": "string",
+                      "description": "Chain ticker (may differ from underlying — e.g. 'SPX' for an index chain)."
+                    },
+                    "can_open_position": {
+                      "type": "boolean",
+                      "description": "Whether new positions can be opened on this chain."
+                    },
+                    "cash_component": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Cash component for adjusted chains; null when none."
+                    },
+                    "expiration_dates": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "All available expirations (YYYY-MM-DD)."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Contract multiplier; typically '100'."
+                    },
+                    "underlying_instruments": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "instrument": {
+                            "type": "string",
+                            "description": "Underlying equity instrument URL."
+                          },
+                          "symbol": {
+                            "type": "string",
+                            "description": "Underlying equity ticker."
+                          }
+                        },
+                        "required": [
+                          "instrument",
+                          "symbol"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "description": "Underlying equity instruments. Empty for index chains."
+                    },
+                    "min_ticks": {
+                      "type": "object",
+                      "properties": {
+                        "above_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment above cutoff_price."
+                        },
+                        "below_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment below cutoff_price."
+                        },
+                        "cutoff_price": {
+                          "type": "string",
+                          "description": "Price boundary between the below/above tick regimes."
+                        }
+                      },
+                      "description": "Tick-size rules.",
+                      "required": [
+                        "above_tick",
+                        "below_tick",
+                        "cutoff_price"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "late_close_state": {
+                      "type": "string",
+                      "description": "Late-close state; 'enabled' adds 15 minutes of trading after the regular close."
+                    },
+                    "extended_hours_state": {
+                      "type": "string",
+                      "description": "'enabled' or 'disabled'. CURB market_hours values require 'enabled' AND an index chain."
+                    },
+                    "settle_on_open": {
+                      "type": "boolean",
+                      "description": "True for AM-settled expirations, false for PM. When an underlying has multiple chains, they may not split cleanly by AM/PM — check per chain."
+                    },
+                    "sellout_time_to_expiration": {
+                      "type": "integer",
+                      "description": "Seconds before expiration when Robinhood begins force-closing positions on this chain. Always 0 for index options — sellout does not apply to index chains."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "symbol",
+                    "can_open_position",
+                    "cash_component",
+                    "expiration_dates",
+                    "trade_value_multiplier",
+                    "underlying_instruments",
+                    "min_ticks",
+                    "late_close_state",
+                    "extended_hours_state",
+                    "settle_on_open",
+                    "sellout_time_to_expiration"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option chains matching the filter. Empty when nothing resolves."
+              },
+              "next": {
+                "type": "string",
+                "description": "Next-page URL. Empty when there are no more pages."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "chains"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Pass id to get_option_instruments as chain_id to list contracts. CURB market_hours on place_option_order require extended_hours_state='enabled' AND an index chain (underlying_instruments empty). When the user mentions AM/PM/morning/evening expiration, check settle_on_open per chain — same underlying can have multiple chains, so do not assume they split cleanly by settlement. Present id, symbol, expiration_dates (annotate AM when settle_on_open is true), and trade_value_multiplier."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_option_instruments": {
+      "name": "get_option_instruments",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "chain_id": {
+            "type": "string",
+            "description": "Chain UUID."
+          },
+          "chain_symbol": {
+            "type": "string",
+            "description": "Underlying ticker (e.g. 'AAPL')."
+          },
+          "expiration_dates": {
+            "type": "string",
+            "description": "Comma-separated YYYY-MM-DD expirations."
+          },
+          "strike_price": {
+            "type": "string",
+            "description": "Exact strike (e.g. '150.0000')."
+          },
+          "type": {
+            "type": "string",
+            "description": "'call' or 'put'."
+          },
+          "state": {
+            "type": "string",
+            "description": "'active' (default), 'expired', or 'inactive'. Use 'expired' to find option contracts whose expiration date has passed; 'inactive' is for delisted/withdrawn contracts that never expired."
+          },
+          "tradability": {
+            "type": "string",
+            "description": "'tradable' or 'untradable' (untradable is rejected at the tool layer)."
+          },
+          "ids": {
+            "type": "string",
+            "description": "Comma-separated instrument UUIDs."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor. Omit for the first page; for the next page, pass the cursor query param from the prior response's next URL."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "instruments": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Option instrument UUID; reference this in an order's legs."
+                    },
+                    "chain_id": {
+                      "type": "string",
+                      "description": "Owning option chain UUID."
+                    },
+                    "chain_symbol": {
+                      "type": "string",
+                      "description": "Underlying ticker (e.g. 'AAPL')."
+                    },
+                    "underlying_type": {
+                      "type": "string",
+                      "description": "'equity' or 'index'. Matches the underlying_type filter on get_option_orders / get_option_positions."
+                    },
+                    "expiration_date": {
+                      "type": "string",
+                      "description": "YYYY-MM-DD contract expiration."
+                    },
+                    "sellout_datetime": {
+                      "type": "string",
+                      "description": "ISO 8601 timestamp at which Robinhood may force-close a position in this contract. Authoritative answer — handles index/equity, AM/PM settle, late-close, and T-1 logic per contract."
+                    },
+                    "strike_price": {
+                      "type": "string",
+                      "description": "Contract strike."
+                    },
+                    "type": {
+                      "type": "string",
+                      "description": "'call' or 'put'."
+                    },
+                    "state": {
+                      "type": "string",
+                      "description": "'active' (tradable), 'expired' (past expiration date), or 'inactive' (delisted/withdrawn before expiration)."
+                    },
+                    "tradability": {
+                      "type": "string",
+                      "description": "'tradable' or 'untradable'; active contracts may still be untradable near expiration or during halts."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Multiplier converting a per-contract price to a total dollar amount: price × quantity × this. '100' for standard contracts; a corporate action can change it. Not a share count."
+                    },
+                    "min_ticks": {
+                      "type": "object",
+                      "properties": {
+                        "above_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment above cutoff_price."
+                        },
+                        "below_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment below cutoff_price."
+                        },
+                        "cutoff_price": {
+                          "type": "string",
+                          "description": "Price boundary between the below/above tick regimes."
+                        }
+                      },
+                      "description": "Tick-size rules.",
+                      "required": [
+                        "above_tick",
+                        "below_tick",
+                        "cutoff_price"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "chain_id",
+                    "chain_symbol",
+                    "underlying_type",
+                    "expiration_date",
+                    "sellout_datetime",
+                    "strike_price",
+                    "type",
+                    "state",
+                    "tradability",
+                    "trade_value_multiplier",
+                    "min_ticks"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option contracts matching the filter. Empty when none match."
+              },
+              "next": {
+                "type": "string",
+                "description": "Next-page URL. Empty when there are no more pages."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "instruments"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Present chain_symbol, expiration_date, type, strike_price; flag state when not 'active' or tradability when not 'tradable'. Pass id to an order's leg.option_id. Quote sellout_datetime when the user asks \"when will Robinhood force-close this position?\" — it is the authoritative per-contract timestamp covering equity/index, AM/PM settle, and T-1 logic. underlying_type ('equity' or 'index') is informational; mention only when it affects strategy. When next is non-null, extract the cursor query param and call this tool again."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_option_orders": {
+      "name": "get_option_orders",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_number": {
+            "type": "string",
+            "description": "Brokerage account number. Must come from the user or be clearly implied — never default from get_accounts."
+          },
+          "order_id": {
+            "type": "string",
+            "description": "Filter to a single order by UUID. The response shape is unchanged (orders[] with at most one entry); empty when the order does not belong to account_number."
+          },
+          "state": {
+            "type": "string",
+            "description": "Filter by single state: queued, confirmed, partially_filled, filled, rejected, cancelled, failed, voided, pending_cancelled."
+          },
+          "created_at_gte": {
+            "type": "string",
+            "description": "Lower bound (inclusive). ISO 8601 UTC or YYYY-MM-DD; naive values are interpreted as UTC."
+          },
+          "chain_ids": {
+            "type": "string",
+            "description": "Comma-separated chain UUIDs (from get_option_chains) to filter by underlying."
+          },
+          "underlying_type": {
+            "type": "string",
+            "description": "'equity' or 'index'."
+          },
+          "placed_agent": {
+            "type": "string",
+            "description": "Filter to one source: 'user', 'agentic' (MCP), 'recurring', 'drip', etc."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor. Omit for the first page; for the next page, pass the cursor query param from the prior response's next URL."
+          }
+        },
+        "required": [
+          "account_number"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "orders": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Order UUID; needed by cancel_option_order."
+                    },
+                    "chain_id": {
+                      "type": "string",
+                      "description": "Option chain UUID."
+                    },
+                    "chain_symbol": {
+                      "type": "string",
+                      "description": "Underlying ticker (e.g. 'AAPL', 'SPX')."
+                    },
+                    "state": {
+                      "type": "string",
+                      "description": "Lifecycle state: queued, confirmed, partially_filled, filled, rejected, cancelled, failed, voided, pending_cancelled."
+                    },
+                    "type": {
+                      "type": "string",
+                      "description": "Order type: 'limit' or 'market'. Combine with trigger to recover user-facing type: limit+immediate=limit, market+immediate=market, limit+stop=stop_limit, market+stop=stop_market."
+                    },
+                    "trigger": {
+                      "type": "string",
+                      "description": "'immediate' or 'stop'."
+                    },
+                    "direction": {
+                      "type": "string",
+                      "description": "'debit' (you pay) or 'credit' (you receive) on the overall order."
+                    },
+                    "quantity": {
+                      "type": "string",
+                      "description": "Contracts originally requested."
+                    },
+                    "processed_quantity": {
+                      "type": "string",
+                      "description": "Contracts filled so far."
+                    },
+                    "pending_quantity": {
+                      "type": "string",
+                      "description": "Contracts still working."
+                    },
+                    "canceled_quantity": {
+                      "type": "string",
+                      "description": "Contracts cancelled."
+                    },
+                    "price": {
+                      "type": "string",
+                      "description": "Limit price per contract."
+                    },
+                    "stop_price": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Stop trigger; null for non-stop orders."
+                    },
+                    "premium": {
+                      "type": "string",
+                      "description": "Total order premium (price × quantity × multiplier)."
+                    },
+                    "processed_premium": {
+                      "type": "string",
+                      "description": "Premium realized on fills so far."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Contract multiplier; typically '100'."
+                    },
+                    "time_in_force": {
+                      "type": "string",
+                      "description": "'gfd' or 'gtc'."
+                    },
+                    "market_hours": {
+                      "type": "string",
+                      "description": "'regular_hours', 'regular_curb_hours', or 'regular_curb_overnight_hours'."
+                    },
+                    "opening_strategy": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Recognized opening strategy (e.g. 'long_call', 'iron_condor'); null when not derivable."
+                    },
+                    "closing_strategy": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Recognized closing strategy; null when not derivable."
+                    },
+                    "placed_agent": {
+                      "type": "string",
+                      "description": "Source that placed the order: 'user' (app), 'agentic' (MCP), 'recurring', 'drip', etc."
+                    },
+                    "created_at": {
+                      "type": "string",
+                      "description": "ISO 8601 creation time."
+                    },
+                    "updated_at": {
+                      "type": "string",
+                      "description": "ISO 8601 last update time."
+                    },
+                    "last_transaction_at": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "ISO 8601 time of the most recent fill/cancel/reject; null on a brand-new unfilled order."
+                    },
+                    "reject_reason": {
+                      "type": "string",
+                      "description": "Free-text reason when state is 'rejected'."
+                    },
+                    "is_replaceable": {
+                      "type": "boolean",
+                      "description": "True when this order is eligible for replace_option_order — cancelable, not already pending-cancel, and not in an in-flight replacement chain."
+                    },
+                    "legs": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "description": "Leg UUID."
+                          },
+                          "option_id": {
+                            "type": "string",
+                            "description": "Option instrument UUID. May be omitted on legacy orders that only carry the option URL."
+                          },
+                          "side": {
+                            "type": "string",
+                            "description": "'buy' or 'sell' for this leg."
+                          },
+                          "position_effect": {
+                            "type": "string",
+                            "description": "'open' or 'close'."
+                          },
+                          "ratio_quantity": {
+                            "type": "integer",
+                            "description": "Contracts for this leg per unit of the order's quantity."
+                          },
+                          "expiration_date": {
+                            "type": "string",
+                            "description": "YYYY-MM-DD contract expiration."
+                          },
+                          "strike_price": {
+                            "type": "string",
+                            "description": "Contract strike."
+                          },
+                          "option_type": {
+                            "type": "string",
+                            "description": "'call' or 'put'."
+                          },
+                          "executions": {
+                            "type": [
+                              "null",
+                              "array"
+                            ],
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string",
+                                  "description": "Execution UUID."
+                                },
+                                "price": {
+                                  "type": "string",
+                                  "description": "Fill price per contract."
+                                },
+                                "quantity": {
+                                  "type": "string",
+                                  "description": "Contracts filled in this execution."
+                                },
+                                "settlement_date": {
+                                  "type": "string",
+                                  "description": "YYYY-MM-DD settlement date."
+                                },
+                                "trade_date": {
+                                  "type": "string",
+                                  "description": "YYYY-MM-DD trade date."
+                                },
+                                "timestamp": {
+                                  "type": "string",
+                                  "description": "ISO 8601 fill time."
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "price",
+                                "quantity",
+                                "settlement_date",
+                                "trade_date",
+                                "timestamp"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "description": "Per-fill detail for this leg."
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "side",
+                          "position_effect",
+                          "ratio_quantity",
+                          "expiration_date",
+                          "strike_price",
+                          "option_type"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "description": "Per-leg detail; single-leg orders are standard."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "chain_id",
+                    "chain_symbol",
+                    "state",
+                    "type",
+                    "trigger",
+                    "direction",
+                    "quantity",
+                    "processed_quantity",
+                    "pending_quantity",
+                    "canceled_quantity",
+                    "price",
+                    "stop_price",
+                    "premium",
+                    "processed_premium",
+                    "trade_value_multiplier",
+                    "time_in_force",
+                    "market_hours",
+                    "opening_strategy",
+                    "closing_strategy",
+                    "placed_agent",
+                    "created_at",
+                    "last_transaction_at",
+                    "is_replaceable",
+                    "legs"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option orders on this page, newest first. Empty when the cursor has no rows."
+              },
+              "next": {
+                "type": "string",
+                "description": "Next-page URL. Empty when there are no more pages."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "orders"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Describe orders by chain_symbol, opening_strategy or closing_strategy, state, quantity (with processed_quantity when partially filled), and premium; show id when cancellation may follow. Source chain_symbol from the response directly — never infer. Mention placed_agent when not 'user'. Recover the user-facing order type from type+trigger (limit+immediate=limit, market+immediate=market, limit+stop=stop_limit, market+stop=stop_market) and surface price for limit/stop_limit, stop_price for stop_limit/stop_market. is_replaceable=true marks orders eligible for replace_option_order (cancel-and-replace on the same contract). When next is non-null, extract the cursor query param and call this tool again."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_option_positions": {
+      "name": "get_option_positions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_number": {
+            "type": "string",
+            "description": "Brokerage account number. Must come from the user or be clearly implied — never default from get_accounts."
+          },
+          "nonzero": {
+            "type": "boolean",
+            "description": "True to return only currently-open positions; omit/false to include closed ones."
+          },
+          "chain_ids": {
+            "type": "string",
+            "description": "Comma-separated chain UUIDs (from get_option_chains)."
+          },
+          "option_ids": {
+            "type": "string",
+            "description": "Comma-separated instrument UUIDs."
+          },
+          "type": {
+            "type": "string",
+            "description": "'long' or 'short'."
+          },
+          "option_type": {
+            "type": "string",
+            "description": "'call' or 'put'."
+          },
+          "expiration_date": {
+            "type": "string",
+            "description": "Exact expiration (YYYY-MM-DD)."
+          },
+          "expiration_date_lte": {
+            "type": "string",
+            "description": "Upper bound on expiration (YYYY-MM-DD)."
+          },
+          "expiration_date_gte": {
+            "type": "string",
+            "description": "Lower bound on expiration (YYYY-MM-DD)."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor. Omit for the first page; for the next page, pass the cursor query param from the prior response's next URL."
+          }
+        },
+        "required": [
+          "account_number"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "positions": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "option_id": {
+                      "type": "string",
+                      "description": "Option instrument UUID. Pass to get_option_instruments to look up strike/expiration/type."
+                    },
+                    "chain_id": {
+                      "type": "string",
+                      "description": "Option chain UUID."
+                    },
+                    "chain_symbol": {
+                      "type": "string",
+                      "description": "Underlying ticker (e.g. 'AAPL', 'SPX')."
+                    },
+                    "type": {
+                      "type": "string",
+                      "description": "'long' (bought) or 'short' (sold/written)."
+                    },
+                    "quantity": {
+                      "type": "string",
+                      "description": "Net contracts held; zero means closed."
+                    },
+                    "average_price": {
+                      "type": "string",
+                      "description": "Signed cost basis per contract; negative on credit-received short positions."
+                    },
+                    "expiration_date": {
+                      "type": "string",
+                      "description": "YYYY-MM-DD contract expiration."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Contract multiplier; typically '100'."
+                    },
+                    "intraday_average_open_price": {
+                      "type": "string",
+                      "description": "Average open price across today's fills."
+                    },
+                    "intraday_quantity": {
+                      "type": "string",
+                      "description": "Contracts opened in the current session; resets daily."
+                    },
+                    "pending_buy_quantity": {
+                      "type": "string",
+                      "description": "Contracts pending open buy orders."
+                    },
+                    "pending_sell_quantity": {
+                      "type": "string",
+                      "description": "Contracts pending open sell orders."
+                    },
+                    "pending_exercise_quantity": {
+                      "type": "string",
+                      "description": "Contracts awaiting exercise."
+                    },
+                    "pending_assignment_quantity": {
+                      "type": "string",
+                      "description": "Contracts awaiting assignment."
+                    },
+                    "pending_expiration_quantity": {
+                      "type": "string",
+                      "description": "Contracts awaiting expiration processing."
+                    },
+                    "opened_at": {
+                      "type": "string",
+                      "description": "ISO 8601 timestamp the current open of this position began (resets on close+reopen). Prefer this over the underlying record's created_at when telling the user when they opened the position."
+                    }
+                  },
+                  "required": [
+                    "option_id",
+                    "chain_id",
+                    "chain_symbol",
+                    "type",
+                    "quantity",
+                    "average_price",
+                    "expiration_date",
+                    "trade_value_multiplier",
+                    "intraday_average_open_price",
+                    "intraday_quantity",
+                    "pending_buy_quantity",
+                    "pending_sell_quantity",
+                    "pending_exercise_quantity",
+                    "pending_assignment_quantity",
+                    "pending_expiration_quantity"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option positions on this page. Empty when the cursor has no rows."
+              },
+              "next": {
+                "type": "string",
+                "description": "Next-page URL. Empty when there are no more pages."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "positions"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Surface chain_symbol, type, quantity, average_price, and expiration_date. Look up strike/option_type (call/put) via get_option_instruments with option_id when needed. Warn the user about any non-zero pending_* quantities. When next is non-null, extract the cursor query param and call this tool again."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "current": {
+    "get_option_chains": {
+      "name": "get_option_chains",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "type": "string",
+            "description": "Comma-separated chain UUIDs."
+          },
+          "underlying_symbol": {
+            "type": "string",
+            "description": "Ticker filter; covers equity and index underlyings (e.g. 'AAPL', 'SPX')."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "chains": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Chain UUID; pass to get_option_instruments as chain_id."
+                    },
+                    "symbol": {
+                      "type": "string",
+                      "description": "Chain ticker (may differ from underlying — e.g. 'SPX' for an index chain)."
+                    },
+                    "can_open_position": {
+                      "type": "boolean",
+                      "description": "Whether new positions can be opened on this chain."
+                    },
+                    "cash_component": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Cash component for adjusted chains; null when none."
+                    },
+                    "expiration_dates": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "All available expirations (YYYY-MM-DD)."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Contract multiplier; typically '100'."
+                    },
+                    "underlying_instruments": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "instrument": {
+                            "type": "string",
+                            "description": "Underlying equity instrument URL."
+                          },
+                          "symbol": {
+                            "type": "string",
+                            "description": "Underlying equity ticker."
+                          }
+                        },
+                        "required": [
+                          "instrument",
+                          "symbol"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "description": "Underlying equity instruments. Empty for index chains."
+                    },
+                    "min_ticks": {
+                      "type": "object",
+                      "properties": {
+                        "above_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment above cutoff_price."
+                        },
+                        "below_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment below cutoff_price."
+                        },
+                        "cutoff_price": {
+                          "type": "string",
+                          "description": "Price boundary between the below/above tick regimes."
+                        }
+                      },
+                      "description": "Tick-size rules.",
+                      "required": [
+                        "above_tick",
+                        "below_tick",
+                        "cutoff_price"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "late_close_state": {
+                      "type": "string",
+                      "description": "Late-close state; 'enabled' adds 15 minutes of trading after the regular close."
+                    },
+                    "extended_hours_state": {
+                      "type": "string",
+                      "description": "'enabled' or 'disabled'. CURB market_hours values require 'enabled' AND an index chain."
+                    },
+                    "settle_on_open": {
+                      "type": "boolean",
+                      "description": "True for AM-settled expirations, false for PM. When an underlying has multiple chains, they may not split cleanly by AM/PM — check per chain."
+                    },
+                    "sellout_time_to_expiration": {
+                      "type": "integer",
+                      "description": "Seconds before expiration when Robinhood begins force-closing positions on this chain. Always 0 for index options — sellout does not apply to index chains."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "symbol",
+                    "can_open_position",
+                    "cash_component",
+                    "expiration_dates",
+                    "trade_value_multiplier",
+                    "underlying_instruments",
+                    "min_ticks",
+                    "late_close_state",
+                    "extended_hours_state",
+                    "settle_on_open",
+                    "sellout_time_to_expiration"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option chains matching the filter. Empty when nothing resolves."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "chains"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Pass id to get_option_instruments as chain_id to list contracts. CURB market_hours on place_option_order require extended_hours_state='enabled' AND an index chain (underlying_instruments empty). When the user mentions AM/PM/morning/evening expiration, check settle_on_open per chain — same underlying can have multiple chains, so do not assume they split cleanly by settlement. Present id, symbol, expiration_dates (annotate AM when settle_on_open is true), and trade_value_multiplier."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_option_instruments": {
+      "name": "get_option_instruments",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "chain_id": {
+            "type": "string",
+            "description": "Chain UUID."
+          },
+          "chain_symbol": {
+            "type": "string",
+            "description": "Underlying ticker (e.g. 'AAPL')."
+          },
+          "expiration_dates": {
+            "type": "string",
+            "description": "Comma-separated YYYY-MM-DD expirations."
+          },
+          "strike_price": {
+            "type": "string",
+            "description": "Exact strike (e.g. '150.0000')."
+          },
+          "type": {
+            "type": "string",
+            "description": "'call' or 'put'."
+          },
+          "state": {
+            "type": "string",
+            "description": "'active' (default), 'expired', or 'inactive'. Use 'expired' to find option contracts whose expiration date has passed; 'inactive' is for delisted/withdrawn contracts that never expired."
+          },
+          "tradability": {
+            "type": "string",
+            "description": "'tradable' or 'untradable' (untradable is rejected at the tool layer)."
+          },
+          "ids": {
+            "type": "string",
+            "description": "Comma-separated instrument UUIDs."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor. Omit for the first page; for the next page, pass the prior response's next value back verbatim."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "instruments": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Option instrument UUID; reference this in an order's legs."
+                    },
+                    "chain_id": {
+                      "type": "string",
+                      "description": "Owning option chain UUID."
+                    },
+                    "chain_symbol": {
+                      "type": "string",
+                      "description": "Underlying ticker (e.g. 'AAPL')."
+                    },
+                    "underlying_type": {
+                      "type": "string",
+                      "description": "'equity' or 'index'. Matches the underlying_type filter on get_option_orders / get_option_positions."
+                    },
+                    "expiration_date": {
+                      "type": "string",
+                      "description": "YYYY-MM-DD contract expiration."
+                    },
+                    "sellout_datetime": {
+                      "type": "string",
+                      "description": "ISO 8601 timestamp at which Robinhood may force-close a position in this contract. Authoritative answer — handles index/equity, AM/PM settle, late-close, and T-1 logic per contract."
+                    },
+                    "strike_price": {
+                      "type": "string",
+                      "description": "Contract strike."
+                    },
+                    "type": {
+                      "type": "string",
+                      "description": "'call' or 'put'."
+                    },
+                    "state": {
+                      "type": "string",
+                      "description": "'active' (tradable), 'expired' (past expiration date), or 'inactive' (delisted/withdrawn before expiration)."
+                    },
+                    "tradability": {
+                      "type": "string",
+                      "description": "'tradable' or 'untradable'; active contracts may still be untradable near expiration or during halts."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Multiplier converting a per-contract price to a total dollar amount: price × quantity × this. '100' for standard contracts; a corporate action can change it. Not a share count."
+                    },
+                    "min_ticks": {
+                      "type": "object",
+                      "properties": {
+                        "above_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment above cutoff_price."
+                        },
+                        "below_tick": {
+                          "type": "string",
+                          "description": "Minimum price increment below cutoff_price."
+                        },
+                        "cutoff_price": {
+                          "type": "string",
+                          "description": "Price boundary between the below/above tick regimes."
+                        }
+                      },
+                      "description": "Tick-size rules.",
+                      "required": [
+                        "above_tick",
+                        "below_tick",
+                        "cutoff_price"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "chain_id",
+                    "chain_symbol",
+                    "underlying_type",
+                    "expiration_date",
+                    "sellout_datetime",
+                    "strike_price",
+                    "type",
+                    "state",
+                    "tradability",
+                    "trade_value_multiplier",
+                    "min_ticks"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option contracts matching the filter. Empty when none match."
+              },
+              "next": {
+                "type": "string",
+                "description": "Opaque cursor for the next page — NOT a URL. When non-empty more pages exist: call this tool again with cursor set to this value verbatim, leaving the other arguments unchanged. Empty on the last page."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "instruments"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Present chain_symbol, expiration_date, type, strike_price; flag state when not 'active' or tradability when not 'tradable'. Pass id to an order's leg.option_id. Quote sellout_datetime when the user asks \"when will Robinhood force-close this position?\" — it is the authoritative per-contract timestamp covering equity/index, AM/PM settle, and T-1 logic. underlying_type ('equity' or 'index') is informational; mention only when it affects strategy. When next is non-empty more pages exist — call this tool again with cursor set to that value verbatim."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_option_orders": {
+      "name": "get_option_orders",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_number": {
+            "type": "string",
+            "description": "Brokerage account number. Must come from the user or be clearly implied — never default from get_accounts."
+          },
+          "order_id": {
+            "type": "string",
+            "description": "Filter to a single order by UUID. The response shape is unchanged (orders[] with at most one entry); empty when the order does not belong to account_number."
+          },
+          "state": {
+            "type": "string",
+            "description": "Filter by single state: queued, confirmed, partially_filled, filled, rejected, cancelled, failed, voided, pending_cancelled."
+          },
+          "created_at_gte": {
+            "type": "string",
+            "description": "Lower bound (inclusive). ISO 8601 UTC or YYYY-MM-DD; naive values are interpreted as UTC."
+          },
+          "chain_ids": {
+            "type": "string",
+            "description": "Comma-separated chain UUIDs (from get_option_chains) to filter by underlying."
+          },
+          "underlying_type": {
+            "type": "string",
+            "description": "'equity' or 'index'."
+          },
+          "placed_agent": {
+            "type": "string",
+            "description": "Filter to one source: 'user', 'agentic' (MCP), 'recurring', 'drip', etc."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor. Omit for the first page; for the next page, pass the prior response's next value back verbatim."
+          }
+        },
+        "required": [
+          "account_number"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "orders": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Order UUID; needed by cancel_option_order."
+                    },
+                    "chain_id": {
+                      "type": "string",
+                      "description": "Option chain UUID."
+                    },
+                    "chain_symbol": {
+                      "type": "string",
+                      "description": "Underlying ticker (e.g. 'AAPL', 'SPX')."
+                    },
+                    "state": {
+                      "type": "string",
+                      "description": "Lifecycle state: queued, confirmed, partially_filled, filled, rejected, cancelled, failed, voided, pending_cancelled."
+                    },
+                    "type": {
+                      "type": "string",
+                      "description": "Order type: 'limit' or 'market'. Combine with trigger to recover user-facing type: limit+immediate=limit, market+immediate=market, limit+stop=stop_limit, market+stop=stop_market."
+                    },
+                    "trigger": {
+                      "type": "string",
+                      "description": "'immediate' or 'stop'."
+                    },
+                    "direction": {
+                      "type": "string",
+                      "description": "'debit' (you pay) or 'credit' (you receive) on the overall order."
+                    },
+                    "quantity": {
+                      "type": "string",
+                      "description": "Contracts originally requested."
+                    },
+                    "processed_quantity": {
+                      "type": "string",
+                      "description": "Contracts filled so far."
+                    },
+                    "pending_quantity": {
+                      "type": "string",
+                      "description": "Contracts still working."
+                    },
+                    "canceled_quantity": {
+                      "type": "string",
+                      "description": "Contracts cancelled."
+                    },
+                    "price": {
+                      "type": "string",
+                      "description": "Limit price per contract."
+                    },
+                    "stop_price": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Stop trigger; null for non-stop orders."
+                    },
+                    "premium": {
+                      "type": "string",
+                      "description": "Total order premium (price × quantity × multiplier)."
+                    },
+                    "processed_premium": {
+                      "type": "string",
+                      "description": "Premium realized on fills so far."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Contract multiplier; typically '100'."
+                    },
+                    "time_in_force": {
+                      "type": "string",
+                      "description": "'gfd' or 'gtc'."
+                    },
+                    "market_hours": {
+                      "type": "string",
+                      "description": "'regular_hours', 'regular_curb_hours', or 'regular_curb_overnight_hours'."
+                    },
+                    "opening_strategy": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Recognized opening strategy (e.g. 'long_call', 'iron_condor'); null when not derivable."
+                    },
+                    "closing_strategy": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Recognized closing strategy; null when not derivable."
+                    },
+                    "placed_agent": {
+                      "type": "string",
+                      "description": "Source that placed the order: 'user' (app), 'agentic' (MCP), 'recurring', 'drip', etc."
+                    },
+                    "created_at": {
+                      "type": "string",
+                      "description": "ISO 8601 creation time."
+                    },
+                    "updated_at": {
+                      "type": "string",
+                      "description": "ISO 8601 last update time."
+                    },
+                    "last_transaction_at": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "ISO 8601 time of the most recent fill/cancel/reject; null on a brand-new unfilled order."
+                    },
+                    "reject_reason": {
+                      "type": "string",
+                      "description": "Free-text reason when state is 'rejected'."
+                    },
+                    "is_replaceable": {
+                      "type": "boolean",
+                      "description": "True when this order is eligible for replace_option_order — cancelable, not already pending-cancel, and not in an in-flight replacement chain."
+                    },
+                    "legs": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "description": "Leg UUID."
+                          },
+                          "option_id": {
+                            "type": "string",
+                            "description": "Option instrument UUID. May be omitted on legacy orders that only carry the option URL."
+                          },
+                          "side": {
+                            "type": "string",
+                            "description": "'buy' or 'sell' for this leg."
+                          },
+                          "position_effect": {
+                            "type": "string",
+                            "description": "'open' or 'close'."
+                          },
+                          "ratio_quantity": {
+                            "type": "integer",
+                            "description": "Contracts for this leg per unit of the order's quantity."
+                          },
+                          "expiration_date": {
+                            "type": "string",
+                            "description": "YYYY-MM-DD contract expiration."
+                          },
+                          "strike_price": {
+                            "type": "string",
+                            "description": "Contract strike."
+                          },
+                          "option_type": {
+                            "type": "string",
+                            "description": "'call' or 'put'."
+                          },
+                          "executions": {
+                            "type": [
+                              "null",
+                              "array"
+                            ],
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string",
+                                  "description": "Execution UUID."
+                                },
+                                "price": {
+                                  "type": "string",
+                                  "description": "Fill price per contract."
+                                },
+                                "quantity": {
+                                  "type": "string",
+                                  "description": "Contracts filled in this execution."
+                                },
+                                "settlement_date": {
+                                  "type": "string",
+                                  "description": "YYYY-MM-DD settlement date."
+                                },
+                                "trade_date": {
+                                  "type": "string",
+                                  "description": "YYYY-MM-DD trade date."
+                                },
+                                "timestamp": {
+                                  "type": "string",
+                                  "description": "ISO 8601 fill time."
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "price",
+                                "quantity",
+                                "settlement_date",
+                                "trade_date",
+                                "timestamp"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "description": "Per-fill detail for this leg."
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "side",
+                          "position_effect",
+                          "ratio_quantity",
+                          "expiration_date",
+                          "strike_price",
+                          "option_type"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "description": "Per-leg detail; single-leg orders are standard."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "chain_id",
+                    "chain_symbol",
+                    "state",
+                    "type",
+                    "trigger",
+                    "direction",
+                    "quantity",
+                    "processed_quantity",
+                    "pending_quantity",
+                    "canceled_quantity",
+                    "price",
+                    "stop_price",
+                    "premium",
+                    "processed_premium",
+                    "trade_value_multiplier",
+                    "time_in_force",
+                    "market_hours",
+                    "opening_strategy",
+                    "closing_strategy",
+                    "placed_agent",
+                    "created_at",
+                    "last_transaction_at",
+                    "is_replaceable",
+                    "legs"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option orders on this page, newest first. Empty when the cursor has no rows."
+              },
+              "next": {
+                "type": "string",
+                "description": "Opaque cursor for the next page — NOT a URL. When non-empty more pages exist: call this tool again with cursor set to this value verbatim, leaving the other arguments unchanged. Empty on the last page."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "orders"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Describe orders by chain_symbol, opening_strategy or closing_strategy, state, quantity (with processed_quantity when partially filled), and premium; show id when cancellation may follow. Source chain_symbol from the response directly — never infer. Mention placed_agent when not 'user'. Recover the user-facing order type from type+trigger (limit+immediate=limit, market+immediate=market, limit+stop=stop_limit, market+stop=stop_market) and surface price for limit/stop_limit, stop_price for stop_limit/stop_market. is_replaceable=true marks orders eligible for replace_option_order (cancel-and-replace on the same contract). When next is non-empty more pages exist — call this tool again with cursor set to that value verbatim."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_option_positions": {
+      "name": "get_option_positions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_number": {
+            "type": "string",
+            "description": "Brokerage account number. Must come from the user or be clearly implied — never default from get_accounts."
+          },
+          "nonzero": {
+            "type": "boolean",
+            "description": "True to return only currently-open positions; omit/false to include closed ones."
+          },
+          "chain_ids": {
+            "type": "string",
+            "description": "Comma-separated chain UUIDs (from get_option_chains)."
+          },
+          "option_ids": {
+            "type": "string",
+            "description": "Comma-separated instrument UUIDs."
+          },
+          "type": {
+            "type": "string",
+            "description": "'long' or 'short'."
+          },
+          "option_type": {
+            "type": "string",
+            "description": "'call' or 'put'."
+          },
+          "expiration_date": {
+            "type": "string",
+            "description": "Exact expiration (YYYY-MM-DD)."
+          },
+          "expiration_date_lte": {
+            "type": "string",
+            "description": "Upper bound on expiration (YYYY-MM-DD)."
+          },
+          "expiration_date_gte": {
+            "type": "string",
+            "description": "Lower bound on expiration (YYYY-MM-DD)."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor. Omit for the first page; for the next page, pass the prior response's next value back verbatim."
+          }
+        },
+        "required": [
+          "account_number"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "positions": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "option_id": {
+                      "type": "string",
+                      "description": "Option instrument UUID. Pass to get_option_instruments to look up strike/expiration/type."
+                    },
+                    "chain_id": {
+                      "type": "string",
+                      "description": "Option chain UUID."
+                    },
+                    "chain_symbol": {
+                      "type": "string",
+                      "description": "Underlying ticker (e.g. 'AAPL', 'SPX')."
+                    },
+                    "type": {
+                      "type": "string",
+                      "description": "'long' (bought) or 'short' (sold/written)."
+                    },
+                    "quantity": {
+                      "type": "string",
+                      "description": "Net contracts held; zero means closed."
+                    },
+                    "average_price": {
+                      "type": "string",
+                      "description": "Signed cost basis per contract; negative on credit-received short positions."
+                    },
+                    "expiration_date": {
+                      "type": "string",
+                      "description": "YYYY-MM-DD contract expiration."
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string",
+                      "description": "Contract multiplier; typically '100'."
+                    },
+                    "intraday_average_open_price": {
+                      "type": "string",
+                      "description": "Average open price across today's fills."
+                    },
+                    "intraday_quantity": {
+                      "type": "string",
+                      "description": "Contracts opened in the current session; resets daily."
+                    },
+                    "pending_buy_quantity": {
+                      "type": "string",
+                      "description": "Contracts pending open buy orders."
+                    },
+                    "pending_sell_quantity": {
+                      "type": "string",
+                      "description": "Contracts pending open sell orders."
+                    },
+                    "pending_exercise_quantity": {
+                      "type": "string",
+                      "description": "Contracts awaiting exercise."
+                    },
+                    "pending_assignment_quantity": {
+                      "type": "string",
+                      "description": "Contracts awaiting assignment."
+                    },
+                    "pending_expiration_quantity": {
+                      "type": "string",
+                      "description": "Contracts awaiting expiration processing."
+                    },
+                    "opened_at": {
+                      "type": "string",
+                      "description": "ISO 8601 timestamp the current open of this position began (resets on close+reopen). Prefer this over the underlying record's created_at when telling the user when they opened the position."
+                    }
+                  },
+                  "required": [
+                    "option_id",
+                    "chain_id",
+                    "chain_symbol",
+                    "type",
+                    "quantity",
+                    "average_price",
+                    "expiration_date",
+                    "trade_value_multiplier",
+                    "intraday_average_open_price",
+                    "intraday_quantity",
+                    "pending_buy_quantity",
+                    "pending_sell_quantity",
+                    "pending_exercise_quantity",
+                    "pending_assignment_quantity",
+                    "pending_expiration_quantity"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Option positions on this page. Empty when the cursor has no rows."
+              },
+              "next": {
+                "type": "string",
+                "description": "Opaque cursor for the next page — NOT a URL. When non-empty more pages exist: call this tool again with cursor set to this value verbatim, leaving the other arguments unchanged. Empty on the last page."
+              }
+            },
+            "description": "Tool-specific result payload; see the inner properties for fields.",
+            "required": [
+              "positions"
+            ],
+            "additionalProperties": false
+          },
+          "guide": {
+            "type": "string",
+            "description": "Surface chain_symbol, type, quantity, average_price, and expiration_date. Look up strike/option_type (call/put) via get_option_instruments with option_id when needed. Warn the user about any non-zero pending_* quantities. When next is non-empty more pages exist — call this tool again with cursor set to that value verbatim."
+          }
+        },
+        "required": [
+          "data",
+          "guide"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}
