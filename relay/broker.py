@@ -22,6 +22,7 @@ import webbrowser
 import uuid
 
 from .status import annotate_failure, failure_detail, publish_status
+from .schema_contracts import cursor_mode, schema_problem
 
 
 ROBINHOOD_ENDPOINT = "https://agent.robinhood.com/mcp/trading"
@@ -726,6 +727,15 @@ class RobinhoodMCP:
         schemas = {key: tool.get(key) for key in ("inputSchema", "outputSchema")}
         return hashlib.sha256(json.dumps(schemas, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
+    @staticmethod
+    def _schema_problem(tool):
+        name = tool.get("name")
+        if name not in SCHEMA_PINS:
+            return "tool has no supported contract"
+        if RobinhoodMCP._schema_digest(tool) in SCHEMA_PINS[name]:
+            return None
+        return schema_problem(tool)
+
     def _persist_schema_cache(self, tools):
         temporary = None
         try:
@@ -768,14 +778,15 @@ class RobinhoodMCP:
         self.schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
         self.catalog = {tool["name"]: tool for tool in tools}
         self._persist_schema_cache(tools)
-        incompatible = [
-            name for name, accepted in SCHEMA_PINS.items()
-            if not self.catalog.get(name) or self._schema_digest(self.catalog[name]) not in accepted
-        ]
+        problems = {name: self._schema_problem(self.catalog[name]) if self.catalog.get(name) else "tool missing"
+                    for name in SCHEMA_PINS}
+        incompatible = {name: problem for name, problem in problems.items() if problem}
         self._schema_incompatible_tools = tuple(incompatible)
-        self._schema_incompatible = bool(self._schema_incompatible_tools)
+        self._schema_incompatible = bool(incompatible)
         if incompatible:
-            publish_status(self.on_status, "broker", "schema_incompatible", detail="Unaccepted pinned tools: " + ", ".join(incompatible))
+            publish_status(self.on_status, "broker", "schema_incompatible",
+                           detail="Incompatible broker schemas: " + "; ".join(
+                               f"{name}: {problem}" for name, problem in incompatible.items()))
         return tools
 
     async def call(self, name, args):
@@ -879,7 +890,7 @@ OPTION_OPAQUE_CURSOR_SCHEMAS = {
     "get_option_positions": "b1bda4a09b2269883ed89f7f679491c3ae6a226bfdf3137670cd9d1155fe684b",
 }
 
-# Authenticated official schemas observed 2026-09-06; changes require renewed qualification.
+# Known schemas are a fast path; compatible variants use structural checks.
 SCHEMA_PINS = {
     "search": {"577c2e161dec698d9efdb2d203a42d99798057035a277cbbb349c26477e7b28e"},
     # Reviewed 2026-09-09: guide text only; 2026-09-23: caller permissions and portfolio text.
@@ -1173,8 +1184,9 @@ class RobinhoodBroker(RobinhoodMCP):
             error = BrokerError(f"Required broker tool {name} missing from qualified catalog")
             annotate_failure(error, tool=name, code="schema_incompatible")
             raise error
-        if self._schema_digest(tool) not in SCHEMA_PINS[name]:
-            error = BrokerError(f"schema changed for {name}; qualify before continuing")
+        problem = self._schema_problem(tool)
+        if problem:
+            error = BrokerError(f"schema changed for {name}: {problem}; compatibility review required")
             annotate_failure(error, tool=name, code="schema_incompatible")
             raise error
         return tool
@@ -1210,8 +1222,11 @@ class RobinhoodBroker(RobinhoodMCP):
                 return rows
             if not isinstance(cursor, str):
                 raise BrokerError("Unexpected broker pagination cursor")
-            # The qualified schema defines cursor semantics, even for URL-shaped tokens.
-            if self._schema_digest(self.catalog.get(name, {})) != OPTION_OPAQUE_CURSOR_SCHEMAS.get(name):
+            # Documentation changes elsewhere do not alter the known cursor contract.
+            mode = cursor_mode(self.catalog.get(name, {}))
+            if mode not in {"opaque", "url"}:
+                raise BrokerError("Unrecognized broker pagination contract")
+            if mode == "url":
                 cursors = parse_qs(urlsplit(cursor).query).get("cursor", [])
                 if len(cursors) != 1:
                     raise BrokerError("Broker pagination is incomplete or cyclic")

@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import json
+from pathlib import Path
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -685,6 +687,7 @@ class BrokerReadLatencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_prefetched_instruments_follow_all_pages_before_selecting(self):
         fixture = FixtureBroker()
         broker = RobinhoodBroker(fixture.runtime, clock=lambda: fixture.now)
+        broker.catalog = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())["legacy"]
         first = fixture.instrument_by_expiry["2026-09-18"]
         second = fixture.instrument_by_expiry["2026-09-11"]
 

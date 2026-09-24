@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
-from relay.broker import BrokerError, RobinhoodBroker
+from relay.broker import BrokerError, RobinhoodBroker, SCHEMA_PINS
 from relay.status import execution_failure, project_execution_diagnostic
 
 
@@ -17,7 +17,36 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
         self.broker = RobinhoodBroker({"robinhood": {"account_number": "TEST0001"}})
         self.broker.catalog = {name: item["tool"] for name, item in self.fixtures.items()}
 
-    def test_original_and_reviewed_schemas_accept_only_exact_versions(self):
+    @staticmethod
+    def _compatible_schema_drift(tool):
+        changed = copy.deepcopy(tool)
+        for schema in (changed["inputSchema"], changed["outputSchema"]):
+            schema.update({"description": "Updated documentation.", "title": "Updated title", "examples": [], "$comment": "Documentation only"})
+        guide = changed["outputSchema"]["properties"]["guide"]
+        guide.update({"description": guide["description"] + " Updated.", "title": "Updated guide", "examples": ["example"], "$comment": "Guide metadata"})
+
+        def reorder_required(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("required"), list):
+                    node["required"] = list(reversed(node["required"]))
+                for value in node.values():
+                    reorder_required(value)
+            elif isinstance(node, list):
+                for value in node:
+                    reorder_required(value)
+
+        reorder_required(changed["inputSchema"])
+        reorder_required(changed["outputSchema"])
+        data_properties = changed["outputSchema"]["properties"]["data"].get("properties", {})
+        data_properties["provider_future_field"] = {"type": "string"}
+        for value in data_properties.values():
+            item_properties = value.get("items", {}).get("properties", {})
+            if item_properties:
+                item_properties["provider_future_field"] = {"type": "boolean"}
+                break
+        return changed
+
+    def test_original_and_reviewed_schemas_allow_documentation_updates(self):
         for name, item in self.fixtures.items():
             for original in (False, True):
                 with self.subTest(tool=name, original=original):
@@ -27,25 +56,66 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
                     self.broker.catalog[name] = tool
                     self.assertIs(self.broker._qualified(name), tool)
                     tool["outputSchema"]["properties"]["guide"]["description"] += " Unreviewed guidance."
-                    with self.assertRaisesRegex(BrokerError, "schema changed"):
-                        self.broker._qualified(name)
+                    self.assertIs(self.broker._qualified(name), tool)
             tool = copy.deepcopy(item["tool"])
             tool["inputSchema"]["additionalProperties"] = True
             self.broker.catalog[name] = tool
             with self.assertRaisesRegex(BrokerError, "schema changed"):
                 self.broker._qualified(name)
 
-    def test_reviewed_schemas_accept_only_exact_versions(self):
+    def test_reviewed_schemas_allow_documentation_updates(self):
         account = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
         options = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())
         for fixtures in (account, options["legacy"], options["current"]):
             for name, tool in fixtures.items():
                 with self.subTest(tool=name):
+                    tool = self._compatible_schema_drift(tool)
                     self.broker.catalog[name] = copy.deepcopy(tool)
                     self.assertIs(self.broker._qualified(name), self.broker.catalog[name])
                     self.broker.catalog[name]["outputSchema"]["properties"]["guide"]["description"] += " Unreviewed."
-                    with self.assertRaisesRegex(BrokerError, "schema changed"):
-                        self.broker._qualified(name)
+                    self.assertIs(self.broker._qualified(name), self.broker.catalog[name])
+
+    def test_schema_changes_are_rejected_and_name_the_incompatible_field(self):
+        account = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+        cases = [
+            ("input property named description", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"].update({"description": {"type": "string"}}), "description"),
+            ("changed type", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"type": "integer"}), "account_number"),
+            ("changed enum", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"enum": ["TEST0001"]}), "account_number"),
+            ("changed default", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"default": "TEST0001"}), "account_number"),
+            ("changed constraint", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"minLength": 2}), "account_number"),
+            ("removed request field", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"].pop("account_number"), "account_number"),
+            ("removed response field", "get_portfolio", account["get_portfolio"], lambda t: t["outputSchema"]["properties"]["data"]["properties"].pop("equity_value"), "equity_value"),
+            ("added required response field", "get_accounts", account["get_accounts"], lambda t: t["outputSchema"]["properties"]["data"]["properties"]["accounts"]["items"]["required"].append("nickname"), "nickname"),
+            ("removed required request field", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["required"].remove("account_number"), "account_number"),
+            ("removed required response field", "get_accounts", account["get_accounts"], lambda t: t["outputSchema"]["required"].remove("guide"), "guide"),
+            ("changed response type", "get_accounts", account["get_accounts"], lambda t: t["outputSchema"]["properties"]["data"]["properties"]["accounts"]["items"]["properties"]["account_number"].update({"type": "integer"}), "account_number"),
+        ]
+        for label, name, baseline, mutate, field in cases:
+            with self.subTest(change=label):
+                tool = copy.deepcopy(baseline)
+                mutate(tool)
+                self.broker.catalog[name] = tool
+                with self.assertRaisesRegex(BrokerError, "schema changed") as raised:
+                    self.broker._qualified(name)
+                self.assertIn(field, str(raised.exception))
+        unknown = copy.deepcopy(account["get_portfolio"])
+        unknown["name"] = "experimental_tool"
+        self.broker.catalog["experimental_tool"] = unknown
+        with self.assertRaisesRegex(BrokerError, "qualified catalog"):
+            self.broker._qualified("experimental_tool")
+
+    def test_option_pagination_schema_preserves_known_modes_and_rejects_unknown(self):
+        options = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())
+        for version in ("legacy", "current"):
+            with self.subTest(version=version):
+                tool = self._compatible_schema_drift(options[version]["get_option_positions"])
+                self.broker.catalog["get_option_positions"] = tool
+                self.assertIs(self.broker._qualified("get_option_positions"), tool)
+                next_schema = tool["outputSchema"]["properties"]["data"]["properties"]["next"]
+                next_schema["description"] = "Unknown next-page protocol."
+                with self.assertRaisesRegex(BrokerError, "schema changed") as raised:
+                    self.broker._qualified("get_option_positions")
+                self.assertIn("next", str(raised.exception))
 
     async def test_option_pagination_preserves_opaque_cursors_and_legacy_urls(self):
         arguments = {"account_number": "TEST0001", "nonzero": True}
@@ -99,7 +169,7 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
 
     def test_schema_rejection_has_safe_tool_diagnostic(self):
         name = "get_accounts"
-        self.broker.catalog[name]["outputSchema"]["properties"]["guide"]["description"] += " Unreviewed guidance."
+        self.broker.catalog[name]["outputSchema"]["properties"]["data"]["properties"]["accounts"]["items"]["properties"]["account_number"]["type"] = "integer"
         with self.assertRaises(BrokerError) as raised:
             self.broker._qualified(name)
         diagnostic = project_execution_diagnostic(getattr(raised.exception, "_relay_failure", {}))
@@ -114,7 +184,10 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("token", str(raised.exception).lower())
 
     async def test_discovery_persists_only_pinned_schemas_owner_only(self):
-        fixtures = self.fixtures
+        fixtures = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+        fixtures = {name: self._compatible_schema_drift(tool) for name, tool in fixtures.items()}
+        options = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())
+        fixtures.update({name: self._compatible_schema_drift(tool) for name, tool in options["current"].items()})
 
         class Tool:
             def __init__(self, value):
@@ -125,7 +198,7 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
 
         class Session:
             async def list_tools(self, cursor=None):
-                return SimpleNamespace(tools=[Tool(item["tool"]) for item in fixtures.values()], nextCursor=None)
+                return SimpleNamespace(tools=[Tool(item) for item in fixtures.values()], nextCursor=None)
 
         with tempfile.TemporaryDirectory() as directory:
             token_store = Path(directory) / "custom-oauth.json"
@@ -142,7 +215,10 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cache_path.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("TEST0001", cache_path.read_text())
             self.assertEqual(events[0]["state"], "schema_incompatible")
-            self.assertTrue(events[0]["detail"].startswith("Unaccepted pinned tools: "))
+            self.assertTrue(events[0]["detail"].startswith("Incompatible broker schemas: "))
+            self.assertEqual(set(self.broker._schema_incompatible_tools), set(SCHEMA_PINS) - set(fixtures))
+            for name in fixtures:
+                self.assertIs(self.broker._qualified(name), self.broker.catalog[name])
 
     async def test_incompatible_readiness_suppresses_connected_but_keeps_errors(self):
         events = []

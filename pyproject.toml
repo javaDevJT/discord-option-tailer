@@ -21,4 +21,4 @@ options-relay = "relay.cli:main"
 include = ["relay*"]
 
 [tool.setuptools.package-data]
-relay = ["static/*.html", "static/*.css", "static/*.js"]
+relay = ["static/*.html", "static/*.css", "static/*.js", "schema-contracts.json"]

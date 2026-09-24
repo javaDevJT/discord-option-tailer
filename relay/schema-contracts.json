@@ -1,0 +1,3243 @@
+{
+  "captured_on": "2026-09-24",
+  "tools": {
+    "cancel_option_order": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "order_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number",
+            "order_id"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "accepted": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "accepted"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "get_accounts": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "accounts": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "account_number": {
+                        "type": "string"
+                      },
+                      "rhs_account_number": {
+                        "type": "string"
+                      },
+                      "rhc_account_number": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "unsettled_funds": {
+                        "type": "string"
+                      },
+                      "brokerage_account_type": {
+                        "type": "string"
+                      },
+                      "nickname": {
+                        "type": "string"
+                      },
+                      "is_default": {
+                        "type": "boolean"
+                      },
+                      "agentic_allowed": {
+                        "type": "boolean"
+                      },
+                      "option_level": {
+                        "type": "string"
+                      },
+                      "user_option_level": {
+                        "type": "string"
+                      },
+                      "management_type": {
+                        "type": "string"
+                      },
+                      "affiliate": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "deactivated": {
+                        "type": "boolean"
+                      },
+                      "permanently_deactivated": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "account_number",
+                      "agentic_allowed",
+                      "brokerage_account_type",
+                      "deactivated",
+                      "is_default",
+                      "option_level",
+                      "permanently_deactivated",
+                      "rhs_account_number",
+                      "state",
+                      "type"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "accounts"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      },
+      {
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "accounts": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "account_number": {
+                        "type": "string"
+                      },
+                      "rhs_account_number": {
+                        "type": "string"
+                      },
+                      "rhc_account_number": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "unsettled_funds": {
+                        "type": "string"
+                      },
+                      "brokerage_account_type": {
+                        "type": "string"
+                      },
+                      "nickname": {
+                        "type": "string"
+                      },
+                      "is_default": {
+                        "type": "boolean"
+                      },
+                      "agentic_allowed": {
+                        "type": "boolean"
+                      },
+                      "option_level": {
+                        "type": "string"
+                      },
+                      "management_type": {
+                        "type": "string"
+                      },
+                      "affiliate": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "deactivated": {
+                        "type": "boolean"
+                      },
+                      "permanently_deactivated": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "account_number",
+                      "agentic_allowed",
+                      "brokerage_account_type",
+                      "deactivated",
+                      "is_default",
+                      "option_level",
+                      "permanently_deactivated",
+                      "rhs_account_number",
+                      "state",
+                      "type"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "accounts"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "get_equity_quotes": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "symbols": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "symbols"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "results": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "quote": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "last_trade_price": {
+                            "type": "string"
+                          },
+                          "venue_last_trade_time": {
+                            "type": "string"
+                          },
+                          "last_non_reg_trade_price": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "venue_last_non_reg_trade_time": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "adjusted_previous_close": {
+                            "type": "string"
+                          },
+                          "previous_close": {
+                            "type": "string"
+                          },
+                          "previous_close_date": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "bid_price": {
+                            "type": "string"
+                          },
+                          "venue_bid_time": {
+                            "type": "string"
+                          },
+                          "ask_price": {
+                            "type": "string"
+                          },
+                          "venue_ask_time": {
+                            "type": "string"
+                          },
+                          "has_traded": {
+                            "type": "boolean"
+                          },
+                          "state": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "adjusted_previous_close",
+                          "ask_price",
+                          "bid_price",
+                          "has_traded",
+                          "last_non_reg_trade_price",
+                          "last_trade_price",
+                          "previous_close",
+                          "previous_close_date",
+                          "state",
+                          "symbol",
+                          "venue_ask_time",
+                          "venue_bid_time",
+                          "venue_last_non_reg_trade_time",
+                          "venue_last_trade_time"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "close": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "date": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "price": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "interpolated": {
+                            "type": [
+                              "null",
+                              "boolean"
+                            ]
+                          },
+                          "source": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "date",
+                          "interpolated",
+                          "price",
+                          "source",
+                          "symbol"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "quote"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "closes_error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "results"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "get_option_chains": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "string"
+            },
+            "underlying_symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "chains": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "can_open_position": {
+                        "type": "boolean"
+                      },
+                      "cash_component": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "expiration_dates": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "underlying_instruments": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "instrument": {
+                              "type": "string"
+                            },
+                            "symbol": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "instrument",
+                            "symbol"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "min_ticks": {
+                        "type": "object",
+                        "properties": {
+                          "above_tick": {
+                            "type": "string"
+                          },
+                          "below_tick": {
+                            "type": "string"
+                          },
+                          "cutoff_price": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "above_tick",
+                          "below_tick",
+                          "cutoff_price"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "late_close_state": {
+                        "type": "string"
+                      },
+                      "extended_hours_state": {
+                        "type": "string"
+                      },
+                      "settle_on_open": {
+                        "type": "boolean"
+                      },
+                      "sellout_time_to_expiration": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "can_open_position",
+                      "cash_component",
+                      "expiration_dates",
+                      "extended_hours_state",
+                      "id",
+                      "late_close_state",
+                      "min_ticks",
+                      "sellout_time_to_expiration",
+                      "settle_on_open",
+                      "symbol",
+                      "trade_value_multiplier",
+                      "underlying_instruments"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "chains"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Next-page URL. Empty when there are no more pages.",
+        "cursor_mode": "url"
+      },
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "string"
+            },
+            "underlying_symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "chains": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "can_open_position": {
+                        "type": "boolean"
+                      },
+                      "cash_component": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "expiration_dates": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "underlying_instruments": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "instrument": {
+                              "type": "string"
+                            },
+                            "symbol": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "instrument",
+                            "symbol"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "min_ticks": {
+                        "type": "object",
+                        "properties": {
+                          "above_tick": {
+                            "type": "string"
+                          },
+                          "below_tick": {
+                            "type": "string"
+                          },
+                          "cutoff_price": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "above_tick",
+                          "below_tick",
+                          "cutoff_price"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "late_close_state": {
+                        "type": "string"
+                      },
+                      "extended_hours_state": {
+                        "type": "string"
+                      },
+                      "settle_on_open": {
+                        "type": "boolean"
+                      },
+                      "sellout_time_to_expiration": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "can_open_position",
+                      "cash_component",
+                      "expiration_dates",
+                      "extended_hours_state",
+                      "id",
+                      "late_close_state",
+                      "min_ticks",
+                      "sellout_time_to_expiration",
+                      "settle_on_open",
+                      "symbol",
+                      "trade_value_multiplier",
+                      "underlying_instruments"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "chains"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "get_option_instruments": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "chain_id": {
+              "type": "string"
+            },
+            "chain_symbol": {
+              "type": "string"
+            },
+            "expiration_dates": {
+              "type": "string"
+            },
+            "strike_price": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "tradability": {
+              "type": "string"
+            },
+            "ids": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "instruments": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "chain_id": {
+                        "type": "string"
+                      },
+                      "chain_symbol": {
+                        "type": "string"
+                      },
+                      "underlying_type": {
+                        "type": "string"
+                      },
+                      "expiration_date": {
+                        "type": "string"
+                      },
+                      "sellout_datetime": {
+                        "type": "string"
+                      },
+                      "strike_price": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "tradability": {
+                        "type": "string"
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "min_ticks": {
+                        "type": "object",
+                        "properties": {
+                          "above_tick": {
+                            "type": "string"
+                          },
+                          "below_tick": {
+                            "type": "string"
+                          },
+                          "cutoff_price": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "above_tick",
+                          "below_tick",
+                          "cutoff_price"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "chain_id",
+                      "chain_symbol",
+                      "expiration_date",
+                      "id",
+                      "min_ticks",
+                      "sellout_datetime",
+                      "state",
+                      "strike_price",
+                      "tradability",
+                      "trade_value_multiplier",
+                      "type",
+                      "underlying_type"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "instruments"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Next-page URL. Empty when there are no more pages.",
+        "cursor_mode": "url"
+      },
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "chain_id": {
+              "type": "string"
+            },
+            "chain_symbol": {
+              "type": "string"
+            },
+            "expiration_dates": {
+              "type": "string"
+            },
+            "strike_price": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "tradability": {
+              "type": "string"
+            },
+            "ids": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "instruments": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "chain_id": {
+                        "type": "string"
+                      },
+                      "chain_symbol": {
+                        "type": "string"
+                      },
+                      "underlying_type": {
+                        "type": "string"
+                      },
+                      "expiration_date": {
+                        "type": "string"
+                      },
+                      "sellout_datetime": {
+                        "type": "string"
+                      },
+                      "strike_price": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "tradability": {
+                        "type": "string"
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "min_ticks": {
+                        "type": "object",
+                        "properties": {
+                          "above_tick": {
+                            "type": "string"
+                          },
+                          "below_tick": {
+                            "type": "string"
+                          },
+                          "cutoff_price": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "above_tick",
+                          "below_tick",
+                          "cutoff_price"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "chain_id",
+                      "chain_symbol",
+                      "expiration_date",
+                      "id",
+                      "min_ticks",
+                      "sellout_datetime",
+                      "state",
+                      "strike_price",
+                      "tradability",
+                      "trade_value_multiplier",
+                      "type",
+                      "underlying_type"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "instruments"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Opaque cursor for the next page — NOT a URL. When non-empty more pages exist: call this tool again with cursor set to this value verbatim, leaving the other arguments unchanged. Empty on the last page.",
+        "cursor_mode": "opaque"
+      }
+    ],
+    "get_option_orders": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "order_id": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "created_at_gte": {
+              "type": "string"
+            },
+            "chain_ids": {
+              "type": "string"
+            },
+            "underlying_type": {
+              "type": "string"
+            },
+            "placed_agent": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "orders": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "chain_id": {
+                        "type": "string"
+                      },
+                      "chain_symbol": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "trigger": {
+                        "type": "string"
+                      },
+                      "direction": {
+                        "type": "string"
+                      },
+                      "quantity": {
+                        "type": "string"
+                      },
+                      "processed_quantity": {
+                        "type": "string"
+                      },
+                      "pending_quantity": {
+                        "type": "string"
+                      },
+                      "canceled_quantity": {
+                        "type": "string"
+                      },
+                      "price": {
+                        "type": "string"
+                      },
+                      "stop_price": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "premium": {
+                        "type": "string"
+                      },
+                      "processed_premium": {
+                        "type": "string"
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "time_in_force": {
+                        "type": "string"
+                      },
+                      "market_hours": {
+                        "type": "string"
+                      },
+                      "opening_strategy": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "closing_strategy": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "placed_agent": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "type": "string"
+                      },
+                      "last_transaction_at": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "reject_reason": {
+                        "type": "string"
+                      },
+                      "is_replaceable": {
+                        "type": "boolean"
+                      },
+                      "legs": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "option_id": {
+                              "type": "string"
+                            },
+                            "side": {
+                              "type": "string"
+                            },
+                            "position_effect": {
+                              "type": "string"
+                            },
+                            "ratio_quantity": {
+                              "type": "integer"
+                            },
+                            "expiration_date": {
+                              "type": "string"
+                            },
+                            "strike_price": {
+                              "type": "string"
+                            },
+                            "option_type": {
+                              "type": "string"
+                            },
+                            "executions": {
+                              "type": [
+                                "null",
+                                "array"
+                              ],
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "id": {
+                                    "type": "string"
+                                  },
+                                  "price": {
+                                    "type": "string"
+                                  },
+                                  "quantity": {
+                                    "type": "string"
+                                  },
+                                  "settlement_date": {
+                                    "type": "string"
+                                  },
+                                  "trade_date": {
+                                    "type": "string"
+                                  },
+                                  "timestamp": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "id",
+                                  "price",
+                                  "quantity",
+                                  "settlement_date",
+                                  "timestamp",
+                                  "trade_date"
+                                ],
+                                "additionalProperties": false
+                              }
+                            }
+                          },
+                          "required": [
+                            "expiration_date",
+                            "id",
+                            "option_type",
+                            "position_effect",
+                            "ratio_quantity",
+                            "side",
+                            "strike_price"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "canceled_quantity",
+                      "chain_id",
+                      "chain_symbol",
+                      "closing_strategy",
+                      "created_at",
+                      "direction",
+                      "id",
+                      "is_replaceable",
+                      "last_transaction_at",
+                      "legs",
+                      "market_hours",
+                      "opening_strategy",
+                      "pending_quantity",
+                      "placed_agent",
+                      "premium",
+                      "price",
+                      "processed_premium",
+                      "processed_quantity",
+                      "quantity",
+                      "state",
+                      "stop_price",
+                      "time_in_force",
+                      "trade_value_multiplier",
+                      "trigger",
+                      "type"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "orders"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Next-page URL. Empty when there are no more pages.",
+        "cursor_mode": "url"
+      },
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "order_id": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "created_at_gte": {
+              "type": "string"
+            },
+            "chain_ids": {
+              "type": "string"
+            },
+            "underlying_type": {
+              "type": "string"
+            },
+            "placed_agent": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "orders": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "chain_id": {
+                        "type": "string"
+                      },
+                      "chain_symbol": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "trigger": {
+                        "type": "string"
+                      },
+                      "direction": {
+                        "type": "string"
+                      },
+                      "quantity": {
+                        "type": "string"
+                      },
+                      "processed_quantity": {
+                        "type": "string"
+                      },
+                      "pending_quantity": {
+                        "type": "string"
+                      },
+                      "canceled_quantity": {
+                        "type": "string"
+                      },
+                      "price": {
+                        "type": "string"
+                      },
+                      "stop_price": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "premium": {
+                        "type": "string"
+                      },
+                      "processed_premium": {
+                        "type": "string"
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "time_in_force": {
+                        "type": "string"
+                      },
+                      "market_hours": {
+                        "type": "string"
+                      },
+                      "opening_strategy": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "closing_strategy": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "placed_agent": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "type": "string"
+                      },
+                      "last_transaction_at": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "reject_reason": {
+                        "type": "string"
+                      },
+                      "is_replaceable": {
+                        "type": "boolean"
+                      },
+                      "legs": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "option_id": {
+                              "type": "string"
+                            },
+                            "side": {
+                              "type": "string"
+                            },
+                            "position_effect": {
+                              "type": "string"
+                            },
+                            "ratio_quantity": {
+                              "type": "integer"
+                            },
+                            "expiration_date": {
+                              "type": "string"
+                            },
+                            "strike_price": {
+                              "type": "string"
+                            },
+                            "option_type": {
+                              "type": "string"
+                            },
+                            "executions": {
+                              "type": [
+                                "null",
+                                "array"
+                              ],
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "id": {
+                                    "type": "string"
+                                  },
+                                  "price": {
+                                    "type": "string"
+                                  },
+                                  "quantity": {
+                                    "type": "string"
+                                  },
+                                  "settlement_date": {
+                                    "type": "string"
+                                  },
+                                  "trade_date": {
+                                    "type": "string"
+                                  },
+                                  "timestamp": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "id",
+                                  "price",
+                                  "quantity",
+                                  "settlement_date",
+                                  "timestamp",
+                                  "trade_date"
+                                ],
+                                "additionalProperties": false
+                              }
+                            }
+                          },
+                          "required": [
+                            "expiration_date",
+                            "id",
+                            "option_type",
+                            "position_effect",
+                            "ratio_quantity",
+                            "side",
+                            "strike_price"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "canceled_quantity",
+                      "chain_id",
+                      "chain_symbol",
+                      "closing_strategy",
+                      "created_at",
+                      "direction",
+                      "id",
+                      "is_replaceable",
+                      "last_transaction_at",
+                      "legs",
+                      "market_hours",
+                      "opening_strategy",
+                      "pending_quantity",
+                      "placed_agent",
+                      "premium",
+                      "price",
+                      "processed_premium",
+                      "processed_quantity",
+                      "quantity",
+                      "state",
+                      "stop_price",
+                      "time_in_force",
+                      "trade_value_multiplier",
+                      "trigger",
+                      "type"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "orders"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Opaque cursor for the next page — NOT a URL. When non-empty more pages exist: call this tool again with cursor set to this value verbatim, leaving the other arguments unchanged. Empty on the last page.",
+        "cursor_mode": "opaque"
+      }
+    ],
+    "get_option_positions": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "nonzero": {
+              "type": "boolean"
+            },
+            "chain_ids": {
+              "type": "string"
+            },
+            "option_ids": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "option_type": {
+              "type": "string"
+            },
+            "expiration_date": {
+              "type": "string"
+            },
+            "expiration_date_lte": {
+              "type": "string"
+            },
+            "expiration_date_gte": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "positions": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "option_id": {
+                        "type": "string"
+                      },
+                      "chain_id": {
+                        "type": "string"
+                      },
+                      "chain_symbol": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "quantity": {
+                        "type": "string"
+                      },
+                      "average_price": {
+                        "type": "string"
+                      },
+                      "expiration_date": {
+                        "type": "string"
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "intraday_average_open_price": {
+                        "type": "string"
+                      },
+                      "intraday_quantity": {
+                        "type": "string"
+                      },
+                      "pending_buy_quantity": {
+                        "type": "string"
+                      },
+                      "pending_sell_quantity": {
+                        "type": "string"
+                      },
+                      "pending_exercise_quantity": {
+                        "type": "string"
+                      },
+                      "pending_assignment_quantity": {
+                        "type": "string"
+                      },
+                      "pending_expiration_quantity": {
+                        "type": "string"
+                      },
+                      "opened_at": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "average_price",
+                      "chain_id",
+                      "chain_symbol",
+                      "expiration_date",
+                      "intraday_average_open_price",
+                      "intraday_quantity",
+                      "option_id",
+                      "pending_assignment_quantity",
+                      "pending_buy_quantity",
+                      "pending_exercise_quantity",
+                      "pending_expiration_quantity",
+                      "pending_sell_quantity",
+                      "quantity",
+                      "trade_value_multiplier",
+                      "type"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "positions"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Next-page URL. Empty when there are no more pages.",
+        "cursor_mode": "url"
+      },
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "nonzero": {
+              "type": "boolean"
+            },
+            "chain_ids": {
+              "type": "string"
+            },
+            "option_ids": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "option_type": {
+              "type": "string"
+            },
+            "expiration_date": {
+              "type": "string"
+            },
+            "expiration_date_lte": {
+              "type": "string"
+            },
+            "expiration_date_gte": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "positions": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "option_id": {
+                        "type": "string"
+                      },
+                      "chain_id": {
+                        "type": "string"
+                      },
+                      "chain_symbol": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "quantity": {
+                        "type": "string"
+                      },
+                      "average_price": {
+                        "type": "string"
+                      },
+                      "expiration_date": {
+                        "type": "string"
+                      },
+                      "trade_value_multiplier": {
+                        "type": "string"
+                      },
+                      "intraday_average_open_price": {
+                        "type": "string"
+                      },
+                      "intraday_quantity": {
+                        "type": "string"
+                      },
+                      "pending_buy_quantity": {
+                        "type": "string"
+                      },
+                      "pending_sell_quantity": {
+                        "type": "string"
+                      },
+                      "pending_exercise_quantity": {
+                        "type": "string"
+                      },
+                      "pending_assignment_quantity": {
+                        "type": "string"
+                      },
+                      "pending_expiration_quantity": {
+                        "type": "string"
+                      },
+                      "opened_at": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "average_price",
+                      "chain_id",
+                      "chain_symbol",
+                      "expiration_date",
+                      "intraday_average_open_price",
+                      "intraday_quantity",
+                      "option_id",
+                      "pending_assignment_quantity",
+                      "pending_buy_quantity",
+                      "pending_exercise_quantity",
+                      "pending_expiration_quantity",
+                      "pending_sell_quantity",
+                      "quantity",
+                      "trade_value_multiplier",
+                      "type"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "next": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "positions"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": "Opaque cursor for the next page — NOT a URL. When non-empty more pages exist: call this tool again with cursor set to this value verbatim, leaving the other arguments unchanged. Empty on the last page.",
+        "cursor_mode": "opaque"
+      }
+    ],
+    "get_option_quotes": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "instrument_ids": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "instrument_ids"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "results": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "quote": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "instrument_id": {
+                            "type": "string"
+                          },
+                          "ask_price": {
+                            "type": "string"
+                          },
+                          "ask_size": {
+                            "type": "integer"
+                          },
+                          "bid_price": {
+                            "type": "string"
+                          },
+                          "bid_size": {
+                            "type": "integer"
+                          },
+                          "break_even_price": {
+                            "type": "string"
+                          },
+                          "adjusted_mark_price": {
+                            "type": "string"
+                          },
+                          "mark_price": {
+                            "type": "string"
+                          },
+                          "high_fill_rate_buy_price": {
+                            "type": "string"
+                          },
+                          "low_fill_rate_buy_price": {
+                            "type": "string"
+                          },
+                          "high_fill_rate_sell_price": {
+                            "type": "string"
+                          },
+                          "low_fill_rate_sell_price": {
+                            "type": "string"
+                          },
+                          "previous_close_price": {
+                            "type": "string"
+                          },
+                          "previous_close_date": {
+                            "type": "string"
+                          },
+                          "implied_volatility": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "delta": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "gamma": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "rho": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "theta": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "vega": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "open_interest": {
+                            "type": "integer"
+                          },
+                          "volume": {
+                            "type": "integer"
+                          },
+                          "chance_of_profit_long": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "chance_of_profit_short": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "updated_at": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "adjusted_mark_price",
+                          "ask_price",
+                          "ask_size",
+                          "bid_price",
+                          "bid_size",
+                          "break_even_price",
+                          "chance_of_profit_long",
+                          "chance_of_profit_short",
+                          "delta",
+                          "gamma",
+                          "high_fill_rate_buy_price",
+                          "high_fill_rate_sell_price",
+                          "implied_volatility",
+                          "instrument_id",
+                          "low_fill_rate_buy_price",
+                          "low_fill_rate_sell_price",
+                          "mark_price",
+                          "open_interest",
+                          "previous_close_date",
+                          "previous_close_price",
+                          "rho",
+                          "theta",
+                          "updated_at",
+                          "vega",
+                          "volume"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "close": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "instrument_id": {
+                            "type": "string"
+                          },
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "date": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "price": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "interpolated": {
+                            "type": [
+                              "null",
+                              "boolean"
+                            ]
+                          },
+                          "source": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "date",
+                          "instrument_id",
+                          "interpolated",
+                          "price",
+                          "source",
+                          "symbol"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "quote"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "closes_error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "results"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "get_portfolio": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "total_value": {
+                  "type": "string"
+                },
+                "equity_value": {
+                  "type": "string"
+                },
+                "options_value": {
+                  "type": "string"
+                },
+                "futures_value": {
+                  "type": "string"
+                },
+                "event_contracts_value": {
+                  "type": "string"
+                },
+                "crypto_value": {
+                  "type": "string"
+                },
+                "cash": {
+                  "type": "string"
+                },
+                "pending_deposits": {
+                  "type": "string"
+                },
+                "mutual_funds_value": {
+                  "type": "string"
+                },
+                "fixed_income_value": {
+                  "type": "string"
+                },
+                "currency": {
+                  "type": "string"
+                },
+                "buying_power": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "buying_power": {
+                      "type": "string"
+                    },
+                    "unleveraged_buying_power": {
+                      "type": "string"
+                    },
+                    "intraday_buying_power": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "off_intraday_buying_power": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "display_currency": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "buying_power",
+                    "display_currency",
+                    "unleveraged_buying_power"
+                  ],
+                  "additionalProperties": false
+                },
+                "crypto_buying_power": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "buying_power": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "buying_power"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "buying_power",
+                "cash",
+                "crypto_value",
+                "currency",
+                "equity_value",
+                "event_contracts_value",
+                "fixed_income_value",
+                "futures_value",
+                "mutual_funds_value",
+                "options_value",
+                "pending_deposits",
+                "total_value"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "place_option_order": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "legs": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "option_id": {
+                    "type": "string"
+                  },
+                  "side": {
+                    "type": "string"
+                  },
+                  "position_effect": {
+                    "type": "string"
+                  },
+                  "ratio_quantity": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "option_id",
+                  "position_effect",
+                  "side"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "direction": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "quantity": {
+              "type": "string"
+            },
+            "price": {
+              "type": "string"
+            },
+            "stop_price": {
+              "type": "string"
+            },
+            "time_in_force": {
+              "type": "string"
+            },
+            "market_hours": {
+              "type": "string"
+            },
+            "ref_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number",
+            "legs",
+            "quantity"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "order": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "chain_id": {
+                      "type": "string"
+                    },
+                    "chain_symbol": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    },
+                    "trigger": {
+                      "type": "string"
+                    },
+                    "direction": {
+                      "type": "string"
+                    },
+                    "quantity": {
+                      "type": "string"
+                    },
+                    "processed_quantity": {
+                      "type": "string"
+                    },
+                    "pending_quantity": {
+                      "type": "string"
+                    },
+                    "canceled_quantity": {
+                      "type": "string"
+                    },
+                    "price": {
+                      "type": "string"
+                    },
+                    "stop_price": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "premium": {
+                      "type": "string"
+                    },
+                    "processed_premium": {
+                      "type": "string"
+                    },
+                    "trade_value_multiplier": {
+                      "type": "string"
+                    },
+                    "time_in_force": {
+                      "type": "string"
+                    },
+                    "market_hours": {
+                      "type": "string"
+                    },
+                    "opening_strategy": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "closing_strategy": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "placed_agent": {
+                      "type": "string"
+                    },
+                    "created_at": {
+                      "type": "string"
+                    },
+                    "updated_at": {
+                      "type": "string"
+                    },
+                    "last_transaction_at": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "reject_reason": {
+                      "type": "string"
+                    },
+                    "is_replaceable": {
+                      "type": "boolean"
+                    },
+                    "legs": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "option_id": {
+                            "type": "string"
+                          },
+                          "side": {
+                            "type": "string"
+                          },
+                          "position_effect": {
+                            "type": "string"
+                          },
+                          "ratio_quantity": {
+                            "type": "integer"
+                          },
+                          "expiration_date": {
+                            "type": "string"
+                          },
+                          "strike_price": {
+                            "type": "string"
+                          },
+                          "option_type": {
+                            "type": "string"
+                          },
+                          "executions": {
+                            "type": [
+                              "null",
+                              "array"
+                            ],
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "price": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "string"
+                                },
+                                "settlement_date": {
+                                  "type": "string"
+                                },
+                                "trade_date": {
+                                  "type": "string"
+                                },
+                                "timestamp": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "price",
+                                "quantity",
+                                "settlement_date",
+                                "timestamp",
+                                "trade_date"
+                              ],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": [
+                          "expiration_date",
+                          "id",
+                          "option_type",
+                          "position_effect",
+                          "ratio_quantity",
+                          "side",
+                          "strike_price"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "canceled_quantity",
+                    "chain_id",
+                    "chain_symbol",
+                    "closing_strategy",
+                    "created_at",
+                    "direction",
+                    "id",
+                    "is_replaceable",
+                    "last_transaction_at",
+                    "legs",
+                    "market_hours",
+                    "opening_strategy",
+                    "pending_quantity",
+                    "placed_agent",
+                    "premium",
+                    "price",
+                    "processed_premium",
+                    "processed_quantity",
+                    "quantity",
+                    "state",
+                    "stop_price",
+                    "time_in_force",
+                    "trade_value_multiplier",
+                    "trigger",
+                    "type"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "review_option_order": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "account_number": {
+              "type": "string"
+            },
+            "legs": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "option_id": {
+                    "type": "string"
+                  },
+                  "side": {
+                    "type": "string"
+                  },
+                  "position_effect": {
+                    "type": "string"
+                  },
+                  "ratio_quantity": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "option_id",
+                  "position_effect",
+                  "side"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "direction": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "quantity": {
+              "type": "string"
+            },
+            "price": {
+              "type": "string"
+            },
+            "stop_price": {
+              "type": "string"
+            },
+            "time_in_force": {
+              "type": "string"
+            },
+            "market_hours": {
+              "type": "string"
+            },
+            "chain_symbol": {
+              "type": "string"
+            },
+            "underlying_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account_number",
+            "legs",
+            "quantity"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "account_number": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string"
+                },
+                "quantity": {
+                  "type": "string"
+                },
+                "price": {
+                  "type": "string"
+                },
+                "stop_price": {
+                  "type": "string"
+                },
+                "time_in_force": {
+                  "type": "string"
+                },
+                "market_hours": {
+                  "type": "string"
+                },
+                "legs": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "option_id": {
+                        "type": "string"
+                      },
+                      "side": {
+                        "type": "string"
+                      },
+                      "position_effect": {
+                        "type": "string"
+                      },
+                      "ratio_quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "option_id",
+                      "position_effect",
+                      "side"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "order_checks": {
+                  "type": "object",
+                  "properties": {
+                    "alertType": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "option_quotes": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "instrument_id": {
+                        "type": "string"
+                      },
+                      "ask_price": {
+                        "type": "string"
+                      },
+                      "ask_size": {
+                        "type": "integer"
+                      },
+                      "bid_price": {
+                        "type": "string"
+                      },
+                      "bid_size": {
+                        "type": "integer"
+                      },
+                      "break_even_price": {
+                        "type": "string"
+                      },
+                      "adjusted_mark_price": {
+                        "type": "string"
+                      },
+                      "mark_price": {
+                        "type": "string"
+                      },
+                      "high_fill_rate_buy_price": {
+                        "type": "string"
+                      },
+                      "low_fill_rate_buy_price": {
+                        "type": "string"
+                      },
+                      "high_fill_rate_sell_price": {
+                        "type": "string"
+                      },
+                      "low_fill_rate_sell_price": {
+                        "type": "string"
+                      },
+                      "previous_close_price": {
+                        "type": "string"
+                      },
+                      "previous_close_date": {
+                        "type": "string"
+                      },
+                      "implied_volatility": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "delta": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "gamma": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "rho": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "theta": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "vega": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "open_interest": {
+                        "type": "integer"
+                      },
+                      "volume": {
+                        "type": "integer"
+                      },
+                      "chance_of_profit_long": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "chance_of_profit_short": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "updated_at": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "adjusted_mark_price",
+                      "ask_price",
+                      "ask_size",
+                      "bid_price",
+                      "bid_size",
+                      "break_even_price",
+                      "chance_of_profit_long",
+                      "chance_of_profit_short",
+                      "delta",
+                      "gamma",
+                      "high_fill_rate_buy_price",
+                      "high_fill_rate_sell_price",
+                      "implied_volatility",
+                      "instrument_id",
+                      "low_fill_rate_buy_price",
+                      "low_fill_rate_sell_price",
+                      "mark_price",
+                      "open_interest",
+                      "previous_close_date",
+                      "previous_close_price",
+                      "rho",
+                      "theta",
+                      "updated_at",
+                      "vega",
+                      "volume"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "fees": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "occ_fee": {
+                      "type": "object",
+                      "properties": {
+                        "fee_rate": {
+                          "type": "string"
+                        },
+                        "fee": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "fee",
+                        "fee_rate"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "or_fee": {
+                      "type": "object",
+                      "properties": {
+                        "fee_rate": {
+                          "type": "string"
+                        },
+                        "fee": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "fee",
+                        "fee_rate"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "contract_fee": {
+                      "type": "object",
+                      "properties": {
+                        "fee_rate": {
+                          "type": "string"
+                        },
+                        "fee": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "fee",
+                        "fee_rate"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "exchange_fee": {
+                      "type": "object",
+                      "properties": {
+                        "fee_rate": {
+                          "type": "string"
+                        },
+                        "fee": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "fee",
+                        "fee_rate"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "cat_fee": {
+                      "type": "object",
+                      "properties": {
+                        "fee_rate": {
+                          "type": "string"
+                        },
+                        "fee": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "fee",
+                        "fee_rate"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "gold_fee_savings": {
+                      "type": "object",
+                      "properties": {
+                        "fee_saving_rate": {
+                          "type": "string"
+                        },
+                        "fee_total_savings": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "fee_saving_rate",
+                        "fee_total_savings"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "sales_taxes": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "fee": {
+                            "type": "string"
+                          },
+                          "fee_rate": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          },
+                          "display_name": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "display_name",
+                          "fee",
+                          "fee_rate",
+                          "type"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "is_gold": {
+                      "type": "boolean"
+                    },
+                    "total_fee": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cat_fee",
+                    "contract_fee",
+                    "exchange_fee",
+                    "gold_fee_savings",
+                    "is_gold",
+                    "occ_fee",
+                    "or_fee",
+                    "sales_taxes",
+                    "total_fee"
+                  ],
+                  "additionalProperties": false
+                },
+                "collateral": {
+                  "type": [
+                    "null",
+                    "object"
+                  ],
+                  "properties": {
+                    "account_number": {
+                      "type": "string"
+                    },
+                    "cash": {
+                      "type": "object",
+                      "properties": {
+                        "amount": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        },
+                        "direction": {
+                          "type": "string"
+                        },
+                        "infinite": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "amount",
+                        "direction",
+                        "infinite"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "equities": {
+                      "type": [
+                        "null",
+                        "array"
+                      ],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "instrument_id": {
+                            "type": "string"
+                          },
+                          "instrument": {
+                            "type": "string"
+                          },
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "string"
+                          },
+                          "direction": {
+                            "type": "string"
+                          },
+                          "uncovered_shares": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "direction",
+                          "instrument",
+                          "instrument_id",
+                          "quantity",
+                          "symbol",
+                          "uncovered_shares"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "account_number",
+                    "cash",
+                    "equities"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "account_number",
+                "direction",
+                "legs",
+                "option_quotes",
+                "order_checks",
+                "quantity",
+                "type"
+              ],
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ],
+    "search": [
+      {
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "asset_type": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "results": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "instrument_id": {
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "simple_name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "instrument_id",
+                      "name",
+                      "symbol"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "currency_pairs": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "name",
+                      "symbol"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "market_indexes": {
+                  "type": [
+                    "null",
+                    "array"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "name",
+                      "symbol"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "guide": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "guide"
+          ],
+          "additionalProperties": false
+        },
+        "pagination_description": null,
+        "cursor_mode": null
+      }
+    ]
+  }
+}
