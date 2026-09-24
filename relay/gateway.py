@@ -571,7 +571,7 @@ class _GatewayRuntime:
         reason: str = "live",
         edited: bool = False,
     ) -> None:
-        payload = _message_payload(message, edited=edited)
+        payload = _message_payload(message)
         channel = self._channel_config(payload.get("channel_id"))
         allowed = self._allowed(payload, channel)
         if not allowed and kind == "edit" and channel is not None:
@@ -580,6 +580,20 @@ class _GatewayRuntime:
         if not allowed:
             return
         normalized = normalize(payload, str(payload["channel_id"]))
+        key = _message_key(normalized)
+        previous = self.latest.get(key)
+        if kind == "edit" and previous is not None and normalized["revision"] == previous["revision"]:
+            # Discord also emits MESSAGE_UPDATE for unchanged embeds and renewed
+            # media URLs. Keep the original live eligibility and pending decision.
+            refreshed = dict(previous)
+            for field in ("attachments", "embeds", "transport_revision"):
+                refreshed[field] = normalized[field]
+            self._remember(refreshed, channel, invalid=key in self.invalidated)
+            if refreshed["transport_revision"] != previous["transport_revision"]:
+                await self.enqueue(refreshed)
+            return
+        if edited and not payload.get("edited_timestamp"):
+            normalized = normalize(_message_payload(message, edited=True), str(payload["channel_id"]))
         normalized["browser_connection_epoch"] = self.epoch
 
         floor = self.history_floor.get(str(payload["channel_id"]))
@@ -613,15 +627,22 @@ class _GatewayRuntime:
         previous = self.latest.get(key)
         if self._channel_config(key[0]) is None or previous is None:
             return
-        self._mark_invalid(key)
-        # Cached edits also produce the complete on_message_edit event. Raw
-        # updates for evicted messages can contain only the changed embeds.
-        if _value(payload, "cached_message") is not None:
-            return
         data = _value(payload, "data", default={})
-        if isinstance(data, dict):
-            updated = {**previous, **data, "id": key[1], "channel_id": key[0]}
-            await self.observe(updated, kind="edit", reason="edit", edited=True)
+        if not isinstance(data, dict):
+            self._mark_invalid(key)
+            return
+        updated = {**previous, **data, "id": key[1], "channel_id": key[0]}
+        if "author" in data:
+            updated.pop("author_id", None)
+            updated.pop("author_name", None)
+        # Cached updates also produce on_message_edit. Fence actual changes
+        # immediately, but an unchanged embed update must not interrupt an entry.
+        if _value(payload, "cached_message") is not None:
+            current = normalize(_message_payload(updated), key[0])
+            if current["revision"] != previous["revision"]:
+                self._mark_invalid(key)
+            return
+        await self.observe(updated, kind="edit", reason="edit", edited=True)
 
     async def delete_raw(self, payload: Any) -> None:
         channel_id = _identifier(_value(payload, "channel_id"))

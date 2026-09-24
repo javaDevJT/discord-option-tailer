@@ -7,6 +7,7 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 ## Project index
 
 - [Execution failure diagnostics](docs/container.md#execution-failure-diagnostics): identify failed stages and broker operations using credential-safe message details and logs.
+- [Discord updates and message history](docs/container.md#discord-updates-and-message-history): distinguish unchanged notifications, actual edits, and prior evaluations.
 
 The [account monitoring guide](docs/container.md#account-balances-and-holdings) explains cached balances, account option holdings, and refresh timing.
 

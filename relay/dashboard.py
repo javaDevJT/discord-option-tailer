@@ -540,6 +540,12 @@ def _project_message(row, event):
         "embeds": _project_embeds(body.get("embeds")),
         "images": _project_message_images(row, body),
         "latest_event": latest_event,
+        "ingestion": {
+            "source": body.get("source") if isinstance(body.get("source"), str) and body["source"] in {"gateway", "browser", "export"} else "unknown",
+            "kind": body.get("ingestion") if isinstance(body.get("ingestion"), str) and body["ingestion"] in {"live", "baseline", "edit", "import"} else "unknown",
+            "reason": "edit" if body.get("ingestion_reason") == "edit" else None,
+            "edited_timestamp": _safe_timestamp(body.get("edited_timestamp")),
+        },
     }
 
 
@@ -1154,7 +1160,15 @@ class DashboardApp:
                 event = None
                 if row["event_id"] is not None:
                     event = {"id": row["event_id"], "state": row["event_state"], "reason": row["event_reason"], "decision": row["event_decision"], "created_at": row["event_created_at"]}
-                items.append(_project_message(row, event))
+                item = _project_message(row, event)
+                if item["latest_event"] and item["latest_event"]["state"] == "context":
+                    previous = connection.execute(
+                        "SELECT * FROM events WHERE message_id=? AND revision<>? AND decision IS NOT NULL ORDER BY id DESC LIMIT 1",
+                        (row["id"], row["revision"]),
+                    ).fetchone()
+                    if previous is not None:
+                        item["previous_evaluation"] = _project_event(previous)
+                items.append(item)
             return {"items": items, "next_offset": offset + limit if more else None}
 
         result, _ = self._ledger(config, read, {"items": [], "next_offset": None})

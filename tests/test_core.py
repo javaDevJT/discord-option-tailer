@@ -170,6 +170,22 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.interpreter.calls, [])
         self.assertEqual(self.broker.submissions, [])
 
+    async def test_context_reasons_identify_the_actual_gate(self):
+        cases = [
+            (self.message() | {"ingestion": "baseline"}, "signals", "history baseline"),
+            (self.message(source="export") | {"ingestion": "import"}, "signals", "imported message"),
+            (self.message(), "context", "channel is configured for context"),
+            (self.message(edited_timestamp=NOW.isoformat()), "signals", "message was edited"),
+        ]
+        for message, role, reason in cases:
+            with self.subTest(reason=reason):
+                self.config["channels"][0]["role"] = role
+                result = await self.engine.handle(message)
+                self.assertEqual(result["state"], "context")
+                self.assertIn(reason, result["reason"])
+        self.assertEqual(self.interpreter.calls, [])
+        self.assertEqual(self.broker.submissions, [])
+
     async def test_history_analysis_and_context_channel_never_submit(self):
         result = await self.engine.handle(self.message() | {"ingestion": "import"}, analyze_history=True)
         self.assertEqual(result["state"], "held")

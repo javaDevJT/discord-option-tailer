@@ -15,7 +15,7 @@ from relay.ingest import normalize
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def seed_dashboard(base, template):
+def seed_dashboard(base, template, *, include_revised=False):
     base = Path(base)
     config = json.loads(Path(template).read_text())
     config.update(mode="paper", database=str(base / "state/demo.sqlite3"),
@@ -117,6 +117,19 @@ def seed_dashboard(base, template):
                 with store.db:
                     store.db.execute("UPDATE orders SET status='filled',broker_id='paper-demo',filled_quantity=1,filled_notional='50' WHERE id='demo-order'")
                     store.db.execute("INSERT INTO positions VALUES (?,?,?,?)", (channel["source_group"], json.dumps(contract), 1, "0.50"))
+        if include_revised:
+            revised = normalize({"id": "1545700000000000099", "channel_id": config["channels"][0]["id"],
+                                 "author_id": config["channels"][0]["authors"][0], "timestamp": now,
+                                 "content": "DEMO: entry changed during evaluation", "source": "gateway"})
+            revised.update(source_group=config["channels"][0]["source_group"], ingestion="live")
+            store.observe(revised)
+            store.record(revised, "held", "the original action message was revised",
+                         {"action": "OPEN", "contract": contract, "evaluation_timing": {"model_duration_seconds": 0,
+                          "posted_to_decision_seconds": .81, "evaluator": "rules", "route": "direct"}})
+            revised = normalize({**revised, "edited_timestamp": now})
+            revised.update(source_group=config["channels"][0]["source_group"], ingestion="baseline", ingestion_reason="edit")
+            store.observe(revised)
+            store.record(revised, "context", "message was edited; prior revision invalidated, no new execution")
         with store.db:
             store.db.execute("""INSERT INTO events(message_id,revision,state,reason,decision,created_at)
                 VALUES (?,?,?,?,?,?)""", ("expiry:synthetic", "expiry-itm-v1:0", "held",
@@ -135,7 +148,7 @@ class DashboardUITests(unittest.TestCase):
     def test_rendered_messages_orders_filtering_and_mobile_layout(self):
         from playwright.sync_api import sync_playwright
         with tempfile.TemporaryDirectory() as temporary:
-            config = seed_dashboard(temporary, ROOT / "config.example.json")
+            config = seed_dashboard(temporary, ROOT / "config.example.json", include_revised=True)
             server = create_server(config, port=0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -149,6 +162,11 @@ class DashboardUITests(unittest.TestCase):
                     page.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
                     page.goto(origin, wait_until="networkidle")
                     page.locator("#messages-shell .message-content").filter(has_text="DEMO: bought SPY 600 calls at 0.50").wait_for()
+                    revised_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: entry changed during evaluation")
+                    revised_text = revised_card.inner_text()
+                    self.assertIn("Received via Gateway / Edit", revised_text)
+                    self.assertIn("Previous revision: OPEN / Held", revised_text)
+                    self.assertIn("the original action message was revised", revised_text)
                     recovery_card = page.locator("#messages-shell .message-card").filter(has_text="DEMO: missed SPY 600 call during downtime")
                     recovery_card.wait_for()
                     recovery_text = recovery_card.inner_text().lower()

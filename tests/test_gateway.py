@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from relay import gateway
+from relay.ingest import normalize as ingest_normalize
 
 
 GUILD = "100000000000000001"
@@ -203,6 +204,176 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.session_patch.stop()
         self.discord_patch.stop()
+
+    def _ready_runtime(self):
+        normalizer_patch = patch.object(gateway, "normalize", ingest_normalize)
+        normalizer_patch.start()
+        self.addCleanup(normalizer_patch.stop)
+        runtime = gateway._GatewayRuntime(_config(), None, None, None)
+        runtime.healthy = True
+        runtime.epoch = "gateway:fixture"
+        runtime.client = FakeClient()
+        runtime.client.started.set()
+        runtime.last_gateway_ack = time.monotonic()
+        return runtime
+
+    def _signal_message(self, identifier, description, *, edited_at=None, attachments=None):
+        message = FakeMessage(
+            identifier,
+            FakeChannel(CHANNEL_SIGNALS),
+            content="OPEN QQQ",
+            edited_at=edited_at,
+        )
+        message.embeds = [SimpleNamespace(to_dict=lambda: {"description": description})]
+        if attachments is not None:
+            message.attachments = attachments
+        return message
+
+    async def _live_signal(self, runtime, message):
+        await runtime.observe(message)
+        original = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(original["ingestion"], "live")
+        self.assertTrue(await runtime.verify(original))
+        return original
+
+    def _attachment(self, token):
+        return SimpleNamespace(
+            id="400000000000000001",
+            filename="chart.png",
+            url=f"https://cdn.discordapp.com/attachments/123/456/chart.png?ex={token}&hm={token}",
+            proxy_url=f"https://media.discordapp.net/attachments/123/456/chart.png?ex={token}&hm={token}",
+            size=10,
+            content_type="image/png",
+            width=10,
+            height=10,
+            description="chart",
+        )
+
+    async def test_cached_raw_and_full_noop_embed_update_preserve_live_signal(self):
+        runtime = self._ready_runtime()
+        description = "ENTRY QQQ 738C @ 1.00"
+        message = self._signal_message("500000000000000051", description)
+        original = await self._live_signal(runtime, message)
+        key = (CHANNEL_SIGNALS, original["id"])
+
+        await runtime.edit_raw(SimpleNamespace(
+            channel_id=CHANNEL_SIGNALS,
+            message_id=original["id"],
+            cached_message=message,
+            data={"embeds": [{"description": description}]},
+        ))
+        await runtime.observe(message, kind="edit", reason="edit", edited=True)
+
+        self.assertTrue(await runtime.verify(original))
+        self.assertNotIn(key, runtime.invalidated)
+        self.assertEqual(runtime.latest[key]["revision"], original["revision"])
+        self.assertIsNone(runtime.latest[key]["edited_timestamp"])
+        self.assertTrue(runtime.queue.empty())
+
+    async def test_uncached_raw_noop_embed_update_does_not_revise_live_signal(self):
+        runtime = self._ready_runtime()
+        description = "ENTRY QQQ 738C @ 1.00"
+        message = self._signal_message("500000000000000052", description)
+        original = await self._live_signal(runtime, message)
+        key = (CHANNEL_SIGNALS, original["id"])
+
+        await runtime.edit_raw(SimpleNamespace(
+            channel_id=CHANNEL_SIGNALS,
+            message_id=original["id"],
+            cached_message=None,
+            data={"embeds": [{"description": description}]},
+        ))
+
+        self.assertTrue(await runtime.verify(original))
+        self.assertNotIn(key, runtime.invalidated)
+        self.assertEqual(runtime.latest[key]["revision"], original["revision"])
+        self.assertIsNone(runtime.latest[key]["edited_timestamp"])
+        self.assertTrue(runtime.queue.empty())
+
+    async def test_signed_cdn_url_renewal_refreshes_media_without_revising_signal(self):
+        runtime = self._ready_runtime()
+        message = self._signal_message(
+            "500000000000000053",
+            "ENTRY QQQ 738C @ 1.00",
+            attachments=[self._attachment("old")],
+        )
+        original = await self._live_signal(runtime, message)
+        previous_transport_revision = original["transport_revision"]
+        renewed = dict(original["attachments"][0])
+        renewed["url"] = renewed["url"].replace("ex=old&hm=old", "ex=new&hm=new")
+        renewed["proxy_url"] = renewed["proxy_url"].replace("ex=old&hm=old", "ex=new&hm=new")
+
+        await runtime.edit_raw(SimpleNamespace(
+            channel_id=CHANNEL_SIGNALS,
+            message_id=original["id"],
+            cached_message=None,
+            data={"attachments": [renewed]},
+        ))
+        refreshed = await runtime.queue.get()
+        runtime.queue.task_done()
+
+        self.assertEqual(refreshed["revision"], original["revision"])
+        self.assertNotEqual(refreshed["transport_revision"], previous_transport_revision)
+        self.assertEqual(refreshed["attachments"][0]["url"], renewed["url"])
+        self.assertEqual(refreshed["ingestion"], "live")
+        self.assertTrue(await runtime.verify(original))
+
+    async def test_changed_embed_contract_or_price_still_invalidates_live_signal(self):
+        runtime = self._ready_runtime()
+        original = await self._live_signal(
+            runtime,
+            self._signal_message("500000000000000054", "ENTRY QQQ 738C @ 1.00"),
+        )
+        key = (CHANNEL_SIGNALS, original["id"])
+
+        await runtime.edit_raw(SimpleNamespace(
+            channel_id=CHANNEL_SIGNALS,
+            message_id=original["id"],
+            cached_message=None,
+            data={"embeds": [{"description": "ENTRY QQQ 739C @ 1.25"}]},
+        ))
+        changed = await runtime.queue.get()
+        runtime.queue.task_done()
+
+        self.assertFalse(await runtime.verify(original))
+        self.assertIn(key, runtime.invalidated)
+        self.assertNotEqual(changed["revision"], original["revision"])
+        self.assertEqual(changed["ingestion_reason"], "edit")
+        self.assertIsNotNone(changed["edited_timestamp"])
+
+    async def test_explicit_edit_timestamp_blocks_and_duplicate_cannot_revive_signal(self):
+        runtime = self._ready_runtime()
+        description = "ENTRY QQQ 738C @ 1.00"
+        original = await self._live_signal(
+            runtime, self._signal_message("500000000000000055", description)
+        )
+        key = (CHANNEL_SIGNALS, original["id"])
+        edited_at = _when(5)
+        edited = self._signal_message(original["id"], description, edited_at=edited_at)
+
+        await runtime.observe(edited, kind="edit", reason="edit", edited=True)
+        revised = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(datetime.fromisoformat(revised["edited_timestamp"]), edited_at)
+        self.assertFalse(await runtime.verify(original))
+        self.assertIn(key, runtime.invalidated)
+
+        await runtime.edit_raw(SimpleNamespace(
+            channel_id=CHANNEL_SIGNALS,
+            message_id=original["id"],
+            cached_message=edited,
+            data={
+                "embeds": [{"description": description}],
+                "edited_timestamp": edited_at.isoformat(),
+            },
+        ))
+        await runtime.observe(edited, kind="edit", reason="edit", edited=True)
+
+        self.assertFalse(await runtime.verify(original))
+        self.assertIn(key, runtime.invalidated)
+        self.assertEqual(runtime.latest[key]["revision"], revised["revision"])
+        self.assertTrue(runtime.queue.empty())
 
     async def test_partial_raw_edit_and_bulk_delete_invalidate_retained_alerts(self):
         runtime = gateway._GatewayRuntime(_config(), None, None, None)

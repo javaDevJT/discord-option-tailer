@@ -1032,7 +1032,18 @@ function relayReadTimeoutSignal() {
         append(decisionPanel, node("span", "no-decision", "No interpretation recorded"));
       }
 
-      const related = getOrdersForMessage(messageId);
+      const ingestion = message.ingestion || {};
+    if (ingestion.source && ingestion.source !== "unknown") {
+      const cause = ingestion.reason === "edit" || ingestion.edited_timestamp ? "edit" : ingestion.kind;
+      append(decisionPanel, node("p", "record-meta", `Received via ${humanize(ingestion.source)} / ${humanize(cause || "unknown")}`));
+    }
+    const previous = message.previous_evaluation;
+    if (previous) {
+      append(decisionPanel, node("p", "record-meta", `Previous revision: ${decisionActionLabel(previous)} / ${humanize(previous.state)}`));
+      append(decisionPanel, node("p", "decision-reason", decisionReason(previous)));
+      renderEvaluationTiming(decisionPanel, previous);
+    }
+    const related = getOrdersForMessage(messageId);
       if (related.length) {
         const relatedOrders = node("div", "related-orders");
         related.forEach((order) => {

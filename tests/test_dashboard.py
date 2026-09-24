@@ -233,6 +233,30 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 2)
         self.assertEqual(payload["next_offset"], 2)
 
+    def test_context_revision_keeps_previous_evaluation_and_ingestion_provenance(self):
+        connection = sqlite3.connect(self.database)
+        message_id = "1545700000000000001"
+        body = json.loads(connection.execute("SELECT body FROM messages WHERE id=?", (message_id,)).fetchone()[0])
+        edited_at = datetime.now(UTC).isoformat()
+        body.update(source="gateway", ingestion="baseline", ingestion_reason="edit", edited_timestamp=edited_at)
+        connection.execute("UPDATE messages SET revision=?,body=? WHERE id=?",
+                           ("changed", json.dumps(body), message_id))
+        connection.execute(
+            "INSERT INTO events(message_id,revision,state,reason,decision,created_at) VALUES (?,?,?,?,?,?)",
+            (message_id, "changed", "context", "message was edited", None, edited_at))
+        connection.commit()
+        connection.close()
+        status, _, payload = self.request("/api/messages?q=entry%20one")
+        self.assertEqual(status, 200)
+        item = payload["items"][0]
+        self.assertEqual(item["latest_event"]["state"], "context")
+        self.assertEqual(item["ingestion"], {"source": "gateway", "kind": "baseline", "reason": "edit", "edited_timestamp": edited_at})
+        self.assertEqual(item["previous_evaluation"]["state"], "held")
+        self.assertEqual(item["previous_evaluation"]["decision"]["action"], "OPEN")
+        self.assertEqual(item["previous_evaluation"]["reason"], "fixture hold")
+        self.assertNotIn("account_number", json.dumps(item))
+        self.assertNotIn("secret.invalid", json.dumps(item))
+
     def test_reconciled_unknown_event_projects_terminal_state_without_duplicate_message(self):
         connection = sqlite3.connect(self.database)
         decision = json.loads(connection.execute("SELECT decision FROM events WHERE id=2").fetchone()[0])

@@ -807,7 +807,17 @@ class Engine:
             return {"message_id": message["id"], "state": "duplicate", "reason": "already observed"}
         context_only = observed == "edit" or message.get("edited_timestamp") or message.get("ingestion") != "live" or message.get("source") not in {"browser", "gateway"} or channel["role"] != "signals"
         if context_only and not analyze_history:
-            return self.store.record(message, "context", "baseline, import, edit, or context channel; no execution")
+            if observed == "edit" or message.get("edited_timestamp") or message.get("ingestion_reason") == "edit":
+                reason = "message was edited; prior revision invalidated, no new execution"
+            elif channel["role"] != "signals":
+                reason = "channel is configured for context only; no execution"
+            elif message.get("source") not in {"browser", "gateway"}:
+                reason = "imported message; no live execution"
+            elif message.get("ingestion") == "baseline":
+                reason = "startup or reconnect history baseline; no live execution"
+            else:
+                reason = "message was not received as a live event; no execution"
+            return self.store.record(message, "context", reason)
         if self.interpreter is None:
             return self.store.record(message, "context", "no interpreter configured")
         started = time.monotonic()

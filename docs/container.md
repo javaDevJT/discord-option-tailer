@@ -196,6 +196,12 @@ docker compose start
 
 Pausing and stopping are safe operational controls for new work. Preserve the Docker volume when restarting or moving the service; it contains the browser profile, Codex subscription state, Robinhood OAuth state, configuration, and mode-specific ledgers.
 
+### Discord updates and message history
+
+Discord can publish `MESSAGE_UPDATE` for an unchanged embed or a renewed attachment URL. The gateway compares normalized content before inventing an edit timestamp or invalidating a pending decision. An unchanged update preserves the original live/baseline eligibility, source revision and existing invalidation state; refreshed media URLs can be retained without creating a second signal. Changed text, embed contents, attachment identity or an explicit edit timestamp still invalidate the old revision. This adds no debounce delay to fresh entries.
+
+Messages show their gateway/browser/import provenance and whether they arrived live, as history or as edits. Context results name the actual gate. When an edited revision replaces a message that was already evaluated, the card also shows the prior action, hold reason and timing. An edited message showing context therefore does not hide its earlier evaluation.
+
 ### Execution failure diagnostics
 
 Unexpected execution failures retain an `execution_diagnostic` on the message decision, visible in the dashboard's message details and emitted to the worker log. The event reason includes the failing stage, exception class, safe error code, broker operation/tool when known, and last internal source location. The structured field adds up to eight internal frames and three causes.
