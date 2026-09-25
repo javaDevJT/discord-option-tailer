@@ -324,6 +324,17 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrokerError, "schema changed"):
             self.broker._qualified("get_accounts")
 
+    async def test_expiry_diagnostics_ignore_malformed_other_chain_rows(self):
+        async def pages(name, args, key):
+            return [self.chain] if name == "get_option_chains" else [self.instrument, {"chain_id": "other"}]
+
+        self.broker._pages = AsyncMock(side_effect=pages)
+        diagnostic = {}
+        resolved = await self.broker.nearest_expiry(self.contract, diagnostic=diagnostic)
+        self.assertEqual(resolved, self.contract)
+        self.assertEqual(diagnostic["returned_expiries"], [self.contract["expiry"]])
+        self.assertEqual(diagnostic["requested_date_instruments"], 1)
+
     async def test_nearest_expiry_uses_listed_matching_standard_contracts(self):
         dates = ["2026-09-18", "2026-09-08", "2026-09-11"]
         chain = self.chain | {"expiration_dates": dates}
@@ -342,7 +353,13 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         request = self.contract | {"expiry": "2026-09-08"}
         self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-08")
         rows[1]["tradability"] = "untradable"
-        self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-11")
+        diagnostic = {}
+        self.assertEqual((await self.broker.nearest_expiry(request, diagnostic=diagnostic))["expiry"], "2026-09-11")
+        self.assertEqual(diagnostic["requested_expiry"], "2026-09-08")
+        self.assertEqual(diagnostic["selected_expiry"], "2026-09-11")
+        self.assertEqual(diagnostic["requested_date_instruments"], 1)
+        self.assertEqual(diagnostic["requested_date_eligible"], 0)
+        self.assertEqual(diagnostic["rejected"], {"untradable": 1})
         rows[2]["strike_price"] = "501"
         self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-18")
         rows[0]["type"] = "put"

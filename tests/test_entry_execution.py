@@ -56,7 +56,7 @@ class EntryExecutionTests(unittest.IsolatedAsyncioTestCase):
         original_quote = self.broker.quote
         original_submit = self.broker.submit
 
-        async def nearest(contract):
+        async def nearest(contract, **kwargs):
             self.assertIsNotNone(active)
             calls.append(("expiry", active))
             return dict(fixtures.CONTRACT)
@@ -117,7 +117,7 @@ class EntryExecutionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 stopped.set()
 
-        async def nearest(contract):
+        async def nearest(contract, **kwargs):
             await started.wait()
             await asyncio.Event().wait()
 
@@ -145,7 +145,7 @@ class EntryExecutionTests(unittest.IsolatedAsyncioTestCase):
             snapshot_started.set()
             return self.broker.account
 
-        async def nearest(contract):
+        async def nearest(contract, **kwargs):
             await asyncio.wait_for(snapshot_started.wait(), .2)
             return dict(fixtures.CONTRACT)
 

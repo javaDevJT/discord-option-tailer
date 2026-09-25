@@ -40,9 +40,20 @@ EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
-    "evaluation_timing", "profit_only", "exit_evaluation", "stop_evaluation", "order_reconciliation",
+    "evaluation_timing", "entry_preparation", "expiry_resolution", "profit_only", "exit_evaluation",
+    "stop_evaluation", "order_reconciliation",
     "execution_diagnostic",
 )
+ENTRY_PREPARATION_ROUTES = frozenset({"prepared", "fresh"})
+ENTRY_PREPARATION_REASONS = frozenset({
+    "prepared", "no_watch_cached", "no_matching_watch", "watch_preparing", "watch_preparation_failed",
+    "watch_invalidated", "watch_expired", "prepared_cache_missing", "prepared_cache_expired",
+    "prepared_metadata_invalid", "chain_open_unconfirmed", "invalid_limit_price", "tick_metadata_invalid",
+    "broker_unsupported", "not_live",
+})
+EXPIRY_REJECTION_REASONS = frozenset({
+    "wrong_chain", "inactive", "untradable", "non_equity", "nonstandard_multiplier", "contract_mismatch",
+})
 SIZING_FIELDS = (
     "method", "source_group", "equity", "parse_confidence", "risk_fraction", "confidence_cap_fraction",
     "budget", "binding_limit", "premium_risk_per_contract", "allocated_premium_risk",
@@ -300,6 +311,16 @@ def _safe_timestamp(value):
     return timestamp if _parse_iso(timestamp) is not None else None
 
 
+def _safe_date(value):
+    rendered = _safe_text(value, 10)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", rendered):
+        return None
+    try:
+        return rendered if datetime.fromisoformat(rendered).date().isoformat() == rendered else None
+    except ValueError:
+        return None
+
+
 def _project_recovery_quote(value):
     quote = _json_object(value)
     result = {}
@@ -455,6 +476,66 @@ def _project_recovery(value):
     return result
 
 
+def _project_expiry_resolution(value):
+    resolution = _json_object(value)
+    result = {}
+    for key in ("requested_expiry", "selected_expiry"):
+        if key in resolution:
+            expiry = _safe_date(resolution[key])
+            if expiry is not None:
+                result[key] = expiry
+    for key in ("listed_expiries", "returned_expiries"):
+        if key in resolution:
+            dates = []
+            for item in _json_list(resolution[key])[:16]:
+                expiry = _safe_date(item)
+                if expiry is not None:
+                    dates.append(expiry)
+            result[key] = dates
+    for key in ("requested_date_instruments", "requested_date_eligible"):
+        count = resolution.get(key)
+        if type(count) is int and 0 <= count <= 1_000_000:
+            result[key] = count
+    rejected = _json_object(resolution.get("rejected"))
+    if rejected:
+        result["rejected"] = {
+            key: count for key, count in rejected.items()
+            if key in EXPIRY_REJECTION_REASONS and type(count) is int and 0 <= count <= 1_000_000
+        }
+    return result or None
+
+
+def _project_entry_preparation(value):
+    preparation = _json_object(value)
+    result = {}
+    route = _safe_text(preparation.get("route"), 16)
+    if route in ENTRY_PREPARATION_ROUTES:
+        result["route"] = route
+    reason = _safe_text(preparation.get("reason"), 64)
+    if reason in ENTRY_PREPARATION_REASONS:
+        result["reason"] = reason
+    watch_message_id = preparation.get("watch_message_id")
+    if isinstance(watch_message_id, str) and re.fullmatch(r"\d{17,20}", watch_message_id):
+        result["watch_message_id"] = watch_message_id
+    for key in ("watch_age_seconds", "prepared_age_seconds"):
+        age = preparation.get(key)
+        if type(age) in (int, float) and 0 <= age <= 315_360_000 and math.isfinite(age):
+            result[key] = age
+    attempted_at = _safe_timestamp(preparation.get("attempted_at"))
+    if attempted_at is not None:
+        result["attempted_at"] = attempted_at
+    attempts = preparation.get("attempts")
+    if type(attempts) is int and 1 <= attempts <= 1000:
+        result["attempts"] = attempts
+    failure = project_execution_diagnostic(preparation.get("failure"))
+    if failure:
+        result["failure"] = failure
+    expiry_resolution = _project_expiry_resolution(preparation.get("expiry_resolution"))
+    if expiry_resolution is not None:
+        result["expiry_resolution"] = expiry_resolution
+    return result or None
+
+
 def _project_decision(value):
     decision = _json_object(value)
     if not decision:
@@ -474,6 +555,14 @@ def _project_decision(value):
             result[key] = _project_recovery(current)
         elif key == "entry_evaluation":
             result[key] = _project_entry_evaluation(current)
+        elif key == "entry_preparation":
+            projected = _project_entry_preparation(current)
+            if projected is not None:
+                result[key] = projected
+        elif key == "expiry_resolution":
+            projected = _project_expiry_resolution(current)
+            if projected is not None:
+                result[key] = projected
         elif key == "execution_diagnostic":
             result[key] = project_execution_diagnostic(current)
         elif key == "evaluation_timing":

@@ -64,6 +64,39 @@ class WatchBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.now += timedelta(seconds=61)
         self.assertIsNone(self.broker.prepared_entry(self.contract, ".95"))
 
+    async def test_zero_cutoff_tick_schedule_can_be_prepared(self):
+        # Captured Robinhood option metadata uses a zero cutoff for penny ticks.
+        self.instrument["min_ticks"] = {
+            "above_tick": "0.01", "below_tick": "0.01", "cutoff_price": "0.00",
+        }
+        quote = await self.broker.quote(self.contract)
+        self.assertEqual(quote["tick_size"], "0.01")
+        await self.broker.prewarm_entry(self.contract)
+        prepared = self.broker.prepared_entry(self.contract, "1.40")
+        self.assertEqual(prepared["tick_size"], "0.01")
+
+    async def test_invalid_tick_schedules_remain_rejected(self):
+        for field, value in (("above_tick", "0"), ("below_tick", "-0.01"), ("cutoff_price", "-1")):
+            with self.subTest(field=field):
+                self.instrument["min_ticks"] = {
+                    "above_tick": "0.01", "below_tick": "0.01", "cutoff_price": "0.00",
+                } | {field: value}
+                with self.assertRaises(BrokerError):
+                    await self.broker.prewarm_entry(self.contract)
+
+    async def test_prepared_cache_explains_unavailable_and_ready_states(self):
+        diagnostic = {}
+        self.assertIsNone(self.broker.prepared_entry(self.contract, "1", diagnostic=diagnostic))
+        self.assertEqual(diagnostic["reason"], "prepared_cache_missing")
+        await self.broker.prewarm_entry(self.contract)
+        self.assertIsNotNone(self.broker.prepared_entry(self.contract, "1", diagnostic=diagnostic))
+        self.assertEqual(diagnostic["route"], "prepared")
+        self.assertEqual(diagnostic["prepared_age_seconds"], 0)
+        self.now += timedelta(seconds=61)
+        self.assertIsNone(self.broker.prepared_entry(self.contract, "1", diagnostic=diagnostic))
+        self.assertEqual(diagnostic["reason"], "prepared_cache_expired")
+        self.assertEqual(diagnostic["route"], "fresh")
+
     async def test_review_quote_invalidity_prevents_placement(self):
         await self.broker.prewarm_entry(self.contract)
         self.broker.snapshot = AsyncMock(return_value=dict(

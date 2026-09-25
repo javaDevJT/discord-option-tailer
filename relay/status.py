@@ -11,7 +11,7 @@ from pathlib import Path
 _FAILURE_STAGES = frozenset({
     "execution", "planning", "snapshot", "quote", "contract_resolution",
     "source_verification", "order_reservation", "submission", "result_recording",
-    "recovery", "expiry", "stop", "stop_submission", "reconciliation",
+    "recovery", "expiry", "stop", "stop_submission", "reconciliation", "watch_preparation",
 })
 _BROKER_OPERATIONS = frozenset({
     "snapshot", "quote", "nearest_expiry", "prepare_contract", "prepare_entry",

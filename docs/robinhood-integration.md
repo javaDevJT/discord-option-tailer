@@ -33,6 +33,14 @@ Discovery stores only observed schema metadata for known tools in owner-only `ro
 
 Account equity uses the portfolio total, not only the stock/ETF component. Spendable funds are constrained by reported and unleveraged buying power. Account snapshot age starts at the beginning of its fetch; option quotes use the provider's timestamp. Session gating uses the installed exchange calendar and conservatively stops at 16:00 New York time.
 
+## Prepared-entry diagnostics
+
+An entry's message card shows whether it used prepared watch metadata or fetched a fresh quote, plus the fallback reason. The saved diagnostic includes the matching watch message, watch/cache age, preparation attempt time and count, and a sanitized failure code and source frame when preparation failed. Background preparation failures are also logged. Missing, expired, invalid, or unavailable caches remain distinguishable; no provider response bodies, exception messages, or credentials are published.
+
+Expiry diagnostics show the requested and selected dates, bounded lists of listed/returned dates, and counts explaining whether matching instruments for the requested day were absent or rejected. These are broker lookup observations, not a guarantee that the publisher intended the selected expiry. A later-expiry ask should not be interpreted as movement in the same-day contract.
+
+Watch-only shorthand such as `QQQ740P` and `QQQ $740P` prepares the same contract metadata. It cannot authorize an order. A tick schedule may legitimately have a zero price cutoff; its actual price increments must remain positive. Prepared entry still requires a fresh account snapshot, current watch/source checks, a bounded limit price, broker review, and the existing execution permissions. It does not guarantee sub-second submission. Older decisions without these diagnostics are left unchanged.
+
 ## Uncertain orders and restart recovery
 
 Uncertain buys are reconciled before startup accepts fresh messages and by a separate background worker while running. A known broker UUID is looked up directly. A lost placement response can instead be resolved only when one agentic broker order matches the persisted contract, side/effect, quantity, limit, order type and submission window on the bound account. Matching does not resend the buy. Manual holdings alone do not establish source ownership; missing or ambiguous evidence keeps the order blocked.

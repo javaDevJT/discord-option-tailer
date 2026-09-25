@@ -772,13 +772,23 @@ class Engine:
         if source_day != self.clock().astimezone(EASTERN).date():
             raise Hold("an older entry without an explicit expiry cannot roll into a new contract")
         requested = canonical_contract(dict(contract, expiry=source_day.isoformat()))
-        warmed = self.watches.match(message, decision)
+        preparation = decision.setdefault("entry_preparation", {})
+        warmed = self.watches.match(message, decision, diagnostic=preparation)
         if warmed:
             prepare = getattr(self.broker, "prepared_entry", None)
             ceiling = money(decision.get("alert_price"), positive=True) * (1 + money(self.config["risk"]["max_chase_fraction"]))
-            if not callable(prepare) or prepare(warmed, ceiling) is None:
+            if not callable(prepare):
+                preparation.update(route="fresh", reason="broker_unsupported")
                 warmed = None
-        resolved = warmed or canonical_contract(await self.measure(decision, "contract_resolution_seconds", self.broker.nearest_expiry(requested)))
+            elif prepare(warmed, ceiling, diagnostic=preparation) is None:
+                warmed = None
+        if warmed:
+            resolved = warmed
+            if preparation.get("expiry_resolution"):
+                decision["expiry_resolution"] = dict(preparation["expiry_resolution"])
+        else:
+            resolution = decision.setdefault("expiry_resolution", {})
+            resolved = canonical_contract(await self.measure(decision, "contract_resolution_seconds", self.broker.nearest_expiry(requested, diagnostic=resolution)))
         if warmed:
             decision.setdefault("evaluation_timing", {})["watch_contract_prepared"] = True
         if any(resolved[key] != requested[key] for key in ("symbol", "strike", "option_type")) or resolved["expiry"] < requested["expiry"]:
@@ -1105,12 +1115,22 @@ class Engine:
         side = "buy" if action == "OPEN" else "sell"
 
         prepared = None
-        watched = self.watches.match(message, decision, with_source=True) if action == "OPEN" else None
+        preparation = decision.setdefault("entry_preparation", {}) if action == "OPEN" else None
+        # Preserve the failed cache/lookup diagnosis from nearest-expiry resolution.
+        watch_diagnostic = {}
+        watched = self.watches.match(message, decision, with_source=True, diagnostic=watch_diagnostic) if action == "OPEN" else None
+        if preparation is not None and not preparation:
+            preparation.update(watch_diagnostic)
         if self.mode == "live" and action == "OPEN" and watched:
             ceiling = money(decision.get("alert_price"), positive=True) * (1 + money(risk["max_chase_fraction"]))
             prepare = getattr(self.broker, "prepared_entry", None)
             if callable(prepare):
-                prepared = prepare(contract, ceiling)
+                previous_reason = preparation.get("reason")
+                prepared = prepare(contract, ceiling, diagnostic=preparation)
+                if prepared is None and previous_reason == "prepared_cache_expired" and preparation.get("reason") == "prepared_cache_missing":
+                    preparation["reason"] = previous_reason
+            else:
+                preparation.update(route="fresh", reason="broker_unsupported")
             if prepared is not None:
                 if (canonical_contract(prepared.get("contract")) != contract or prepared.get("tradable") is not True
                         or prepared.get("multiplier") != 100 or prepared.get("currency") != "USD"
@@ -1119,13 +1139,20 @@ class Engine:
                 tick = money(prepared.get("tick_size"), positive=True)
                 capped_price = (ceiling / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
                 # Recheck the schedule when rounding crosses a premium threshold.
-                prepared = prepare(contract, capped_price)
+                prepared = prepare(contract, capped_price, diagnostic=preparation)
                 if prepared is not None:
                     tick = money(prepared.get("tick_size"), positive=True)
                     capped_price = (capped_price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
                     if capped_price <= 0 or capped_price > ceiling:
                         raise Hold("entry chase ceiling does not permit a valid limit price")
                     decision.setdefault("evaluation_timing", {})["watch_contract_prepared"] = True
+                    preparation.update(route="prepared", reason="prepared")
+        elif preparation is not None and self.mode != "live":
+            preparation.update(route="fresh", reason="not_live")
+        if preparation is not None and prepared is None:
+            preparation["route"] = "fresh"
+            if preparation.get("reason") == "prepared":
+                preparation.update(watch_diagnostic)
 
         async def checked_quote():
             if prepared is not None:

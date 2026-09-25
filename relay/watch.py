@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 import time
 
 from .core import EASTERN, Hold, canonical_contract, channel_allows_author, instant
 from .entry_rules import _normalize_expiry, _source_date, option_matches, visible_text
+from .status import execution_failure
 
 
 def watch_candidate(message):
@@ -14,7 +16,9 @@ def watch_candidate(message):
     if (not re.search(r"\b(?:on\s+watch|eyes\s+on|watching)\b", text, re.I)
             or re.search(r"\b(?:test|example|cancel(?:led)?|no\s+longer|entry|open|bought|bto)\b", text, re.I)):
         return None
-    contracts = option_matches(re.sub(r"\b(calls|puts)\b", lambda m: m.group(0)[:-1], text, flags=re.I))
+    # Watch shorthand such as QQQ740P only prepares metadata, never an order.
+    contract_text = re.sub(r"\b([A-Z]{1,6})(\$?\d+(?:\.\d+)?[CP])\b", r"\1 \2", text)
+    contracts = option_matches(re.sub(r"\b(calls|puts)\b", lambda m: m.group(0)[:-1], contract_text, flags=re.I))
     # "At the ask today" dates the observed purchase, not the option's expiry.
     expiry_text = re.sub(r"\bat\s+(?:the\s+)?ask\s+today\b", "at the ask", text, flags=re.I)
     expiry, invalid = _normalize_expiry(expiry_text, message)
@@ -71,13 +75,19 @@ class WatchEntries:
         task.add_done_callback(self.tasks.discard)
 
     async def _prepare(self, entry):
+        diagnostic = {"route": "fresh", "reason": "watch_preparing",
+                      "watch_message_id": entry["message"]["id"],
+                      "attempts": entry.get("diagnostic", {}).get("attempts", 0) + 1,
+                      "attempted_at": self.engine.clock().isoformat()}
+        entry["diagnostic"] = diagnostic
         try:
             if not self._current(entry):
                 return
             requested = entry["requested"]
             if requested["expiry"] == "nearest":
                 anchored = canonical_contract(requested | {"expiry": entry["day"]})
-                contract = canonical_contract(await self.engine.broker.nearest_expiry(anchored))
+                resolution = diagnostic.setdefault("expiry_resolution", {})
+                contract = canonical_contract(await self.engine.broker.nearest_expiry(anchored, diagnostic=resolution))
                 if (any(contract[k] != anchored[k] for k in ("symbol", "strike", "option_type"))
                         or contract["expiry"] < anchored["expiry"]):
                     raise Hold("watch expiry resolution changed the intended contract")
@@ -86,37 +96,67 @@ class WatchEntries:
             await self.engine.broker.prewarm_entry(contract)
             if self._current(entry):
                 entry["contract"] = contract
+                diagnostic["reason"] = "prepared"
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             # Preparation failure falls back to the existing fresh execution path.
             entry["contract"] = None
+            diagnostic["reason"] = "watch_preparation_failed"
+            _, diagnostic["failure"] = execution_failure(error, stage="watch_preparation")
         finally:
             entry["refresh_at"] = time.monotonic() + 30
             entry["busy"] = False
 
-    def match(self, message, decision, *, with_source=False):
+    def match(self, message, decision, *, with_source=False, diagnostic=None):
         if decision.get("action") != "OPEN":
             return None
         requested = decision.get("contract") or {}
         group = self.engine.channels.get(str(message.get("channel_id")), {}).get("source_group")
+        if diagnostic is not None:
+            diagnostic.clear()
+            diagnostic.update(route="fresh", reason="no_matching_watch" if self.entries else "no_watch_cached")
+
+        def report(entry, reason=None):
+            if diagnostic is not None:
+                diagnostic.clear()
+                diagnostic.update(copy.deepcopy(entry.get("diagnostic", {})))
+                diagnostic.update(route="fresh", watch_message_id=entry["message"]["id"],
+                                  watch_age_seconds=max(0, (instant(message["timestamp"]) - instant(entry["message"]["timestamp"])).total_seconds()))
+                diagnostic.setdefault("reason", "watch_preparing")
+                if reason:
+                    diagnostic["reason"] = reason
+
         for entry in reversed(list(self.entries.values())):
             contract = entry["contract"]
-            if (not contract or entry["group"] != group or not self._current(entry)
+            if (entry["group"] != group
                     or entry["day"] != _source_date(message)
-                    or instant(entry["message"]["timestamp"]) > instant(message["timestamp"])):
-                continue
-            try:
-                normalized = canonical_contract(requested | {"expiry": contract["expiry"]})
-            except Hold:
-                continue
-            if normalized != contract:
+                or instant(entry["message"]["timestamp"]) > instant(message["timestamp"])):
                 continue
             expiry = requested.get("expiry")
             if expiry == "nearest" and entry["requested"]["expiry"] != "nearest":
                 continue
-            if expiry != "nearest" and expiry != contract["expiry"]:
+            if contract and expiry != "nearest" and expiry != contract["expiry"]:
                 continue
+            if not contract and expiry != "nearest" and entry["requested"]["expiry"] not in {"nearest", expiry}:
+                continue
+            try:
+                candidate = contract or canonical_contract(entry["requested"] | {"expiry": entry["day"]})
+                normalized = canonical_contract(requested | {"expiry": candidate["expiry"]})
+            except Hold:
+                continue
+            if normalized != candidate:
+                continue
+            # Retain the newest relevant failure unless an older usable watch wins.
+            if diagnostic is not None and "watch_message_id" not in diagnostic:
+                report(entry)
+            if not self._current(entry):
+                if diagnostic is not None and diagnostic.get("watch_message_id") == entry["message"]["id"]:
+                    diagnostic["reason"] = "watch_expired" if time.monotonic() >= entry["expires"] else "watch_invalidated"
+                continue
+            if not contract:
+                continue
+            report(entry, "prepared")
             if with_source:
                 return {"message_id": entry["message"]["id"], "revision": entry["message"]["revision"]}
             return dict(contract)

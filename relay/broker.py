@@ -308,7 +308,7 @@ class PaperBroker:
                 "account_id": "paper", "timestamp": timestamp.astimezone(timezone.utc).isoformat(),
                 "currency": "USD", "simulated": True}
 
-    async def nearest_expiry(self, contract):
+    async def nearest_expiry(self, contract, *, diagnostic=None):
         """Resolve an omitted entry expiry using only explicit paper fixtures."""
         target = _contract_key(contract)
         path = self.config.get("quotes_file")
@@ -1584,10 +1584,12 @@ class RobinhoodBroker(RobinhoodMCP):
         return result
 
     @_scope_operation
-    async def nearest_expiry(self, contract):
+    async def nearest_expiry(self, contract, *, diagnostic=None):
         """Choose the first listed standard contract at the requested strike/type."""
         target = _contract_key(contract)
         requested_day = datetime.strptime(target[1], "%Y-%m-%d").date()
+        if diagnostic is not None:
+            diagnostic.update(requested_expiry=target[1])
         # One bounded near-term query removes the chain dependency for daily/weekly entries.
         # Later dates still use individual exact queries, with complete pagination.
         prefetched_dates = [(requested_day + timedelta(days=day)).isoformat() for day in range(7)]
@@ -1609,6 +1611,28 @@ class RobinhoodBroker(RobinhoodMCP):
         ]
 
         eligible_ids = {chain["id"] for chain in eligible_chains}
+        if diagnostic is not None:
+            requested_rows = [row for row in instruments if row.get("expiration_date") == target[1]]
+            rejected, eligible = {}, 0
+            for row in requested_rows:
+                reason = (
+                    "wrong_chain" if row["chain_id"] not in eligible_ids else
+                    "inactive" if row.get("state") != "active" else
+                    "untradable" if row.get("tradability") != "tradable" else
+                    "non_equity" if row["underlying_type"] != "equity" else
+                    "nonstandard_multiplier" if _decimal(row["trade_value_multiplier"], "multiplier") != 100 else
+                    "contract_mismatch" if _contract_key(self._instrument_contract(row)) != target else None
+                )
+                if reason:
+                    rejected[reason] = rejected.get(reason, 0) + 1
+                else:
+                    eligible += 1
+            diagnostic.update(
+                listed_expiries=sorted({expiry for chain in eligible_chains for expiry in (chain["expiration_dates"] or []) if expiry >= target[1]})[:16],
+                returned_expiries=sorted({row["expiration_date"] for row in instruments if isinstance(row.get("expiration_date"), str)})[:16],
+                requested_date_instruments=len(requested_rows), requested_date_eligible=eligible,
+                rejected=rejected,
+            )
         expiries = sorted({
             expiry for chain in eligible_chains
             for expiry in (chain["expiration_dates"] or [])
@@ -1647,6 +1671,8 @@ class RobinhoodBroker(RobinhoodMCP):
                 raise BrokerError("Option expiration is ambiguous across chains")
             if candidates:
                 resolved = dict(contract, expiry=expiry)
+                if diagnostic is not None:
+                    diagnostic["selected_expiry"] = expiry
                 self._remember_execution_handoff(resolved, *candidates[0])
                 return resolved
         raise BrokerError("No listed expiration for the requested option")
@@ -1823,9 +1849,12 @@ class RobinhoodBroker(RobinhoodMCP):
         ticks = instrument.get("min_ticks") or chain.get("min_ticks")
         if not isinstance(ticks, dict):
             raise BrokerError("Option tick metadata is missing")
-        for field in ("above_tick", "below_tick", "cutoff_price"):
+        for field in ("above_tick", "below_tick"):
             if _decimal(ticks.get(field), f"tick {field}") <= 0:
                 raise BrokerError("Option tick metadata is invalid")
+        # A zero cutoff is valid for schedules that always use the above tick.
+        if _decimal(ticks.get("cutoff_price"), "tick cutoff") < 0:
+            raise BrokerError("Option tick cutoff is invalid")
         if self.currency is None:
             await self._portfolio()
         if self.currency != "USD":
@@ -1860,21 +1889,28 @@ class RobinhoodBroker(RobinhoodMCP):
             self._prepared_entries.pop(oldest, None)
         return copy.deepcopy(metadata)
 
-    def prepared_entry(self, contract, price):
+    def prepared_entry(self, contract, price, *, diagnostic=None):
         """Return prepared entry metadata with the price-specific tick, if fresh."""
+        def unavailable(reason):
+            if diagnostic is not None:
+                diagnostic.update(route="fresh", reason=reason)
+            return None
+
         try:
             target = _contract_key(contract)
             cached = self._prepared_entries.get(target)
             if cached is None:
-                return None
+                return unavailable("prepared_cache_missing")
             cached_at, metadata = cached
             prepared_at = _instant(metadata.get("prepared_at"))
             age = (self.clock().astimezone(timezone.utc) - prepared_at).total_seconds()
+            if diagnostic is not None and age >= 0:
+                diagnostic["prepared_age_seconds"] = round(age, 3)
             if age < 0 or age > _PREPARED_ENTRY_TTL_SECONDS or (
                 time.monotonic() - cached_at > _PREPARED_ENTRY_TTL_SECONDS
             ):
                 self._prepared_entries.pop(target, None)
-                return None
+                return unavailable("prepared_cache_expired")
             if (
                 _contract_key(metadata.get("contract")) != target
                 or metadata.get("tradable") is not True
@@ -1882,23 +1918,27 @@ class RobinhoodBroker(RobinhoodMCP):
                 or metadata.get("currency") != "USD"
                 or metadata.get("asset_type") != "equity_option"
             ):
-                return None
+                return unavailable("prepared_metadata_invalid")
             entry_price = _decimal(price, "entry price")
-            if entry_price <= 0 or metadata.get("can_open_position") is not True:
-                return None
+            if entry_price <= 0:
+                return unavailable("invalid_limit_price")
+            if metadata.get("can_open_position") is not True:
+                return unavailable("chain_open_unconfirmed")
             ticks = metadata.get("min_ticks")
             cutoff = _decimal(ticks.get("cutoff_price"), "tick cutoff")
             tick = _decimal(
                 ticks["above_tick" if entry_price >= cutoff else "below_tick"],
                 "tick",
             )
-            if tick <= 0:
-                return None
+            if cutoff < 0 or tick <= 0:
+                return unavailable("tick_metadata_invalid")
             prepared = copy.deepcopy(metadata)
             prepared["tick_size"] = format(tick, "f")
+            if diagnostic is not None:
+                diagnostic.update(route="prepared", reason="prepared")
             return prepared
         except (BrokerError, AttributeError, KeyError, TypeError, ValueError):
-            return None
+            return unavailable("prepared_metadata_invalid")
 
     def _prepared_order_args(self, order):
         if (

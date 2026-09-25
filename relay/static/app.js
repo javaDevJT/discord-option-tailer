@@ -951,12 +951,83 @@ function relayReadTimeoutSignal() {
     return text;
   }
 
-  function renderProtection(parent, evaluation) {
-    const text = protectionText(evaluation);
-    if (text) append(parent, node("div", "record-meta", text));
-  }
+function renderProtection(parent, evaluation) {
+  const text = protectionText(evaluation);
+  if (text) append(parent, node("div", "record-meta", text));
+}
 
-  function renderStopOrder(parent, order) {
+function renderExpiryResolution(parent, resolution, label) {
+  if (!resolution || typeof resolution !== "object" || Array.isArray(resolution)) return;
+  const parts = [];
+  const dateValue = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
+  const countValue = (value) => Number.isInteger(value) && value >= 0 && value <= 1_000_000 ? formatNumber(value) : null;
+  const requested = dateValue(resolution.requested_expiry);
+  const selected = dateValue(resolution.selected_expiry);
+  if (requested || selected) {
+    parts.push([requested ? `Requested ${requested}` : "", selected ? `selected ${selected}` : ""].filter(Boolean).join(" → "));
+  }
+  const instruments = countValue(resolution.requested_date_instruments);
+  const eligible = countValue(resolution.requested_date_eligible);
+  if (instruments !== null || eligible !== null) {
+    parts.push(`Requested date ${instruments ?? "—"} instruments / ${eligible ?? "—"} eligible`);
+  }
+  for (const [key, title] of [["listed_expiries", "Listed"], ["returned_expiries", "Returned"]]) {
+    const dates = Array.isArray(resolution[key])
+      ? resolution[key].slice(0, 16).map(dateValue).filter(Boolean)
+      : [];
+    if (dates.length) parts.push(`${title} ${dates.join(", ")}`);
+  }
+  const rejected = resolution.rejected;
+  if (rejected && typeof rejected === "object" && !Array.isArray(rejected)) {
+    const reasons = ["wrong_chain", "inactive", "untradable", "non_equity", "nonstandard_multiplier", "contract_mismatch"];
+    const counts = reasons
+      .map((reason) => [reason, rejected[reason]])
+      .filter(([, count]) => Number.isInteger(count) && count > 0 && count <= 1_000_000)
+      .map(([reason, count]) => `${humanize(reason)} ${count}`);
+    if (counts.length) parts.push(`Rejected ${counts.join(", ")}`);
+  }
+  if (parts.length) append(parent, node("p", "record-meta", `${label} / ${parts.join(" · ")}`));
+}
+
+function renderEntryPreparation(parent, preparation, directExpiryResolution) {
+  if (preparation && typeof preparation === "object" && !Array.isArray(preparation)) {
+    const parts = [];
+    if (["prepared", "fresh"].includes(preparation.route)) parts.push(`Route ${humanize(preparation.route)}`);
+    if (preparation.reason === "prepared") parts.push("Preparation ready");
+    else if (preparation.reason) parts.push(`Fallback ${humanize(preparation.reason)}`);
+    const watchMessageId = safeString(preparation.watch_message_id);
+    if (/^\d{17,20}$/.test(watchMessageId)) parts.push(`Watch message ${watchMessageId}`);
+    for (const [key, label] of [["watch_age_seconds", "Watch age"], ["prepared_age_seconds", "Prepared age"]]) {
+      const age = preparation[key];
+      if (typeof age === "number" && Number.isFinite(age) && age >= 0 && age <= 315_360_000) {
+        parts.push(`${label} ${formatEvaluationDuration(age)}`);
+      }
+    }
+    if (typeof preparation.attempted_at === "string") parts.push(`Attempted ${formatDate(preparation.attempted_at)}`);
+    if (Number.isInteger(preparation.attempts) && preparation.attempts >= 1 && preparation.attempts <= 1000) {
+      parts.push(`Attempts ${preparation.attempts}`);
+    }
+    if (parts.length) append(parent, node("p", "record-meta", `Entry preparation / ${parts.join(" · ")}`));
+
+    const failure = preparation.failure;
+    if (failure && typeof failure === "object" && !Array.isArray(failure)) {
+      const candidates = [failure, ...(Array.isArray(failure.causes) ? failure.causes.slice(0, 3) : [])];
+      const operation = firstValue(...candidates.flatMap((item) => [item?.broker_operation, item?.tool, item?.stage]));
+      const code = firstValue(...candidates.map((item) => item?.code));
+      const frame = firstValue(...candidates.flatMap((item) => Array.isArray(item?.frames) ? item.frames : []));
+      const details = [
+        operation ? `Operation ${humanize(operation)}` : "",
+        code ? `Code ${humanize(code)}` : "",
+        frame ? `Frame ${safeString(frame)}` : "",
+      ].filter(Boolean);
+      if (details.length) append(parent, node("p", "record-meta", `Preparation failure / ${details.join(" · ")}`));
+    }
+    renderExpiryResolution(parent, preparation.expiry_resolution, "Watch expiry");
+  }
+  renderExpiryResolution(parent, directExpiryResolution, "Expiry resolution");
+}
+
+function renderStopOrder(parent, order) {
     const orderType = normalized(order?.order_type);
     const price = firstValue(order?.stop_price, order?.requested_stop_price);
     if (!orderType && price === undefined) return;
@@ -1023,10 +1094,11 @@ function relayReadTimeoutSignal() {
             append(evidenceBlock, node("div", "evidence-label", "Evidence"), node("p", "evidence-text", valueText(evidence)));
             append(decisionPanel, evidenceBlock);
           }
-          const contract = firstValue(readDecision(event).contract, event.contract);
-          if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
-          renderEvaluationTiming(decisionPanel, event);
-          renderProtection(decisionPanel, readDecision(event).stop_evaluation);
+      const contract = firstValue(readDecision(event).contract, event.contract);
+      if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
+      renderEvaluationTiming(decisionPanel, event);
+      renderEntryPreparation(decisionPanel, readDecision(event).entry_preparation, readDecision(event).expiry_resolution);
+      renderProtection(decisionPanel, readDecision(event).stop_evaluation);
         }
       } else {
         append(decisionPanel, node("span", "no-decision", "No interpretation recorded"));
@@ -1042,6 +1114,7 @@ function relayReadTimeoutSignal() {
       append(decisionPanel, node("p", "record-meta", `Previous revision: ${decisionActionLabel(previous)} / ${humanize(previous.state)}`));
       append(decisionPanel, node("p", "decision-reason", decisionReason(previous)));
       renderEvaluationTiming(decisionPanel, previous);
+      renderEntryPreparation(decisionPanel, readDecision(previous).entry_preparation, readDecision(previous).expiry_resolution);
     }
     const related = getOrdersForMessage(messageId);
       if (related.length) {

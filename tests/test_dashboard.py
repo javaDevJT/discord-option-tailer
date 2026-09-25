@@ -184,6 +184,83 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("provider_response", json.dumps(decision))
         self.assertNotIn("negative", json.dumps(decision))
 
+    def test_entry_preparation_and_expiry_projection_is_bounded_and_allowlisted(self):
+        from relay.dashboard import _project_decision
+
+        failed = _project_decision({
+            "entry_preparation": {
+                "route": "fresh",
+                "reason": "tick_metadata_invalid",
+                "watch_message_id": "https://secret.invalid/message",
+                "watch_age_seconds": float("inf"),
+                "prepared_age_seconds": -1,
+                "attempted_at": "not-a-timestamp",
+                "attempts": 0,
+                "failure": {
+                    "stage": "watch_preparation",
+                    "broker_operation": "prepare_entry",
+                    "code": "timeout",
+                    "frames": ["relay/broker.py:123:prepare_entry", "<script>alert(1)</script>"],
+                    "provider_payload": "SECRET",
+                },
+                "provider_response": "SECRET",
+            },
+            "expiry_resolution": {
+                "requested_expiry": "2026-02-30",
+                "selected_expiry": "2026-09-25",
+                "listed_expiries": ["2026-09-18", "2026-02-30", "<script>alert(1)</script>"],
+                "returned_expiries": [f"2026-10-{day:02d}" for day in range(1, 19)],
+                "requested_date_instruments": 0,
+                "requested_date_eligible": True,
+                "rejected": {"wrong_chain": 2, "inactive": True, "secret": 99},
+                "raw_provider_payload": "SECRET",
+            },
+            "unapproved": "SECRET",
+        })
+        preparation = failed["entry_preparation"]
+        self.assertEqual(preparation["route"], "fresh")
+        self.assertEqual(preparation["reason"], "tick_metadata_invalid")
+        self.assertEqual(preparation["failure"]["broker_operation"], "prepare_entry")
+        self.assertEqual(preparation["failure"]["code"], "timeout")
+        self.assertEqual(preparation["failure"]["frames"], ["relay/broker.py:123:prepare_entry"])
+        self.assertNotIn("watch_message_id", preparation)
+        self.assertNotIn("watch_age_seconds", preparation)
+        self.assertNotIn("attempts", preparation)
+        self.assertEqual(failed["expiry_resolution"]["selected_expiry"], "2026-09-25")
+        self.assertNotIn("requested_expiry", failed["expiry_resolution"])
+        self.assertEqual(failed["expiry_resolution"]["requested_date_instruments"], 0)
+        self.assertNotIn("requested_date_eligible", failed["expiry_resolution"])
+        self.assertEqual(failed["expiry_resolution"]["rejected"], {"wrong_chain": 2})
+        self.assertLessEqual(len(failed["expiry_resolution"]["returned_expiries"]), 16)
+
+        prepared = _project_decision({
+            "entry_preparation": {
+                "route": "prepared",
+                "reason": "prepared",
+                "watch_message_id": "1545700000000000003",
+                "watch_age_seconds": 1.5,
+                "prepared_age_seconds": 0.25,
+                "attempted_at": "2026-09-25T12:00:00+00:00",
+                "attempts": 1,
+                "expiry_resolution": {
+                    "requested_expiry": "2026-09-18",
+                    "selected_expiry": "2026-09-18",
+                    "listed_expiries": ["2026-09-18", "bad date"],
+                    "requested_date_instruments": 3,
+                    "requested_date_eligible": 2,
+                },
+                "raw_text": "SECRET",
+            },
+        })
+        prepared_entry = prepared["entry_preparation"]
+        self.assertEqual(prepared_entry["route"], "prepared")
+        self.assertEqual(prepared_entry["reason"], "prepared")
+        self.assertEqual(prepared_entry["watch_message_id"], "1545700000000000003")
+        self.assertEqual(prepared_entry["expiry_resolution"]["requested_date_eligible"], 2)
+        self.assertEqual(prepared_entry["expiry_resolution"]["listed_expiries"], ["2026-09-18"])
+        self.assertNotIn("SECRET", json.dumps([failed, prepared]))
+        self.assertNotIn("<script>", json.dumps([failed, prepared]))
+
     def test_status_reports_counts_and_stale_detection_without_sensitive_fields(self):
         status, headers, payload = self.request("/api/status")
         self.assertEqual(status, 200)

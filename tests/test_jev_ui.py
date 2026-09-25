@@ -382,6 +382,89 @@ class JevUITests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_render_prepared_entry_diagnostics_safely_on_message_cards(self):
+        failed_event = {
+            "message_id": "message-entry-failed",
+            "state": "held",
+            "decision": {
+                "action": "wait",
+                "entry_preparation": {
+                    "route": "fresh",
+                    "reason": "tick_metadata_invalid",
+                    "watch_message_id": "1545700000000000003",
+                    "watch_age_seconds": 1.5,
+                    "attempted_at": "2026-09-25T12:00:00Z",
+                    "attempts": 2,
+                    "failure": {
+                        "stage": "watch_preparation",
+                        "broker_operation": "<img>",
+                        "code": "timeout",
+                        "frames": ["relay/broker.py:123:prepare_entry"],
+                    },
+                },
+                "expiry_resolution": {
+                    "requested_expiry": "2026-09-18",
+                    "selected_expiry": "2026-09-25",
+                    "requested_date_instruments": 0,
+                    "requested_date_eligible": 0,
+                },
+            },
+        }
+        prepared_event = {
+            "message_id": "message-entry-prepared",
+            "state": "held",
+            "decision": {
+                "action": "wait",
+                "entry_preparation": {
+                    "route": "prepared",
+                    "reason": "prepared",
+                    "watch_message_id": "1545700000000000004",
+                    "watch_age_seconds": 3,
+                    "prepared_age_seconds": 0.5,
+                    "attempted_at": "2026-09-25T12:00:01Z",
+                    "attempts": 1,
+                    "expiry_resolution": {
+                        "requested_expiry": "2026-09-18",
+                        "selected_expiry": "2026-09-18",
+                        "listed_expiries": ["2026-09-18"],
+                        "requested_date_instruments": 3,
+                        "requested_date_eligible": 2,
+                    },
+                },
+            },
+        }
+        messages = [
+            {"id": event["message_id"], "source_group": "synthetic", "channel_id": "1", "content": "entry", "latest_event": event}
+            for event in (failed_event, prepared_event)
+        ]
+        state = {
+            "setup": self.setup_status(),
+            "messages": messages,
+            "events": [failed_event, prepared_event],
+            "evaluation_requests": [],
+            "test_requests": [],
+        }
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                message_list = page.locator("#message-list")
+                expect(message_list).to_contain_text("Fallback Tick Metadata Invalid")
+                expect(message_list).to_contain_text("Watch message 1545700000000000003")
+                expect(message_list).to_contain_text("Watch age")
+                expect(message_list).to_contain_text("Attempted")
+                expect(message_list).to_contain_text("Operation <Img>")
+                expect(message_list).to_contain_text("Code Timeout")
+                expect(message_list).to_contain_text("Frame relay/broker.py:123:prepare_entry")
+                expect(message_list).to_contain_text("selected 2026-09-25")
+                expect(message_list).to_contain_text("Requested date 0 instruments / 0 eligible")
+                expect(message_list).to_contain_text("Preparation ready")
+                expect(message_list).to_contain_text("Prepared age")
+                expect(message_list).to_contain_text("Watch expiry / Requested 2026-09-18 → selected 2026-09-18")
+                expect(message_list).to_contain_text("Requested date 3 instruments / 2 eligible")
+                self.assertEqual(message_list.locator("img").count(), 0)
+            finally:
+                browser.close()
+
     def test_render_aggregate_evaluation_summary(self):
         state = {
             "setup": self.setup_status(),

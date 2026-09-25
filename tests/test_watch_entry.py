@@ -4,6 +4,7 @@ import copy
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+import json
 import unittest
 from unittest.mock import AsyncMock
 
@@ -28,7 +29,7 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.engine.watches.close)
         self.broker.prewarm_entry = AsyncMock()
         self.broker.nearest_expiry = AsyncMock(return_value=fixtures.CONTRACT)
-        self.broker.prepared_entry = lambda contract, price: dict(
+        self.broker.prepared_entry = lambda contract, price, **kwargs: dict(
             contract=contract, tradable=True, multiplier=100, currency="USD",
             asset_type="equity_option", tick_size=".05", prepared_at=self.now.isoformat())
 
@@ -66,6 +67,69 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["contract"], fixtures.CONTRACT)
         self.assertEqual(self.broker.nearest_expiry.await_count, 1)
 
+    async def test_observed_compact_and_spaced_watch_embeds_prepare_same_put(self):
+        contract = dict(symbol="QQQ", strike="740", option_type="put", expiry=fixtures.CONTRACT["expiry"])
+        self.broker.nearest_expiry.return_value = contract
+        for description in ("QQQ740P 👀", "QQQ $740P 👀"):
+            with self.subTest(description=description):
+                watch = self.message(content="", embeds=[{
+                    "title": "On watch", "description": description, "footer": {"text": "@zendotrades"},
+                }])
+                self.assertEqual(watch_candidate(watch), contract | {"expiry": "nearest"})
+                watch["source_group"] = self.config["channels"][0]["source_group"]
+                self.store.observe(watch)
+                self.engine.watches.note(watch)
+                await asyncio.gather(*list(self.engine.watches.tasks))
+                entry = self.message(content="ENTRY QQQ $740P @ 1.40")
+                decision = self.interpreter.decision | {"contract": contract | {"expiry": "nearest"}}
+                diagnostic = {}
+                self.assertEqual(self.engine.watches.match(entry, decision, diagnostic=diagnostic),
+                                 self.engine.watches.entries[watch["id"]]["contract"])
+                self.assertEqual(diagnostic["watch_message_id"], watch["id"])
+        self.assertEqual(self.broker.submissions, [])
+
+    async def test_preparation_failure_is_saved_on_held_entry_without_secret_text(self):
+        self.broker.prewarm_entry.side_effect = RuntimeError("Authorization: Bearer secret-provider-response")
+        with self.assertLogs("relay.status", level="ERROR") as logs:
+            watch = await self.warm()
+        self.broker.quotes.update(bid="9.90", ask="10.00")
+        entry = self.message()
+        result = await self.engine.handle(entry)
+        self.assertEqual(result["state"], "held", result)
+        row = self.store.db.execute("SELECT decision FROM events WHERE message_id=?", (entry["id"],)).fetchone()
+        diagnostic = json.loads(row[0])["entry_preparation"]
+        self.assertEqual(diagnostic["route"], "fresh")
+        self.assertEqual(diagnostic["reason"], "watch_preparation_failed")
+        self.assertEqual(diagnostic["watch_message_id"], watch["id"])
+        self.assertEqual(diagnostic["failure"]["stage"], "watch_preparation")
+        self.assertNotIn("secret-provider-response", json.dumps(diagnostic) + str(logs.output))
+        self.assertEqual(self.broker.submissions, [])
+
+    async def test_expired_cache_reason_survives_second_lookup(self):
+        await self.warm()
+        calls = 0
+
+        def unavailable(contract, price, *, diagnostic):
+            nonlocal calls
+            calls += 1
+            diagnostic.update(route="fresh", reason="prepared_cache_expired" if calls == 1 else "prepared_cache_missing")
+            return None
+
+        self.broker.prepared_entry = unavailable
+        entry = self.message()
+        entry["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(entry)
+        decision = copy.deepcopy(self.interpreter.decision)
+        decision.update(
+            origin_message_id=entry["id"],
+            contract=fixtures.CONTRACT | {"expiry": "nearest"},
+            evidence=[{"message_id": entry["id"], "quote": entry["content"]}],
+        )
+        resolved = await self.engine.resolve_expiry(entry, decision)
+        order = await self.engine.plan(entry, resolved)
+        self.assertNotIn("prepared_entry", order)
+        self.assertEqual(resolved["entry_preparation"]["reason"], "prepared_cache_expired")
+
     async def test_prepared_plan_sizes_at_downward_rounded_cap_without_quote(self):
         await self.warm()
         entry = self.message()
@@ -77,6 +141,7 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         order = await self.engine.plan(entry, decision)
         self.assertEqual(Decimal(order["limit_price"]), Decimal(".95"))
         self.assertTrue(order["prepared_entry"])
+        self.assertEqual(decision["entry_preparation"]["route"], "prepared")
         self.assertEqual(order["entry_cancel_after_seconds"], 3)
         self.assertIsNone(order["quote_timestamp"])
         self.assertLessEqual(Decimal(order["limit_price"]), Decimal(".8") * Decimal("1.2"))
@@ -98,7 +163,7 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.engine.watches.match(self.message(), self.interpreter.decision))
         self.broker.prewarm_entry.side_effect = None
         await self.warm()
-        self.broker.prepared_entry = lambda contract, price: None
+        self.broker.prepared_entry = lambda contract, price, **kwargs: None
         self.broker.quote = AsyncMock(wraps=self.broker.quote)
         entry = self.message()
         entry["source_group"] = self.config["channels"][0]["source_group"]

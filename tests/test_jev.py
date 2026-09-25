@@ -44,7 +44,7 @@ class Broker:
     def __init__(self):
         self.calls = []
 
-    async def nearest_expiry(self, contract):
+    async def nearest_expiry(self, contract, **kwargs):
         self.calls.append(contract)
         return contract | {"expiry": "2026-09-04"}
 
@@ -144,7 +144,7 @@ class JEVTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def nearest_expiry(self, contract):
+            async def nearest_expiry(self, contract, **kwargs):
                 self.calls.append(contract)
                 return dict(contract, expiry="2026-09-04")
 
@@ -163,7 +163,7 @@ class JEVTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def nearest_expiry(self, contract):
+            async def nearest_expiry(self, contract, **kwargs):
                 self.calls.append(contract)
                 return dict(contract, expiry="2026-09-03")
 
