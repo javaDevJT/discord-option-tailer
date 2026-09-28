@@ -340,7 +340,28 @@ class JevUITests(unittest.TestCase):
         event = {
             "message_id": "message-jev-1",
             "state": "evaluated",
-            "decision": {"action": "open", "contract": {"symbol": "SPY", "expiry": "2026-09-18", "strike": 500, "right": "call"}},
+            "decision": {
+                "action": "open",
+                "contract": {"symbol": "SPY", "expiry": "2026-09-18", "strike": 500, "right": "call"},
+                "broker_submission": {
+                    "stage": "response",
+                    "broker_state": "accepted",
+                    "status_recognized": True,
+                    "broker_order_id": "broker-123",
+                    "submitted_at": "2026-09-18T12:00:01Z",
+                    "response_at": "2026-09-18T12:00:02Z",
+                },
+                "order_reconciliation": {
+                    "status": "canceled",
+                    "broker_state": "canceled",
+                    "status_recognized": True,
+                    "cancel_reason": "entry_timeout",
+                    "cancel_requested_at": "2026-09-18T12:00:03Z",
+                    "cancel_result_status": "canceled",
+                    "cancel_result_broker_state": "canceled",
+                    "entry_cancel_at": "2026-09-18T12:00:04Z",
+                },
+            },
             "evaluation_timing": {
                 "evaluator": "jev",
                 "route": "fallback",
@@ -360,6 +381,11 @@ class JevUITests(unittest.TestCase):
                 "interpretation_seconds": 1.6,
                 "execution_seconds": 0.8,
                 "submission_seconds": 0.2,
+                "snapshot_account_seconds": 0.11,
+                "snapshot_portfolio_seconds": 0.22,
+                "snapshot_positions_seconds": 0.33,
+                "snapshot_position_details_seconds": 0.44,
+                "snapshot_orders_seconds": 0.55,
             },
         }
         state = {
@@ -376,6 +402,18 @@ class JevUITests(unittest.TestCase):
                 expect(page.locator("#message-list")).to_contain_text("Evaluator Jev")
                 expect(page.locator("#message-list")).to_contain_text("Fallback Deadline")
                 expect(page.locator("#message-list")).to_contain_text("Final broker result is recorded separately")
+                expect(page.locator("#message-list")).to_contain_text("Snapshot account 110ms")
+                expect(page.locator("#message-list")).to_contain_text("Snapshot portfolio 220ms")
+                expect(page.locator("#message-list")).to_contain_text("Snapshot positions 330ms")
+                expect(page.locator("#message-list")).to_contain_text("Snapshot position details 440ms")
+                expect(page.locator("#message-list")).to_contain_text("Snapshot orders 550ms")
+                expect(page.locator("#message-list")).to_contain_text("Broker submission / Stage Response")
+                expect(page.locator("#message-list")).to_contain_text("Broker state Accepted")
+                expect(page.locator("#message-list")).to_contain_text("Order reconciliation / Status Canceled")
+                expect(page.locator("#message-list")).to_contain_text("Cancel reason Entry Timeout")
+                expect(page.locator("#message-list")).to_contain_text("Entry cancel deadline")
+                expect(page.locator("#message-list")).not_to_contain_text("Entry canceled")
+                expect(page.locator("#message-list")).to_contain_text("Cancel result Canceled / Canceled")
                 page.locator("#test-evaluation").click()
                 expect(page.locator("#evaluation-jev-feedback")).to_contain_text("JEV test Passed")
                 self.assertEqual(state["test_requests"], [{}])
@@ -405,8 +443,17 @@ class JevUITests(unittest.TestCase):
                 "expiry_resolution": {
                     "requested_expiry": "2026-09-18",
                     "selected_expiry": "2026-09-25",
+                    "selection_source": "requested_date_probe",
                     "requested_date_instruments": 0,
                     "requested_date_eligible": 0,
+                    "requested_date_probe": {
+                        "attempted": True,
+                        "status": "filtered",
+                        "instrument_count": 1,
+                        "eligible_count": 0,
+                        "duration_seconds": 0.015,
+                        "rejected": {"wrong_chain": 1},
+                    },
                 },
             },
         }
@@ -457,6 +504,10 @@ class JevUITests(unittest.TestCase):
                 expect(message_list).to_contain_text("Frame relay/broker.py:123:prepare_entry")
                 expect(message_list).to_contain_text("selected 2026-09-25")
                 expect(message_list).to_contain_text("Requested date 0 instruments / 0 eligible")
+                expect(message_list).to_contain_text("Selection Requested Date Probe")
+                expect(message_list).to_contain_text("Requested-date probe Filtered")
+                expect(message_list).to_contain_text("1 instruments / 0 eligible")
+                expect(message_list).to_contain_text("rejected Wrong Chain 1")
                 expect(message_list).to_contain_text("Preparation ready")
                 expect(message_list).to_contain_text("Prepared age")
                 expect(message_list).to_contain_text("Watch expiry / Requested 2026-09-18 → selected 2026-09-18")

@@ -1,4 +1,5 @@
 """Provider-shaped prepared entry and lost-response recovery; no network calls."""
+import asyncio
 import copy
 from datetime import timedelta
 import hashlib
@@ -54,6 +55,79 @@ class WatchBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.broker.quote.assert_not_awaited()
         before.assert_awaited_once()
         self.assertEqual(before.await_args.args[1]["ask"], "1.00")
+
+    async def test_prepared_snapshot_and_review_overlap_with_separate_timings(self):
+        await self.broker.prewarm_entry(self.contract)
+        self.broker._market_open = lambda: True
+        snapshot_started, review_started = asyncio.Event(), asyncio.Event()
+        original = self.broker._data.side_effect
+
+        async def snapshot():
+            snapshot_started.set()
+            await review_started.wait()
+            return dict(account_id="TEST0001", market_open=True, restrictions=[],
+                        buying_power="1000", positions=[], timestamp=self.now.isoformat())
+
+        async def data(name, args):
+            if name == "review_option_order":
+                review_started.set()
+                await snapshot_started.wait()
+            return await original(name, args)
+
+        self.broker.snapshot = snapshot
+        self.broker._data.side_effect = data
+        order = self.order | {"prepared_entry": True}
+        result = await asyncio.wait_for(self.broker.submit(order, before_submit=AsyncMock()), 1)
+        trace = order["broker_submission"]
+        self.assertEqual((trace["stage"], trace["broker_state"]), ("validated", "filled"))
+        self.assertTrue(trace["status_recognized"])
+        self.assertEqual(trace["broker_order_id"], result["id"])
+        for key in ("snapshot_seconds", "review_seconds", "dispatch_guard_seconds", "placement_seconds", "response_validation_seconds"):
+            self.assertGreaterEqual(trace[key], 0)
+        self.assertEqual(result, await self.broker.submit(order))
+
+    async def test_failed_review_cancels_pending_snapshot_without_placement(self):
+        await self.broker.prewarm_entry(self.contract)
+        self.calls.clear()
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def snapshot():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async def data(name, args):
+            self.assertEqual(name, "review_option_order")
+            await started.wait()
+            raise BrokerError("synthetic review failure")
+
+        self.broker.snapshot = snapshot
+        self.broker._data.side_effect = data
+        with self.assertRaises(BrokerPreflightHold):
+            await asyncio.wait_for(self.broker.submit(self.order | {"prepared_entry": True}), 1)
+        self.assertTrue(cancelled.is_set())
+        self.assertNotIn(self.order["client_order_id"], self.broker.attempted)
+
+    async def test_response_diagnostic_survives_invalid_payload_without_raw_text(self):
+        await self.broker.prewarm_entry(self.contract)
+        self.broker._market_open = lambda: True
+        original = self.broker._data.side_effect
+
+        async def data(name, args):
+            result = await original(name, args)
+            if name == "place_option_order":
+                result["order"]["state"] = "Bearer private-provider-secret"
+            return result
+
+        self.broker._data.side_effect = data
+        order = self.order | {"prepared_entry": True}
+        with self.assertRaises(BrokerError):
+            await self.broker.submit(order)
+        self.assertEqual(order["broker_submission"]["stage"], "response")
+        self.assertIn("broker_order_id", order["broker_submission"])
+        self.assertNotIn("private-provider-secret", json.dumps(order["broker_submission"]))
 
     async def test_metadata_reports_tick_for_unrounded_ceiling_and_expires(self):
         self.instrument["min_ticks"]["below_tick"] = ".05"

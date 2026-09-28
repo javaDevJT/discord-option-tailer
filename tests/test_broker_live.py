@@ -56,7 +56,12 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             if name == "get_option_chains":
                 return {"chains": [self.chain]}
             if name == "get_option_instruments":
-                return {"instruments": [self.instrument]}
+                requested_dates = args.get("expiration_dates")
+                instruments = [self.instrument]
+                if requested_dates:
+                    dates = set(requested_dates.split(","))
+                    instruments = [row for row in instruments if row.get("expiration_date") in dates]
+                return {"instruments": instruments}
             if name == "get_option_quotes":
                 return {"results": [{"quote": self.quote}]}
             if name == "get_equity_quotes":
@@ -206,13 +211,18 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.broker.account_changed.is_set())
 
         self.broker.account_changed.clear()
-        await self.broker.order_status(result["id"])
+        status = await self.broker.order_status(result["id"])
+        self.assertEqual(status["broker_state"], "filled")
+        self.assertTrue(status["status_recognized"])
+        self.assertEqual(status["broker_order_id"], result["id"])
         self.assertTrue(self.broker.account_changed.is_set())
         self.orders[0]["state"] = "partially_filled"
         self.orders[0]["processed_quantity"] = "0"
         self.orders[0]["processed_premium"] = "0"
         self.broker.account_changed.clear()
-        await self.broker.order_status(result["id"])
+        status = await self.broker.order_status(result["id"])
+        self.assertEqual(status["broker_state"], "partially_filled")
+        self.assertTrue(status["status_recognized"])
         self.assertTrue(self.broker.account_changed.is_set())
 
         self.broker.account_changed.clear()
@@ -236,6 +246,46 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
                 before_submit=block_before_submit,
             )
         self.assertFalse(self.broker.account_changed.is_set())
+
+    async def test_unrecognized_well_formed_order_state_stays_pending_and_idempotent(self):
+        self.broker._market_open = lambda: True
+        original = self.broker._data.side_effect
+
+        async def data(name, args):
+            response = await original(name, args)
+            if name == "place_option_order":
+                response["order"].update(state="awaiting_exchange_ack", processed_quantity="0", processed_premium="0")
+            return response
+
+        self.broker._data.side_effect = data
+        result = await self.broker.submit(self.order)
+        broker_order_id = result["id"]
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["filled_quantity"], 0)
+        self.assertFalse(self.order["broker_submission"]["status_recognized"])
+
+        status = await self.broker.order_status(broker_order_id, broker_order_id=broker_order_id)
+
+        self.assertEqual(status["status"], "pending")
+        self.assertEqual(status["broker_state"], "awaiting_exchange_ack")
+        self.assertFalse(status["status_recognized"])
+        self.assertEqual(status["broker_order_id"], broker_order_id)
+        self.assertEqual((await self.broker.submit(self.order))["id"], result["id"])
+        self.assertEqual(sum(name == "place_option_order" for name, _ in self.calls), 1)
+
+    async def test_unrecognized_order_state_does_not_skip_state_or_fill_validation(self):
+        self.broker._market_open = lambda: True
+        result = await self.broker.submit(self.order)
+        broker_order_id = result["id"]
+        for state in (None, "", [], "https://example.invalid/orders/private-token"):
+            with self.subTest(state=state), self.assertRaises(BrokerError):
+                self.orders[0]["state"] = state
+                await self.broker.order_status(broker_order_id, broker_order_id=broker_order_id)
+
+        self.orders[0]["state"] = "awaiting_exchange_ack"
+        self.orders[0]["processed_premium"] = "not-a-price"
+        with self.assertRaises(BrokerError):
+            await self.broker.order_status(broker_order_id, broker_order_id=broker_order_id)
 
     async def test_captured_blank_underlying_symbol_is_verified_without_url_fetch(self):
         # Sanitized shape of the actual SPY chain response observed on 2026-09-06.
@@ -365,6 +415,94 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         rows[0]["type"] = "put"
         with self.assertRaisesRegex(BrokerError, "No listed expiration"):
             await self.broker.nearest_expiry(request)
+
+    async def _configure_requested_date_probe(self, *, include_same_day=False, probe_error=None):
+        requested_date, later_date = "2026-09-28", "2026-09-30"
+        chain = self.chain | {"expiration_dates": [requested_date, later_date]}
+        same_day = self.instrument | {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "expiration_date": requested_date,
+        }
+        later = self.instrument | {"expiration_date": later_date}
+        request = self.contract | {"expiry": requested_date}
+        probe_requests = []
+
+        async def data(name, args):
+            self.calls.append((name, copy.deepcopy(args)))
+            if name == "get_option_chains":
+                return {"chains": [chain]}
+            if name != "get_option_instruments":
+                raise AssertionError(name)
+            dates = args["expiration_dates"].split(",")
+            self.assertEqual(args.get("chain_symbol"), "SPY")
+            self.assertEqual(args.get("strike_price"), "500")
+            self.assertEqual(args.get("type"), "call")
+            self.assertEqual(args.get("state"), "active")
+            self.assertEqual(args.get("tradability"), "tradable")
+            if dates == [requested_date]:
+                probe_requests.append(copy.deepcopy(args))
+                if probe_error is not None:
+                    raise probe_error
+                return {"instruments": [same_day] if include_same_day else []}
+            if later_date in dates:
+                return {"instruments": [later]}
+            return {"instruments": []}
+
+        self.broker._data = AsyncMock(side_effect=data)
+        return request, same_day, probe_requests
+
+    async def test_nearest_expiry_probes_listed_requested_date_omitted_by_bulk(self):
+        request, _, probe_requests = await self._configure_requested_date_probe(include_same_day=True)
+        # The initial bulk response omits the listed requested date. Only the
+        # focused exact-date response contains its matching instrument.
+        diagnostic = {}
+
+        resolved = await self.broker.nearest_expiry(request, diagnostic=diagnostic)
+
+        self.assertEqual(resolved, request)
+        self.assertEqual(len(probe_requests), 1)
+        probe = diagnostic["requested_date_probe"]
+        self.assertEqual(
+            {key: probe[key] for key in ("attempted", "status", "instrument_count", "eligible_count")},
+            {"attempted": True, "status": "matched", "instrument_count": 1, "eligible_count": 1},
+        )
+        self.assertEqual(diagnostic["selection_source"], "requested_date_probe")
+
+    async def test_nearest_expiry_confirms_empty_requested_date_before_bulk_fallback(self):
+        request, _, probe_requests = await self._configure_requested_date_probe()
+        diagnostic = {}
+
+        resolved = await self.broker.nearest_expiry(request, diagnostic=diagnostic)
+
+        self.assertEqual(resolved["expiry"], "2026-09-30")
+        self.assertEqual(len(probe_requests), 1)
+        probe = diagnostic["requested_date_probe"]
+        self.assertEqual(
+            {key: probe[key] for key in ("attempted", "status", "instrument_count", "eligible_count")},
+            {"attempted": True, "status": "empty", "instrument_count": 0, "eligible_count": 0},
+        )
+        self.assertEqual(diagnostic["selection_source"], "later_date")
+
+    async def test_nearest_expiry_does_not_fallback_when_requested_date_probe_fails(self):
+        request, _, probe_requests = await self._configure_requested_date_probe(
+            probe_error=BrokerError("fixture exact-date probe failed")
+        )
+        diagnostic = {"selected_expiry": "2026-09-30", "selection_source": "later_date"}
+
+        with self.assertRaisesRegex(BrokerError, "fixture exact-date probe failed"):
+            await self.broker.nearest_expiry(request, diagnostic=diagnostic)
+
+        self.assertEqual(len(probe_requests), 1)
+        probe = diagnostic["requested_date_probe"]
+        self.assertEqual(
+            {key: probe[key] for key in ("attempted", "status")},
+            {"attempted": True, "status": "failed"},
+        )
+        self.assertGreaterEqual(probe["duration_seconds"], 0)
+        self.assertNotIn("instrument_count", probe)
+        self.assertNotIn("eligible_count", probe)
+        self.assertNotIn("selected_expiry", diagnostic)
+        self.assertNotIn("selection_source", diagnostic)
 
 
 if __name__ == "__main__":

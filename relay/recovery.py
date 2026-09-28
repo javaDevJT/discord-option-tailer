@@ -142,7 +142,18 @@ class RecoveryEvaluator:
             cancel = getattr(self.engine.broker, "cancel_order", None)
             if cancel is not None:
                 try:
+                    body.update(
+                        cancel_reason="entry_timeout",
+                        cancel_requested_at=self.engine.clock().isoformat(),
+                        cancel_result_status=None,
+                        cancel_result_broker_state=None,
+                    )
+                    self.store.persist_active_order_body(row["id"], body)
+                    options["expected_order"] = body
                     result = await cancel(row["id"], **options)
+                    body["cancel_result_status"] = result.get("status")
+                    body["cancel_result_broker_state"] = result.get("broker_state")
+                    self.store.persist_active_order_body(row["id"], body)
                     self.store.apply_result(row["id"], result)
                     return
                 except Exception:

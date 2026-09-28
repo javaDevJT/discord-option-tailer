@@ -168,6 +168,11 @@ class DashboardTests(unittest.TestCase):
         timing = {
             "model_duration_seconds": 1.25,
             "posted_to_decision_seconds": 12.5,
+            "snapshot_account_seconds": 0.11,
+            "snapshot_portfolio_seconds": 0.22,
+            "snapshot_positions_seconds": 0.33,
+            "snapshot_position_details_seconds": 0.44,
+            "snapshot_orders_seconds": 0.55,
             "attempts": 2,
             "decision_at": "2026-09-17T12:00:00+00:00",
             "path": "direct",
@@ -180,9 +185,138 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(decision["evaluation_timing"]["model_duration_seconds"], 1.25)
         self.assertEqual(decision["evaluation_timing"]["attempts"], 2)
         self.assertTrue(decision["evaluation_timing"]["delayed"])
+        for key, value in (
+            ("snapshot_account_seconds", 0.11),
+            ("snapshot_portfolio_seconds", 0.22),
+            ("snapshot_positions_seconds", 0.33),
+            ("snapshot_position_details_seconds", 0.44),
+            ("snapshot_orders_seconds", 0.55),
+        ):
+            self.assertEqual(decision["evaluation_timing"][key], value)
         self.assertEqual(decision["recovery"]["evaluation_timing"]["path"], "recovery")
         self.assertNotIn("provider_response", json.dumps(decision))
         self.assertNotIn("negative", json.dumps(decision))
+
+        rejected = _project_decision({"evaluation_timing": {
+            "snapshot_account_seconds": -0.01,
+            "snapshot_portfolio_seconds": float("inf"),
+            "snapshot_positions_seconds": True,
+            "snapshot_position_details_seconds": "0.44",
+            "snapshot_orders_seconds": 315_360_001,
+        }})["evaluation_timing"]
+        for key in (
+            "snapshot_account_seconds", "snapshot_portfolio_seconds", "snapshot_positions_seconds",
+            "snapshot_position_details_seconds", "snapshot_orders_seconds",
+        ):
+            self.assertNotIn(key, rejected)
+
+    def test_broker_submission_and_reconciliation_projection_is_allowlisted(self):
+        from relay.dashboard import _project_decision
+
+        decision = _project_decision({
+            "broker_submission": {
+                "stage": "response",
+                "broker_state": "accepted",
+                "status_recognized": True,
+                "broker_order_id": "broker-123",
+                "submitted_at": "2026-09-28T12:00:00Z",
+                "response_at": "2026-09-28T12:00:01Z",
+                "snapshot_seconds": 0.1,
+                "review_seconds": 0.2,
+                "dispatch_guard_seconds": 0.3,
+                "placement_seconds": 0.4,
+                "response_validation_seconds": 0.5,
+                "provider_response": "SECRET",
+            },
+            "order_reconciliation": {
+                "status": "filled",
+                "filled_quantity": 1,
+                "requested_quantity": 1,
+                "broker_order_id": "broker-123",
+                "broker_state": "filled",
+                "status_recognized": True,
+                "cancel_reason": "entry_timeout",
+                "cancel_requested_at": "2026-09-28T12:00:02Z",
+                "cancel_result_status": "canceled",
+                "cancel_result_broker_state": "cancelled",
+                "entry_cancel_at": "2026-09-28T12:00:03Z",
+                "provider_response": "SECRET",
+            },
+        })
+        submission = decision["broker_submission"]
+        self.assertEqual(submission["stage"], "response")
+        self.assertEqual(submission["broker_state"], "accepted")
+        self.assertTrue(submission["status_recognized"])
+        self.assertEqual(submission["broker_order_id"], "broker-123")
+        self.assertEqual(submission["submitted_at"], "2026-09-28T12:00:00Z")
+        self.assertEqual(submission["response_at"], "2026-09-28T12:00:01Z")
+        for key, value in (
+            ("snapshot_seconds", 0.1),
+            ("review_seconds", 0.2),
+            ("dispatch_guard_seconds", 0.3),
+            ("placement_seconds", 0.4),
+            ("response_validation_seconds", 0.5),
+        ):
+            self.assertEqual(submission[key], value)
+        reconciliation = decision["order_reconciliation"]
+        self.assertEqual(reconciliation["status"], "filled")
+        self.assertEqual(reconciliation["filled_quantity"], 1)
+        self.assertEqual(reconciliation["requested_quantity"], 1)
+        self.assertEqual(reconciliation["broker_order_id"], "broker-123")
+        self.assertEqual(reconciliation["broker_state"], "filled")
+        self.assertTrue(reconciliation["status_recognized"])
+        self.assertEqual(reconciliation["cancel_reason"], "entry_timeout")
+        self.assertEqual(reconciliation["cancel_requested_at"], "2026-09-28T12:00:02Z")
+        self.assertEqual(reconciliation["cancel_result_status"], "canceled")
+        self.assertEqual(reconciliation["cancel_result_broker_state"], "cancelled")
+        self.assertEqual(reconciliation["entry_cancel_at"], "2026-09-28T12:00:03Z")
+        self.assertNotIn("provider_response", json.dumps(decision))
+
+        rejected = _project_decision({
+            "broker_submission": {
+                "stage": "response",
+                "broker_state": "<img>",
+                "status_recognized": "yes",
+                "broker_order_id": "https://secret.invalid/order",
+                "submitted_at": "not-a-date",
+                "response_at": "not-a-date",
+                "snapshot_seconds": -1,
+                "review_seconds": float("inf"),
+                "dispatch_guard_seconds": True,
+                "placement_seconds": "0.4",
+                "response_validation_seconds": 315_360_001,
+                "provider_payload": "SECRET",
+            },
+            "order_reconciliation": {
+                "status": "filled",
+                "broker_state": "<img>",
+                "status_recognized": "yes",
+                "cancel_reason": "untrusted",
+                "cancel_requested_at": "not-a-date",
+                "cancel_result_status": "unknown-state",
+                "cancel_result_broker_state": "<img>",
+                "entry_cancel_at": "not-a-date",
+            },
+        })
+        self.assertEqual(rejected["broker_submission"]["stage"], "response")
+        self.assertNotIn("broker_state", rejected["broker_submission"])
+        self.assertNotIn("status_recognized", rejected["broker_submission"])
+        self.assertNotIn("broker_order_id", rejected["broker_submission"])
+        self.assertNotIn("submitted_at", rejected["broker_submission"])
+        self.assertNotIn("response_at", rejected["broker_submission"])
+        for key in (
+            "snapshot_seconds", "review_seconds", "dispatch_guard_seconds", "placement_seconds",
+            "response_validation_seconds",
+        ):
+            self.assertNotIn(key, rejected["broker_submission"])
+        self.assertNotIn("provider_payload", json.dumps(rejected))
+        reconciliation = rejected["order_reconciliation"]
+        for key in (
+            "broker_state", "status_recognized", "cancel_reason", "cancel_requested_at",
+            "cancel_result_status", "cancel_result_broker_state", "entry_cancel_at",
+        ):
+            self.assertNotIn(key, reconciliation)
+        self.assertNotIn("broker_submission", _project_decision({"broker_submission": {"stage": "untrusted"}}))
 
     def test_entry_preparation_and_expiry_projection_is_bounded_and_allowlisted(self):
         from relay.dashboard import _project_decision
@@ -208,11 +342,20 @@ class DashboardTests(unittest.TestCase):
             "expiry_resolution": {
                 "requested_expiry": "2026-02-30",
                 "selected_expiry": "2026-09-25",
+                "selection_source": "<script>",
                 "listed_expiries": ["2026-09-18", "2026-02-30", "<script>alert(1)</script>"],
                 "returned_expiries": [f"2026-10-{day:02d}" for day in range(1, 19)],
                 "requested_date_instruments": 0,
                 "requested_date_eligible": True,
                 "rejected": {"wrong_chain": 2, "inactive": True, "secret": 99},
+                "requested_date_probe": {
+                    "attempted": "yes",
+                    "status": "provider payload",
+                    "instrument_count": -1,
+                    "eligible_count": True,
+                    "duration_seconds": float("inf"),
+                    "rejected": {"wrong_chain": True, "secret": 99},
+                },
                 "raw_provider_payload": "SECRET",
             },
             "unapproved": "SECRET",
@@ -230,6 +373,8 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("requested_expiry", failed["expiry_resolution"])
         self.assertEqual(failed["expiry_resolution"]["requested_date_instruments"], 0)
         self.assertNotIn("requested_date_eligible", failed["expiry_resolution"])
+        self.assertNotIn("selection_source", failed["expiry_resolution"])
+        self.assertNotIn("requested_date_probe", failed["expiry_resolution"])
         self.assertEqual(failed["expiry_resolution"]["rejected"], {"wrong_chain": 2})
         self.assertLessEqual(len(failed["expiry_resolution"]["returned_expiries"]), 16)
 
@@ -248,6 +393,15 @@ class DashboardTests(unittest.TestCase):
                     "listed_expiries": ["2026-09-18", "bad date"],
                     "requested_date_instruments": 3,
                     "requested_date_eligible": 2,
+                    "selection_source": "requested_date_probe",
+                    "requested_date_probe": {
+                        "attempted": True,
+                        "status": "matched",
+                        "instrument_count": 3,
+                        "eligible_count": 2,
+                        "duration_seconds": 0.125,
+                        "rejected": {"wrong_chain": 1, "inactive": True, "secret": 99},
+                    },
                 },
                 "raw_text": "SECRET",
             },
@@ -258,6 +412,15 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(prepared_entry["watch_message_id"], "1545700000000000003")
         self.assertEqual(prepared_entry["expiry_resolution"]["requested_date_eligible"], 2)
         self.assertEqual(prepared_entry["expiry_resolution"]["listed_expiries"], ["2026-09-18"])
+        self.assertEqual(prepared_entry["expiry_resolution"]["selection_source"], "requested_date_probe")
+        self.assertEqual(prepared_entry["expiry_resolution"]["requested_date_probe"], {
+            "attempted": True,
+            "status": "matched",
+            "instrument_count": 3,
+            "eligible_count": 2,
+            "duration_seconds": 0.125,
+            "rejected": {"wrong_chain": 1},
+        })
         self.assertNotIn("SECRET", json.dumps([failed, prepared]))
         self.assertNotIn("<script>", json.dumps([failed, prepared]))
 

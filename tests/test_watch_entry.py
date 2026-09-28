@@ -5,6 +5,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 import json
+import sqlite3
 import unittest
 from unittest.mock import AsyncMock
 
@@ -200,6 +201,108 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.broker.submissions[0]["prepared_entry"])
         self.engine.verify_current.assert_awaited_once()
         self.assertEqual(self.store.positions()[0]["quantity"], 1)
+
+    async def test_prepared_entry_deadline_starts_after_slow_review_and_is_persisted_before_dispatch(self):
+        await self.warm()
+        self.config["require_source_verification"] = True
+        self.engine.verify_current = AsyncMock(return_value=True)
+        self.config["risk"]["buying_power_reserve_fraction"] = "0"
+        self.broker.account["buying_power"] = "100"
+        self.broker.result = dict(id="fixture-slow-review", status="filled", filled_quantity=1, fill_price=".80")
+        message = self.message()
+        captured = {}
+
+        async def slow_review():
+            row = self.store.db.execute("SELECT body FROM orders WHERE message_id=?", (message["id"],)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertNotIn("entry_cancel_at", json.loads(row["body"]))
+            self.now += timedelta(seconds=4)
+
+        self.broker.review_hook = slow_review
+        original_submit = self.broker.submit
+
+        async def capture_dispatch(order, before_submit=None):
+            async def capture_after_guard(snapshot, quote):
+                await before_submit(snapshot, quote)
+                row = self.store.db.execute("SELECT body FROM orders WHERE id=?", (order["client_order_id"],)).fetchone()
+                captured["body"] = json.loads(row["body"])
+
+            return await original_submit(order, before_submit=capture_after_guard)
+
+        self.broker.submit = capture_dispatch
+        result = await self.engine.handle(message)
+        self.assertEqual(result["state"], "broker_order", result)
+        self.engine.verify_current.assert_awaited_once()
+        expected_deadline = (self.now + timedelta(seconds=3)).isoformat()
+        self.assertEqual(captured["body"]["entry_cancel_at"], expected_deadline)
+        self.assertEqual(self.broker.submissions[0]["entry_cancel_at"], expected_deadline)
+
+    async def test_unprepared_entry_dispatch_trace_is_durable_before_placement(self):
+        self.config["require_source_verification"] = True
+        self.engine.verify_current = AsyncMock(return_value=True)
+        self.config["risk"]["buying_power_reserve_fraction"] = "0"
+        self.broker.account["buying_power"] = "100"
+        self.broker.error = RuntimeError("simulated response lost")
+        original_submit = self.broker.submit
+        captured = {}
+
+        async def capture_dispatch(order, before_submit=None):
+            self.assertFalse(order.get("prepared_entry"))
+            order["broker_submission"].update(stage="dispatch", review_seconds=0.2)
+
+            async def capture_after_guard(snapshot, quote):
+                await before_submit(snapshot, quote)
+                restarted = sqlite3.connect((Path(self.temp.name) / "live-watch.sqlite3").as_uri() + "?mode=ro", uri=True)
+                restarted.row_factory = sqlite3.Row
+                try:
+                    row = restarted.execute("SELECT body,status FROM orders WHERE id=?", (order["client_order_id"],)).fetchone()
+                    captured.update(body=json.loads(row["body"]), status=row["status"])
+                finally:
+                    restarted.close()
+
+            return await original_submit(order, before_submit=capture_after_guard)
+
+        self.broker.submit = capture_dispatch
+        result = await self.engine.handle(self.message())
+        self.assertEqual(result["state"], "unknown", result)
+        self.assertEqual(captured["status"], "submitting")
+        self.assertEqual(captured["body"]["broker_submission"], {"stage": "dispatch", "review_seconds": 0.2})
+        self.assertNotIn("entry_cancel_at", captured["body"])
+
+    async def test_snapshot_stage_timings_survive_later_submission_failure(self):
+        await self.warm()
+        self.config["require_source_verification"] = True
+        self.engine.verify_current = AsyncMock(return_value=True)
+        self.config["risk"]["buying_power_reserve_fraction"] = "0"
+        self.broker.account["buying_power"] = "100"
+        self.broker.account["read_timing"] = {
+            "account": .1234567,
+            "portfolio": .2,
+            "positions": .3,
+            "position_details": .4,
+            "orders": .5,
+            "ignored": .6,
+            "account_invalid": float("inf"),
+            "portfolio_invalid": True,
+            "orders_unbounded": 3601,
+        }
+        self.broker.error = RuntimeError("fixture response lost")
+        message = self.message()
+        result = await self.engine.handle(message)
+        self.assertEqual(result["state"], "unknown", result)
+        row = self.store.db.execute(
+            "SELECT decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1", (message["id"],)
+        ).fetchone()
+        timing = json.loads(row["decision"])["evaluation_timing"]
+        self.assertEqual(timing["snapshot_account_seconds"], .123457)
+        self.assertEqual(timing["snapshot_portfolio_seconds"], .2)
+        self.assertEqual(timing["snapshot_positions_seconds"], .3)
+        self.assertEqual(timing["snapshot_position_details_seconds"], .4)
+        self.assertEqual(timing["snapshot_orders_seconds"], .5)
+        self.assertNotIn("ignored", timing)
+        self.assertNotIn("snapshot_account_invalid_seconds", timing)
+        self.assertNotIn("snapshot_portfolio_invalid_seconds", timing)
+        self.assertNotIn("snapshot_orders_unbounded_seconds", timing)
 
     async def test_expired_entry_window_cannot_submit_after_slow_review(self):
         await self.warm()

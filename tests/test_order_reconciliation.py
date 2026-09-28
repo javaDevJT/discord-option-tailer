@@ -60,14 +60,30 @@ class OrderReconciliationChecks(unittest.IsolatedAsyncioTestCase):
         self.broker.cancel_order.assert_not_awaited()
         self.engine.stops.maintain.assert_not_awaited()
 
-    async def test_reservation_persists_cancel_deadline_and_restarts_without_submit(self):
+    async def test_dispatch_deadline_is_persisted_and_survives_restart(self):
         order = self.order("entry-1", after_seconds=3)
-        self.reserve(order)
+        order["prepared_entry"] = True
+        message = self.reserve(order)
         row = self.store.db.execute("SELECT body,status FROM orders WHERE id=?", ("entry-1",)).fetchone()
         body = json.loads(row["body"])
-        self.assertEqual(body["entry_cancel_at"], (NOW + timedelta(seconds=3)).isoformat())
+        self.assertNotIn("entry_cancel_at", body)
+        self.assertEqual(body["entry_cancel_after_seconds"], 3)
+
+        dispatch_at = NOW + timedelta(seconds=4)
+        self.store.arm_entry_deadline(order, dispatch_at)
+        row = self.store.db.execute("SELECT body,status FROM orders WHERE id=?", ("entry-1",)).fetchone()
+        body = json.loads(row["body"])
+        self.assertEqual(body["entry_cancel_at"], (dispatch_at + timedelta(seconds=3)).isoformat())
+
+        order["broker_submission"] = {"stage": "dispatch", "review_seconds": 0.2}
+        self.store.arm_entry_deadline(order, dispatch_at + timedelta(seconds=2))
+        body = json.loads(self.store.db.execute("SELECT body FROM orders WHERE id=?", ("entry-1",)).fetchone()["body"])
+        self.assertEqual(body["entry_cancel_at"], (dispatch_at + timedelta(seconds=3)).isoformat())
+        self.assertEqual(body["broker_submission"], order["broker_submission"])
 
         self.store.mark_unknown("entry-1")
+        event = self.store.db.execute("SELECT decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1", (message["id"],)).fetchone()
+        self.assertEqual(json.loads(event["decision"])["broker_submission"], order["broker_submission"])
         self.broker.order_status = AsyncMock(return_value={
             "id": "paper-entry-1",
             "status": "filled",
@@ -92,6 +108,65 @@ class OrderReconciliationChecks(unittest.IsolatedAsyncioTestCase):
             "fill_price": "1.00",
         })
         self.assertEqual(self.store.positions(), [])
+
+    async def test_entry_timeout_cancel_attribution_survives_later_reconciliation(self):
+        order = self.order("entry-timeout", deadline=(NOW - timedelta(seconds=1)).isoformat())
+        original_submission = {
+            "stage": "response",
+            "broker_state": "queued",
+            "status_recognized": True,
+            "broker_order_id": "paper-entry-timeout",
+        }
+        order["broker_submission"] = original_submission
+        message = self.reserve(order)
+        self.store.record(message, "broker_order", "submitted", {"broker_submission": original_submission})
+        self.store.db.execute("UPDATE orders SET status='open' WHERE id=?", ("entry-timeout",))
+        self.broker.cancel_order = AsyncMock(return_value={
+            "id": "paper-entry-timeout",
+            "status": "pending",
+            "filled_quantity": 0,
+            "fill_price": None,
+            "broker_state": "pending_cancelled",
+            "status_recognized": False,
+        })
+        evaluator = self.recovery()
+        await evaluator.reconcile_orders(force=True)
+
+        event = self.store.db.execute(
+            "SELECT decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1", (message["id"],)
+        ).fetchone()
+        decision = json.loads(event["decision"])
+        reconciliation = decision["order_reconciliation"]
+        self.assertEqual(decision["broker_submission"], original_submission)
+        self.assertEqual(reconciliation["cancel_reason"], "entry_timeout")
+        self.assertEqual(reconciliation["cancel_requested_at"], self.now.isoformat())
+        self.assertEqual(reconciliation["entry_cancel_at"], order["entry_cancel_at"])
+        self.assertEqual(reconciliation["cancel_result_status"], "pending")
+        self.assertEqual(reconciliation["cancel_result_broker_state"], "pending_cancelled")
+
+        # A later observe-only reconciliation must retain the initiating timeout and first response trace.
+        self.engine.observe_only = True
+        self.broker.order_status = AsyncMock(return_value={
+            "id": "paper-entry-timeout",
+            "status": "canceled",
+            "filled_quantity": 0,
+            "fill_price": None,
+            "broker_state": "cancelled",
+            "status_recognized": True,
+        })
+        await evaluator.reconcile_orders(force=True)
+        event = self.store.db.execute(
+            "SELECT decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1", (message["id"],)
+        ).fetchone()
+        decision = json.loads(event["decision"])
+        reconciliation = decision["order_reconciliation"]
+        self.assertEqual(decision["broker_submission"], original_submission)
+        self.assertEqual(reconciliation["status"], "canceled")
+        self.assertEqual(reconciliation["broker_state"], "cancelled")
+        self.assertTrue(reconciliation["status_recognized"])
+        self.assertEqual(reconciliation["cancel_reason"], "entry_timeout")
+        self.assertEqual(reconciliation["cancel_result_status"], "pending")
+        self.assertEqual(reconciliation["cancel_result_broker_state"], "pending_cancelled")
 
     async def test_unknown_fill_updates_originating_event_and_never_resubmits(self):
         message = self.reserve(self.order("entry-2"))

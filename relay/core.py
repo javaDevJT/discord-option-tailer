@@ -5,6 +5,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import time
@@ -459,20 +460,57 @@ class Store:
 
     @staticmethod
     def _entry_deadline(order, now):
-        """Persist the short entry window from the reservation timestamp."""
-        if not isinstance(order, dict) or not isinstance(now, datetime):
-            return order
+        """Calculate the short entry window from the dispatch boundary."""
+        if (not isinstance(order, dict) or not isinstance(now, datetime)
+                or now.tzinfo is None):
+            return None
         seconds = order.get("entry_cancel_after_seconds")
-        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
-            return order
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or seconds <= 0 or seconds > 3600 or not math.isfinite(seconds)):
+            return None
         if order.get("entry_cancel_at"):
-            return order
-        order["entry_cancel_at"] = (now + timedelta(seconds=seconds)).isoformat()
-        return order
+            return order["entry_cancel_at"]
+        return (now + timedelta(seconds=seconds)).isoformat()
+
+    def arm_entry_deadline(self, order, now):
+        """Persist dispatch evidence, arming a deadline only for prepared entries."""
+        order_id = order.get("client_order_id")
+        row = self.db.execute("SELECT body,status FROM orders WHERE id=?", (order_id,)).fetchone()
+        if row is None or row["status"] != "submitting":
+            raise Hold("order reservation is no longer awaiting dispatch")
+        persisted = json.loads(row["body"])
+        deadline = persisted.get("entry_cancel_at")
+        if order.get("prepared_entry") is True and not deadline:
+            if "entry_cancel_after_seconds" not in order:
+                raise Hold("prepared entry cancellation window is missing")
+            deadline = self._entry_deadline(order, now)
+            if deadline is None:
+                raise Hold("prepared entry cancellation window is invalid")
+        updated = dict(order)
+        if deadline:
+            updated["entry_cancel_at"] = deadline
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE orders SET body=? WHERE id=? AND status='submitting'",
+                (json.dumps(updated), order_id),
+            )
+            if changed.rowcount != 1:
+                raise Hold("order evidence could not be persisted before dispatch")
+        if deadline:
+            order["entry_cancel_at"] = deadline
+        return deadline
+
+    def persist_active_order_body(self, order_id, body):
+        """Durably update recovery attribution while an order can still be active."""
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE orders SET body=? WHERE id=? AND status NOT IN ('filled','canceled','rejected','expired')",
+                (json.dumps(body), order_id),
+            )
+            if changed.rowcount != 1:
+                raise Hold("order is no longer active for reconciliation")
 
     def reserve(self, message, decision, order, now):
-        if decision["action"] == "OPEN":
-            order = self._entry_deadline(order, now)
         with self.db:
             if decision["action"] in {"OPEN", "REDUCE"} and decision.get("stop_price") is not None:
                 self.save_stop_request(message, decision, entry_order=order if decision["action"] == "OPEN" else None)
@@ -523,12 +561,32 @@ class Store:
             decision = json.loads(event["decision"]) if event["decision"] else {}
         except (TypeError, ValueError):
             decision = {}
-        decision["order_reconciliation"] = {
+        try:
+            order_body = json.loads(order["body"])
+        except (TypeError, ValueError):
+            order_body = {}
+        reconciliation = {
             "status": status,
             "filled_quantity": filled_quantity,
-            "requested_quantity": json.loads(order["body"]).get("quantity"),
+            "requested_quantity": order_body.get("quantity"),
             "broker_order_id": order["broker_id"] if order["broker_id"] else (result or {}).get("id"),
         }
+        submission = order_body.get("broker_submission")
+        submission = submission if isinstance(submission, dict) else {}
+        if submission and not decision.get("broker_submission"):
+            decision["broker_submission"] = submission
+        response = result if isinstance(result, dict) else {}
+        for key in ("broker_state", "status_recognized"):
+            value = response.get(key, submission.get(key))
+            if key == "broker_state" and isinstance(value, str) and value.isascii() and len(value) <= 64:
+                reconciliation[key] = value
+            elif key == "status_recognized" and type(value) is bool:
+                reconciliation[key] = value
+        for key in ("cancel_reason", "cancel_requested_at", "entry_cancel_at",
+                    "cancel_result_status", "cancel_result_broker_state"):
+            if key in order_body:
+                reconciliation[key] = order_body[key]
+        decision["order_reconciliation"] = reconciliation
         if result and result.get("fill_price") is not None:
             decision["order_reconciliation"]["fill_price"] = result["fill_price"]
         if status == "unknown":
@@ -1007,6 +1065,12 @@ class Engine:
                 timing["received_to_submission_seconds"] = round(now - received, 6)
                 if "posted_to_receipt_seconds" in timing:
                     timing["posted_to_submission_seconds"] = round(timing["posted_to_receipt_seconds"] + now - received, 6)
+            self.store.arm_entry_deadline(order, self.clock())
+
+        submission_trace = order.setdefault("broker_submission", {})
+        if not isinstance(submission_trace, dict):
+            raise Hold("broker submission trace is invalid")
+        decision["broker_submission"] = submission_trace
         try:
             if self.mode == "live":
                 result = await self.measure(decision, "submission_seconds", self.broker.submit(order, before_submit=before_submit))
@@ -1187,6 +1251,21 @@ class Engine:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*reads, return_exceptions=True)
+        snapshot_timing = snapshot.get("read_timing") if isinstance(snapshot, dict) else None
+        if isinstance(snapshot_timing, dict):
+            timing_fields = {
+                "account": "snapshot_account_seconds",
+                "portfolio": "snapshot_portfolio_seconds",
+                "positions": "snapshot_positions_seconds",
+                "position_details": "snapshot_position_details_seconds",
+                "orders": "snapshot_orders_seconds",
+            }
+            evaluation_timing = decision.setdefault("evaluation_timing", {})
+            for source, target in timing_fields.items():
+                value = snapshot_timing.get(source)
+                if (type(value) in (int, float) and 0 <= value <= 3600
+                        and math.isfinite(value)):
+                    evaluation_timing[target] = round(value, 6)
         if self.mode != "paper" and snapshot.get("account_id") != self.account:
             raise Hold("broker snapshot does not match the bound account")
         restrictions = snapshot.get("restrictions", [])

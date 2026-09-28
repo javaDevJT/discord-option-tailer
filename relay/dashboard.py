@@ -40,10 +40,13 @@ EVENT_STATES = MESSAGE_STATES | ORDER_STATUSES
 DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
-    "evaluation_timing", "entry_preparation", "expiry_resolution", "profit_only", "exit_evaluation",
+    "evaluation_timing", "entry_preparation", "expiry_resolution", "broker_submission", "profit_only", "exit_evaluation",
     "stop_evaluation", "order_reconciliation",
     "execution_diagnostic",
 )
+BROKER_SUBMISSION_STAGES = frozenset({"snapshot", "review", "dispatch", "response", "validated"})
+EXPIRY_SELECTION_SOURCES = frozenset({"bulk", "requested_date_probe", "later_date"})
+REQUESTED_DATE_PROBE_STATUSES = frozenset({"matched", "empty", "filtered", "failed"})
 ENTRY_PREPARATION_ROUTES = frozenset({"prepared", "fresh"})
 ENTRY_PREPARATION_REASONS = frozenset({
     "prepared", "no_watch_cached", "no_matching_watch", "watch_preparing", "watch_preparation_failed",
@@ -89,6 +92,10 @@ def _safe_state(value):
 def _safe_identifier(value, limit=128):
     value = _safe_text(value, limit)
     return value if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) else ""
+
+
+def _safe_broker_state(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z_]{0,47}", value) else None
 
 
 def _safe_channel_id(value):
@@ -194,10 +201,55 @@ def _project_order_reconciliation(value):
     broker_id = _safe_broker_id(reconciliation.get("broker_order_id"))
     if broker_id:
         result["broker_order_id"] = broker_id
+    broker_state = _safe_broker_state(reconciliation.get("broker_state"))
+    if broker_state:
+        result["broker_state"] = broker_state
+    if type(reconciliation.get("status_recognized")) is bool:
+        result["status_recognized"] = reconciliation["status_recognized"]
+    if reconciliation.get("cancel_reason") == "entry_timeout":
+        result["cancel_reason"] = "entry_timeout"
+    for key in ("cancel_requested_at", "entry_cancel_at"):
+        timestamp = _safe_timestamp(reconciliation.get(key))
+        if timestamp is not None:
+            result[key] = timestamp
+    cancel_status = _safe_text(reconciliation.get("cancel_result_status"), 64).lower()
+    if cancel_status in ORDER_STATUSES:
+        result["cancel_result_status"] = cancel_status
+    cancel_state = _safe_broker_state(reconciliation.get("cancel_result_broker_state"))
+    if cancel_state:
+        result["cancel_result_broker_state"] = cancel_state
     if "fill_price" in reconciliation:
         fill_price = _safe_scalar(reconciliation["fill_price"], 256)
         if fill_price is not None:
             result["fill_price"] = fill_price
+    return result or None
+
+
+def _project_broker_submission(value):
+    submission = _json_object(value)
+    result = {}
+    stage = _safe_text(submission.get("stage"), 32)
+    if stage in BROKER_SUBMISSION_STAGES:
+        result["stage"] = stage
+    broker_state = _safe_broker_state(submission.get("broker_state"))
+    if broker_state:
+        result["broker_state"] = broker_state
+    if type(submission.get("status_recognized")) is bool:
+        result["status_recognized"] = submission["status_recognized"]
+    broker_id = _safe_broker_id(submission.get("broker_order_id"))
+    if broker_id:
+        result["broker_order_id"] = broker_id
+    for key in ("submitted_at", "response_at"):
+        timestamp = _safe_timestamp(submission.get(key))
+        if timestamp is not None:
+            result[key] = timestamp
+    for key in (
+        "snapshot_seconds", "review_seconds", "dispatch_guard_seconds", "placement_seconds",
+        "response_validation_seconds",
+    ):
+        duration = submission.get(key)
+        if type(duration) in (int, float) and 0 <= duration <= 315_360_000 and math.isfinite(duration):
+            result[key] = duration
     return result or None
 
 
@@ -384,7 +436,8 @@ def _project_evaluation_timing(value):
         "posted_to_decision_seconds", "jev_duration_seconds",
         "codex_duration_seconds", "queue_wait_seconds", "preparation_seconds",
         "interpretation_seconds", "execution_wait_seconds", "execution_seconds",
-        "snapshot_seconds", "quote_seconds", "source_verification_seconds",
+        "snapshot_seconds", "snapshot_account_seconds", "snapshot_portfolio_seconds", "snapshot_positions_seconds",
+        "snapshot_position_details_seconds", "snapshot_orders_seconds", "quote_seconds", "source_verification_seconds",
         "contract_resolution_seconds", "submission_seconds", "received_to_submission_seconds",
         "posted_to_submission_seconds",
         "broker_ack_seconds", "fill_seconds",
@@ -476,6 +529,14 @@ def _project_recovery(value):
     return result
 
 
+def _project_expiry_rejections(value):
+    rejected = _json_object(value)
+    return {
+        key: count for key, count in rejected.items()
+        if key in EXPIRY_REJECTION_REASONS and type(count) is int and 0 <= count <= 1_000_000
+    }
+
+
 def _project_expiry_resolution(value):
     resolution = _json_object(value)
     result = {}
@@ -496,12 +557,31 @@ def _project_expiry_resolution(value):
         count = resolution.get(key)
         if type(count) is int and 0 <= count <= 1_000_000:
             result[key] = count
-    rejected = _json_object(resolution.get("rejected"))
+    selection_source = _safe_text(resolution.get("selection_source"), 32)
+    if selection_source in EXPIRY_SELECTION_SOURCES:
+        result["selection_source"] = selection_source
+    rejected = _project_expiry_rejections(resolution.get("rejected"))
     if rejected:
-        result["rejected"] = {
-            key: count for key, count in rejected.items()
-            if key in EXPIRY_REJECTION_REASONS and type(count) is int and 0 <= count <= 1_000_000
-        }
+        result["rejected"] = rejected
+    probe = _json_object(resolution.get("requested_date_probe"))
+    projected_probe = {}
+    if type(probe.get("attempted")) is bool:
+        projected_probe["attempted"] = probe["attempted"]
+    probe_status = _safe_text(probe.get("status"), 16)
+    if probe_status in REQUESTED_DATE_PROBE_STATUSES:
+        projected_probe["status"] = probe_status
+    for key in ("instrument_count", "eligible_count"):
+        count = probe.get(key)
+        if type(count) is int and 0 <= count <= 1_000_000:
+            projected_probe[key] = count
+    duration = probe.get("duration_seconds")
+    if type(duration) in (int, float) and 0 <= duration <= 315_360_000 and math.isfinite(duration):
+        projected_probe["duration_seconds"] = duration
+    probe_rejected = _project_expiry_rejections(probe.get("rejected"))
+    if probe_rejected:
+        projected_probe["rejected"] = probe_rejected
+    if projected_probe:
+        result["requested_date_probe"] = projected_probe
     return result or None
 
 
@@ -557,6 +637,10 @@ def _project_decision(value):
             result[key] = _project_entry_evaluation(current)
         elif key == "entry_preparation":
             projected = _project_entry_preparation(current)
+            if projected is not None:
+                result[key] = projected
+        elif key == "broker_submission":
+            projected = _project_broker_submission(current)
             if projected is not None:
                 result[key] = projected
         elif key == "expiry_resolution":

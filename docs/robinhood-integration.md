@@ -43,9 +43,17 @@ Watch-only shorthand such as `QQQ740P` and `QQQ $740P` prepares the same contrac
 
 ## Uncertain orders and restart recovery
 
+If the bulk lookup omits an eligible contract for the requested, chain-listed date, the relay confirms that date with a focused lookup before choosing a later expiry. The card retains the original bulk counts and a separate probe result, duration, and selection source. A failed confirmation holds the entry instead of assuming the requested date is unavailable.
+
+The first broker response has a separate submission trace that survives later reconciliation: review, snapshot, final guard, placement and validation timings; dispatch/response timestamps; broker order ID; and a bounded lifecycle-state token. Unfamiliar well-formed states retain the verified order identity and fills as nonterminal pending, blocking new orders until reconciliation. Invalid identity, price, quantity or fill accounting still fails closed. Raw provider messages and credentials are never copied into the trace.
+
+Snapshot diagnostics separate accounts, portfolio, positions, orders and position-detail reads. Position details start as soon as positions arrive, and prepared submission overlaps a required snapshot refresh with broker review. These durations overlap and must not be summed. The existing one-second execution-scope reuse limit is unchanged.
+
 Uncertain buys are reconciled before startup accepts fresh messages and by a separate background worker while running. A known broker UUID is looked up directly. A lost placement response can instead be resolved only when one agentic broker order matches the persisted contract, side/effect, quantity, limit, order type and submission window on the bound account. Matching does not resend the buy. Manual holdings alone do not establish source ownership; missing or ambiguous evidence keeps the order blocked.
 
 Confirmed cumulative fills update the durable source-owned position and the message's order result together. Repeated reconciliation cannot add the same fill twice. Recovered inventory also restarts missed-exit scanning, so a later sell can use the original source and entry lifetime after restart. Prepared entries persist their cancellation deadline; a restart cancels an expired remainder and reconciles any fill that raced cancellation.
+
+The three-second prepared-entry deadline is armed after final checks, immediately before dispatch, and saved before sending the order. Review time no longer consumes that window. Automatic timeout cancellation records its request time, deadline, reason and broker result separately from the final order status, including across restart.
 
 ## Modes and allocation
 

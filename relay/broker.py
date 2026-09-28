@@ -9,9 +9,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import functools
 import json
+import logging
 import hmac
 import hashlib
 import os
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import stat
@@ -44,6 +46,11 @@ class BrokerError(RuntimeError):
 
 class BrokerPreflightHold(BrokerError):
     """Final dispatch validation failed before any order transport began."""
+
+
+def _broker_state(value):
+    """Keep lifecycle tokens, never arbitrary provider text, in diagnostics."""
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z_]{0,47}", value) else None
 
 
 class _ExecutionReadScope:
@@ -1471,11 +1478,28 @@ class RobinhoodBroker(RobinhoodMCP):
         if cached is not None:
             return cached
         observed_at = self.clock()
-        account_data, portfolio_result, positions, orders = await asyncio.gather(
-            self._data("get_accounts", {}), self._portfolio(),
-            self._pages("get_option_positions", {"account_number": self.account_number, "nonzero": True}, "positions"),
-            self._pages("get_option_orders", {"account_number": self.account_number}, "orders"),
-        )
+        read_timing = {}
+
+        async def measured(name, work):
+            started = time.monotonic()
+            try:
+                return await work
+            finally:
+                read_timing[name] = round(time.monotonic() - started, 6)
+
+        async def positions_with_details():
+            positions = await measured("positions", self._pages(
+                "get_option_positions", {"account_number": self.account_number, "nonzero": True}, "positions"))
+            details = await measured("position_details", self._snapshot_position_data(positions))
+            return positions, details
+
+        account_data, portfolio_result, position_result, orders = await self._bounded_reads(lambda read: read(), [
+            lambda: measured("account", self._data("get_accounts", {})),
+            lambda: measured("portfolio", self._portfolio()),
+            positions_with_details,
+            lambda: measured("orders", self._pages("get_option_orders", {"account_number": self.account_number}, "orders")),
+        ])
+        positions, position_data = position_result
         matches = [row for row in account_data["accounts"] or [] if row["account_number"] == self.account_number]
         if len(matches) != 1:
             raise BrokerError("Bound Robinhood account is missing or ambiguous")
@@ -1483,7 +1507,6 @@ class RobinhoodBroker(RobinhoodMCP):
         portfolio, power = portfolio_result
         exposure, normalized = {}, []
         reported_pending_buys = {}
-        position_data = await self._snapshot_position_data(positions)
         for position in positions:
             quantity = _contracts(position["quantity"])
             if not quantity:
@@ -1580,6 +1603,7 @@ class RobinhoodBroker(RobinhoodMCP):
                 "agentic_allowed": account.get("agentic_allowed") is True, "option_level": account.get("option_level"),
                 "account_type": account["type"], "account_state": account["state"], "restrictions": restrictions,
                 "simulated": False, "sandbox_status": "not_reported", "source": "Robinhood Agentic MCP"}
+        result["read_timing"] = read_timing
         self._remember_execution_snapshot(result)
         return result
 
@@ -1589,6 +1613,7 @@ class RobinhoodBroker(RobinhoodMCP):
         target = _contract_key(contract)
         requested_day = datetime.strptime(target[1], "%Y-%m-%d").date()
         if diagnostic is not None:
+            diagnostic.clear()
             diagnostic.update(requested_expiry=target[1])
         # One bounded near-term query removes the chain dependency for daily/weekly entries.
         # Later dates still use individual exact queries, with complete pagination.
@@ -1639,20 +1664,7 @@ class RobinhoodBroker(RobinhoodMCP):
             if expiry >= target[1]
         } | {row["expiration_date"] for row in instruments
              if row["chain_id"] in eligible_ids and row["expiration_date"] in prefetched_dates})
-        for expiry in expiries:
-            rows = instruments if expiry in prefetched_dates else await self._pages(
-                    "get_option_instruments",
-                    {
-                        "chain_symbol": target[0],
-                        "expiration_dates": expiry,
-                        "strike_price": format(Decimal(target[2]), "f"),
-                        "type": target[3],
-                        "state": "active",
-                        "tradability": "tradable",
-                    },
-                    "instruments",
-                )
-
+        def matching(rows, expiry):
             candidates = []
             for chain in eligible_chains:
                 for instrument in rows:
@@ -1669,10 +1681,44 @@ class RobinhoodBroker(RobinhoodMCP):
                         candidates.append((chain, instrument))
             if len(candidates) > 1:
                 raise BrokerError("Option expiration is ambiguous across chains")
+            return candidates
+
+        async def exact_date(expiry):
+            return await self._pages(
+                    "get_option_instruments",
+                    {
+                        "chain_symbol": target[0],
+                        "expiration_dates": expiry,
+                        "strike_price": format(Decimal(target[2]), "f"),
+                        "type": target[3],
+                        "state": "active",
+                        "tradability": "tradable",
+                    },
+                    "instruments",
+                )
+        for expiry in expiries:
+            rows = instruments if expiry in prefetched_dates else await exact_date(expiry)
+            candidates = matching(rows, expiry)
+            selection_source = "bulk" if expiry == target[1] else "later_date"
+            if not candidates and expiry == target[1]:
+                # Confirm an omitted listed date before accepting a different contract.
+                probe = {"attempted": True, "status": "failed"}
+                if diagnostic is not None:
+                    diagnostic["requested_date_probe"] = probe
+                started = time.monotonic()
+                try:
+                    exact_rows = await exact_date(expiry)
+                    candidates = matching(exact_rows, expiry)
+                    probe.update(instrument_count=len(exact_rows), eligible_count=len(candidates),
+                                 status="matched" if candidates else "filtered" if exact_rows else "empty")
+                finally:
+                    probe["duration_seconds"] = round(time.monotonic() - started, 6)
+                selection_source = "requested_date_probe"
             if candidates:
                 resolved = dict(contract, expiry=expiry)
                 if diagnostic is not None:
                     diagnostic["selected_expiry"] = expiry
+                    diagnostic["selection_source"] = selection_source
                 self._remember_execution_handoff(resolved, *candidates[0])
                 return resolved
         raise BrokerError("No listed expiration for the requested option")
@@ -2168,7 +2214,7 @@ class RobinhoodBroker(RobinhoodMCP):
         order_type = order.get("order_type", "limit")
         identity = {
             key: value for key, value in order.items()
-            if key not in {"entry_evaluation", "limit_price", "stop_price", "time_in_force", "order_type"}
+            if key not in {"entry_evaluation", "broker_submission", "entry_cancel_at", "limit_price", "stop_price", "time_in_force", "order_type"}
         }
         identity["contract"] = _contract_key(order.get("contract"))
         identity["order_type"] = order_type
@@ -2186,19 +2232,26 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Prior submission outcome is unknown; reconcile without resubmitting")
         self.order_bodies[client_id] = body
         self.order_inputs[client_id] = copy.deepcopy(order)
+        trace = order.setdefault("broker_submission", {})
+        trace["stage"] = "snapshot"
+
+        async def timed(name, work):
+            started = time.monotonic()
+            try:
+                return await work
+            finally:
+                trace[name + "_seconds"] = round(time.monotonic() - started, 6)
+
         try:
             prepared_entry = order.get("prepared_entry") is True
             if prepared_entry:
-                snapshot = await self.snapshot()
                 args, metadata = self._prepared_order_args(order)
-                review_payload = await self._data(
-                    "review_option_order",
-                    dict(
-                        args,
-                        chain_symbol=metadata["contract"]["symbol"],
-                        underlying_type="equity",
-                    ),
-                )
+                trace["stage"] = "review"
+                snapshot, review_payload = await self._bounded_reads(lambda read: read(), [
+                    lambda: timed("snapshot", self.snapshot()),
+                    lambda: timed("review", self._data("review_option_order", dict(
+                        args, chain_symbol=metadata["contract"]["symbol"], underlying_type="equity"))),
+                ])
                 quote = self._review_option_quote(review_payload, metadata)
                 review, fee = await self._review_args(
                     args,
@@ -2206,10 +2259,10 @@ class RobinhoodBroker(RobinhoodMCP):
                     review=review_payload,
                 )
             elif self.currency is None:
-                snapshot = await self.snapshot()
+                snapshot = await timed("snapshot", self.snapshot())
                 args, quote = await self._order_args(order)
             else:
-                snapshot_task = asyncio.create_task(self.snapshot())
+                snapshot_task = asyncio.create_task(timed("snapshot", self.snapshot()))
                 order_args_task = asyncio.create_task(self._order_args(order))
                 try:
                     snapshot, order_result = await asyncio.gather(snapshot_task, order_args_task)
@@ -2230,7 +2283,8 @@ class RobinhoodBroker(RobinhoodMCP):
                 if order["quantity"] > available:
                     raise BrokerError("Order would exceed available long option inventory")
             if not prepared_entry:
-                review, fee = await self._review_args(args, quote)
+                trace["stage"] = "review"
+                review, fee = await timed("review", self._review_args(args, quote))
             if order["side"] == "buy" and _decimal(args["price"], "price") * 100 * order["quantity"] + max(fee, Decimal(0)) > _decimal(snapshot["buying_power"], "buying power"):
                 raise BrokerError("Actual review fees and premium exceed available buying power")
             self._fresh_quote(quote)
@@ -2244,9 +2298,10 @@ class RobinhoodBroker(RobinhoodMCP):
         except BrokerError as exc:
             raise BrokerPreflightHold(f"Order preflight validation held the order: {exc}") from exc
         ref_id = _order_ref_id(self.account_number, client_id)
+        trace["stage"] = "dispatch"
         if before_submit is not None:
             try:
-                await before_submit(snapshot, quote)
+                await timed("dispatch_guard", before_submit(snapshot, quote))
                 self._live_enabled()
                 self._fresh_quote(quote)
                 for position in snapshot["positions"]:
@@ -2256,12 +2311,29 @@ class RobinhoodBroker(RobinhoodMCP):
             except Exception as exc:
                 raise BrokerPreflightHold("Final dispatch validation held the order; nothing was submitted") from exc
         self.attempted.add(client_id)
+        trace["submitted_at"] = self.clock().isoformat()
         try:
-            result = await self._data("place_option_order", dict(args, ref_id=ref_id))
+            result = await timed("placement", self._data("place_option_order", dict(args, ref_id=ref_id)))
         finally:
             self.account_changed.set()
             self._invalidate_execution_scope()
-        normalized = self._order_result(result.get("order"), client_id, args)
+        trace.update(stage="response", response_at=self.clock().isoformat())
+        raw = result.get("order")
+        if isinstance(raw, dict):
+            state = _broker_state(raw.get("state"))
+            if state is not None:
+                trace["broker_state"] = state
+            if isinstance(raw.get("id"), str):
+                try:
+                    trace["broker_order_id"] = str(uuid.UUID(raw["id"]))
+                except ValueError:
+                    pass
+        started = time.monotonic()
+        try:
+            normalized = self._order_result(raw, client_id, args)
+        finally:
+            trace["response_validation_seconds"] = round(time.monotonic() - started, 6)
+        trace.update(stage="validated", status_recognized=normalized.get("status_recognized", True))
         normalized["ref_id"] = ref_id
         self.order_results[client_id] = normalized
         return dict(normalized)
@@ -2440,19 +2512,26 @@ class RobinhoodBroker(RobinhoodMCP):
             "voided": "rejected",
             "pending_cancelled": "open",
         }
-        if raw.get("state") not in states:
-            raise BrokerError("Unknown Robinhood order status; reconciliation is required")
+        raw_state = _broker_state(raw.get("state"))
+        if raw_state is None:
+            raise BrokerError("Malformed Robinhood order lifecycle state; reconciliation is required")
+        state = raw_state.lower()
+        recognized = state in states
         filled = _contracts(raw.get("processed_quantity"))
         premium = _decimal(raw.get("processed_premium"), "filled premium")
         if filled > _contracts(raw.get("quantity")) or (not filled and premium):
             raise BrokerError("Inconsistent cumulative Robinhood fills")
-        if (raw["state"] == "filled" and filled != _contracts(raw["quantity"])) or (filled and not premium):
+        if (state == "filled" and filled != _contracts(raw["quantity"])) or (filled and not premium):
             raise BrokerError("Robinhood fill quantity or premium is inconsistent with its status")
+        if not recognized and self.order_results.get(client_id, {}).get("broker_state") != raw_state:
+            logging.getLogger(__name__).warning("Unrecognized broker order state=%s; tracking as pending", raw_state)
         return {
             "id": raw["id"],
             "client_order_id": client_id,
             "broker_order_id": raw["id"],
-            "status": states[raw["state"]],
+            "status": states.get(state, "pending"),
+            "broker_state": raw_state,
+            "status_recognized": recognized,
             "filled_quantity": filled,
             "fill_price": str(premium / 100 / filled) if filled else None,
             "timestamp": raw.get("updated_at") or raw["created_at"],

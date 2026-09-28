@@ -421,6 +421,11 @@ function relayReadTimeoutSignal() {
       evaluationTimingPart(timing, "execution_wait_seconds", "Execution wait"),
       evaluationTimingPart(timing, "execution_seconds", "Execution"),
       evaluationTimingPart(timing, "snapshot_seconds", "Snapshot"),
+      evaluationTimingPart(timing, "snapshot_account_seconds", "Snapshot account"),
+      evaluationTimingPart(timing, "snapshot_portfolio_seconds", "Snapshot portfolio"),
+      evaluationTimingPart(timing, "snapshot_positions_seconds", "Snapshot positions"),
+      evaluationTimingPart(timing, "snapshot_position_details_seconds", "Snapshot position details"),
+      evaluationTimingPart(timing, "snapshot_orders_seconds", "Snapshot orders"),
       evaluationTimingPart(timing, "quote_seconds", "Quote"),
       evaluationTimingPart(timing, "source_verification_seconds", "Source verification"),
       evaluationTimingPart(timing, "contract_resolution_seconds", "Contract resolution"),
@@ -961,6 +966,14 @@ function renderExpiryResolution(parent, resolution, label) {
   const parts = [];
   const dateValue = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
   const countValue = (value) => Number.isInteger(value) && value >= 0 && value <= 1_000_000 ? formatNumber(value) : null;
+  const rejectionSummary = (rejected) => {
+    if (!rejected || typeof rejected !== "object" || Array.isArray(rejected)) return "";
+    const reasons = ["wrong_chain", "inactive", "untradable", "non_equity", "nonstandard_multiplier", "contract_mismatch"];
+    return reasons
+      .filter((reason) => Number.isInteger(rejected[reason]) && rejected[reason] > 0 && rejected[reason] <= 1_000_000)
+      .map((reason) => `${humanize(reason)} ${formatNumber(rejected[reason])}`)
+      .join(", ");
+  };
   const requested = dateValue(resolution.requested_expiry);
   const selected = dateValue(resolution.selected_expiry);
   if (requested || selected) {
@@ -971,20 +984,38 @@ function renderExpiryResolution(parent, resolution, label) {
   if (instruments !== null || eligible !== null) {
     parts.push(`Requested date ${instruments ?? "—"} instruments / ${eligible ?? "—"} eligible`);
   }
+  if (["bulk", "requested_date_probe", "later_date"].includes(resolution.selection_source)) {
+    parts.push(`Selection ${humanize(resolution.selection_source)}`);
+  }
   for (const [key, title] of [["listed_expiries", "Listed"], ["returned_expiries", "Returned"]]) {
     const dates = Array.isArray(resolution[key])
       ? resolution[key].slice(0, 16).map(dateValue).filter(Boolean)
       : [];
     if (dates.length) parts.push(`${title} ${dates.join(", ")}`);
   }
-  const rejected = resolution.rejected;
-  if (rejected && typeof rejected === "object" && !Array.isArray(rejected)) {
-    const reasons = ["wrong_chain", "inactive", "untradable", "non_equity", "nonstandard_multiplier", "contract_mismatch"];
-    const counts = reasons
-      .map((reason) => [reason, rejected[reason]])
-      .filter(([, count]) => Number.isInteger(count) && count > 0 && count <= 1_000_000)
-      .map(([reason, count]) => `${humanize(reason)} ${count}`);
-    if (counts.length) parts.push(`Rejected ${counts.join(", ")}`);
+  const rejections = rejectionSummary(resolution.rejected);
+  if (rejections) parts.push(`Rejected ${rejections}`);
+  const probe = resolution.requested_date_probe;
+  if (probe && typeof probe === "object" && !Array.isArray(probe)) {
+    const probeParts = [];
+    if (probe.attempted === true) {
+      const status = ["matched", "empty", "filtered", "failed"].includes(probe.status) ? humanize(probe.status) : "Outcome unavailable";
+      probeParts.push(status);
+    } else if (probe.attempted === false) {
+      probeParts.push("Not attempted");
+    }
+    const probeInstruments = countValue(probe.instrument_count);
+    const probeEligible = countValue(probe.eligible_count);
+    if (probeInstruments !== null || probeEligible !== null) {
+      probeParts.push(`${probeInstruments ?? "—"} instruments / ${probeEligible ?? "—"} eligible`);
+    }
+    if (typeof probe.duration_seconds === "number" && Number.isFinite(probe.duration_seconds)
+        && probe.duration_seconds >= 0 && probe.duration_seconds <= 315_360_000) {
+      probeParts.push(formatEvaluationDuration(probe.duration_seconds));
+    }
+    const probeRejections = rejectionSummary(probe.rejected);
+    if (probeRejections) probeParts.push(`rejected ${probeRejections}`);
+    if (probeParts.length) parts.push(`Requested-date probe ${probeParts.join(" · ")}`);
   }
   if (parts.length) append(parent, node("p", "record-meta", `${label} / ${parts.join(" · ")}`));
 }
@@ -1025,6 +1056,60 @@ function renderEntryPreparation(parent, preparation, directExpiryResolution) {
     renderExpiryResolution(parent, preparation.expiry_resolution, "Watch expiry");
   }
   renderExpiryResolution(parent, directExpiryResolution, "Expiry resolution");
+}
+
+function renderBrokerLifecycle(parent, submission, reconciliation) {
+  if (submission && typeof submission === "object" && !Array.isArray(submission)) {
+    const parts = [];
+    if (["snapshot", "review", "dispatch", "response", "validated"].includes(submission.stage)) {
+      parts.push(`Stage ${humanize(submission.stage)}`);
+    }
+    if (typeof submission.broker_state === "string" && /^[A-Za-z][A-Za-z_]{0,47}$/.test(submission.broker_state)) {
+      parts.push(`Broker state ${humanize(submission.broker_state)}`);
+    }
+    if (typeof submission.status_recognized === "boolean") {
+      parts.push(submission.status_recognized ? "Status recognized" : "Status unrecognized");
+    }
+    const brokerId = safeString(submission.broker_order_id);
+    if (/^[A-Za-z0-9_.:-]{1,256}$/.test(brokerId) && !/^\d{5,20}$/.test(brokerId)) parts.push(`Order ${brokerId}`);
+    for (const [key, label] of [["submitted_at", "Submitted"], ["response_at", "Response"]]) {
+      if (typeof submission[key] === "string") parts.push(`${label} ${formatDate(submission[key])}`);
+    }
+    for (const [key, label] of [
+      ["snapshot_seconds", "Snapshot"], ["review_seconds", "Review"], ["dispatch_guard_seconds", "Dispatch guard"],
+      ["placement_seconds", "Placement"], ["response_validation_seconds", "Response validation"],
+    ]) {
+      const duration = submission[key];
+      if (typeof duration === "number" && Number.isFinite(duration) && duration >= 0 && duration <= 315_360_000) {
+        parts.push(`${label} ${formatEvaluationDuration(duration)}`);
+      }
+    }
+    if (parts.length) append(parent, node("p", "record-meta", `Broker submission / ${parts.join(" · ")}`));
+  }
+
+  if (reconciliation && typeof reconciliation === "object" && !Array.isArray(reconciliation)) {
+    const parts = [];
+    if (reconciliation.status) parts.push(`Status ${humanize(reconciliation.status)}`);
+    if (typeof reconciliation.broker_state === "string" && /^[A-Za-z][A-Za-z_]{0,47}$/.test(reconciliation.broker_state)) {
+      parts.push(`Broker state ${humanize(reconciliation.broker_state)}`);
+    }
+    if (typeof reconciliation.status_recognized === "boolean") {
+      parts.push(reconciliation.status_recognized ? "Status recognized" : "Status unrecognized");
+    }
+    if (reconciliation.cancel_reason === "entry_timeout") parts.push("Cancel reason Entry Timeout");
+    if (typeof reconciliation.cancel_requested_at === "string") {
+      parts.push(`Cancel requested ${formatDate(reconciliation.cancel_requested_at)}`);
+    }
+    const cancelStatus = reconciliation.cancel_result_status ? humanize(reconciliation.cancel_result_status) : "";
+    const cancelState = reconciliation.cancel_result_broker_state && /^[A-Za-z][A-Za-z_]{0,47}$/.test(reconciliation.cancel_result_broker_state)
+      ? humanize(reconciliation.cancel_result_broker_state)
+      : "";
+    if (cancelStatus || cancelState) parts.push(`Cancel result ${[cancelStatus, cancelState].filter(Boolean).join(" / ")}`);
+    if (typeof reconciliation.entry_cancel_at === "string") {
+      parts.push(`Entry cancel deadline ${formatDate(reconciliation.entry_cancel_at)}`);
+    }
+    if (parts.length) append(parent, node("p", "record-meta", `Order reconciliation / ${parts.join(" · ")}`));
+  }
 }
 
 function renderStopOrder(parent, order) {
@@ -1098,6 +1183,7 @@ function renderStopOrder(parent, order) {
       if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
       renderEvaluationTiming(decisionPanel, event);
       renderEntryPreparation(decisionPanel, readDecision(event).entry_preparation, readDecision(event).expiry_resolution);
+      renderBrokerLifecycle(decisionPanel, readDecision(event).broker_submission, readDecision(event).order_reconciliation);
       renderProtection(decisionPanel, readDecision(event).stop_evaluation);
         }
       } else {
@@ -1115,6 +1201,7 @@ function renderStopOrder(parent, order) {
       append(decisionPanel, node("p", "decision-reason", decisionReason(previous)));
       renderEvaluationTiming(decisionPanel, previous);
       renderEntryPreparation(decisionPanel, readDecision(previous).entry_preparation, readDecision(previous).expiry_resolution);
+      renderBrokerLifecycle(decisionPanel, readDecision(previous).broker_submission, readDecision(previous).order_reconciliation);
     }
     const related = getOrdersForMessage(messageId);
       if (related.length) {

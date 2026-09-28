@@ -574,6 +574,25 @@ class PortfolioProbe(RobinhoodBroker):
 
 
 class SnapshotLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_position_details_start_before_slow_account_read_finishes(self):
+        broker = SnapshotProbe()
+        broker._market_open = lambda: True
+        original = broker._data
+
+        async def data(name, args):
+            if name == "get_accounts":
+                await broker.instrument_started.wait()
+                await broker.quote_started.wait()
+                broker.release_instruments.set()
+                broker.release_quotes.set()
+            return await original(name, args)
+
+        broker._data = data
+        result = await asyncio.wait_for(broker.snapshot(), 1)
+        self.assertEqual(len(result["positions"]), 2)
+        self.assertEqual(set(result["read_timing"]), {"account", "portfolio", "positions", "orders", "position_details"})
+        self.assertTrue(all(value >= 0 for value in result["read_timing"].values()))
+
     async def test_snapshot_overlaps_position_reads_and_refreshes_quotes(self):
         broker = SnapshotProbe()
         task = asyncio.create_task(broker.snapshot())
