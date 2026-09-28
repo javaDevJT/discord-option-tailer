@@ -238,6 +238,8 @@ Provider credentials remain in the persistent volume and are not copied from the
 
 ## Build and published image path
 
+The Dockerfile groups installation and source copying into two `RUN` steps, using read-only build-context mounts and the existing `.dockerignore` allowlist. This avoids repeated filesystem snapshots on the isolated TrueNAS builder, where even a small standalone `COPY` can take several minutes. Runtime paths, versions and file permissions remain explicit in the Dockerfile.
+
 `compose.yaml` builds from the repository's `Dockerfile`. The source build is:
 
 ```sh
