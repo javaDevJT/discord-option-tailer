@@ -98,6 +98,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await run_until_change(operation(), [], self.status)
         self.assertEqual(cleaned, [True])
 
+    async def test_config_watcher_failure_is_propagated_after_worker_cleanup(self):
+        cleaned = []
+
+        async def operation():
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.append(True)
+
+        async def broken_watcher(*args, **kwargs):
+            await asyncio.sleep(0)
+            raise OSError("fixture watcher failure")
+
+        with patch("relay.service.watch_changes", broken_watcher):
+            with self.assertRaisesRegex(OSError, "fixture watcher failure"):
+                await run_until_change(operation(), [], self.status)
+        self.assertEqual(cleaned, [True])
+
     async def test_config_change_during_startup_is_not_missed(self):
         path = self.base / "config.json"
         path.write_text("old")

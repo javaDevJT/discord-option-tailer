@@ -32,6 +32,7 @@ from relay.discovery import (
     _discover_page,
     _ensure_page,
     _observed_channels,
+    _process_request,
     _public_projection,
     discovery_status,
     request_discovery,
@@ -306,6 +307,39 @@ class _FakeContext:
 
 
 class DiscoveryWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_failure_logs_only_safe_chain_and_projects_diagnostic(self):
+        request = {"request_id": "12345678-1234-1234-1234-123456789abc",
+                   "guild_id": GUILD, "channel_id": CHANNEL}
+        private = "https://discord.com/channels/private?token=secret"
+        with patch("relay.discovery._discover_page", new=AsyncMock(side_effect=RuntimeError(private))):
+            with self.assertLogs("relay.status", level="ERROR") as captured:
+                result = await _process_request(None, request)
+
+        projected = _public_projection(result)
+        self.assertEqual(projected["state"], "failed")
+        self.assertEqual(projected["execution_diagnostic"]["stage"], "discovery")
+        self.assertNotIn(private, json.dumps(projected) + "\n".join(captured.output))
+
+    async def test_worker_error_persists_safe_discovery_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = _runtime(Path(directory))
+            request = request_discovery(runtime, {"guild_id": GUILD, "channel_id": CHANNEL})
+            private = "https://discord.com/api/private?access_token=secret"
+            context = _FakeContext(_FakePage())
+            resolver = AsyncMock(side_effect=RuntimeError(private))
+            task = asyncio.create_task(serve_discovery(context, runtime, resolver=resolver))
+            try:
+                status = await self._wait_async(lambda: discovery_status(runtime))
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["execution_diagnostic"]["stage"], "discovery")
+        self.assertEqual(status["request_id"], request["request_id"])
+        self.assertNotIn(private, json.dumps(status))
+
     async def test_virtualized_channel_sidebar_is_scanned_and_scroll_restored(self):
         class ScrollingPage(_FakePage):
             top = 1

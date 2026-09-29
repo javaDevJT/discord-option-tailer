@@ -424,6 +424,76 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("SECRET", json.dumps([failed, prepared]))
         self.assertNotIn("<script>", json.dumps([failed, prepared]))
 
+    def test_execution_and_dispatch_diagnostics_are_bounded_and_allowlisted(self):
+        from relay.dashboard import _project_decision
+
+        frames = [f"relay/broker.py:{index + 1}:submit_order" for index in range(20)]
+        causes = [
+            {
+                "id": f"{index + 1:032x}",
+                "check": "quote_age",
+                "code": "timeout",
+                "frames": frames,
+                "context": {"quote_age_seconds": index + 0.25, "provider_payload": "SECRET"},
+                "raw_message": "<script>SECRET</script>",
+            }
+            for index in range(10)
+        ]
+        decision = _project_decision({
+            "execution_diagnostic": {
+                "id": "a" * 32,
+                "check": "dispatch_persistence",
+                "stage": "dispatch",
+                "exception": "BrokerPreflightHold",
+                "code": "timeout",
+                "context": {
+                    "quote_age_seconds": 1.25,
+                    "symbol": "SPY",
+                    "provider_response": "SECRET",
+                    "account_number": "123456789",
+                },
+                "frames": frames,
+                "causes": causes,
+                "provider_payload": "SECRET",
+            },
+            "dispatch_checks": [
+                {
+                    "check": "quote_age",
+                    "status": "passed",
+                    "started_at": "2026-09-28T12:00:00Z",
+                    "duration_seconds": 0.012,
+                    "context": {"quote_age_seconds": 0.5, "provider_response": "SECRET"},
+                    "raw": "SECRET",
+                },
+                {
+                    "check": "dispatch_persistence",
+                    "status": "failed",
+                    "started_at": "2026-09-28T12:00:01Z",
+                    "duration_seconds": 0.025,
+                    "context": {"submitted": False, "symbol": "SPY"},
+                },
+                {"check": "<script>alert(1)</script>", "status": "passed", "duration_seconds": float("inf")},
+            ],
+            "broker_submission": {"stage": "dispatch", "transport_attempted": False, "provider_response": "SECRET"},
+        })
+
+        diagnostic = decision["execution_diagnostic"]
+        self.assertEqual(diagnostic["id"], "a" * 32)
+        self.assertEqual(diagnostic["check"], "dispatch_persistence")
+        self.assertEqual(diagnostic["context"]["quote_age_seconds"], 1.25)
+        self.assertEqual(len(diagnostic["frames"]), 16)
+        self.assertEqual(len(diagnostic["causes"]), 8)
+        self.assertEqual(len(decision["dispatch_checks"]), 2)
+        self.assertEqual(decision["dispatch_checks"][0]["status"], "passed")
+        self.assertEqual(decision["dispatch_checks"][1]["status"], "failed")
+        self.assertEqual(decision["dispatch_checks"][1]["context"]["submitted"], False)
+        self.assertEqual(decision["broker_submission"]["transport_attempted"], False)
+        projected = json.dumps(decision)
+        self.assertNotIn("SECRET", projected)
+        self.assertNotIn("<script>", projected)
+        self.assertNotIn("provider_response", projected)
+        self.assertNotIn("account_number", projected)
+
     def test_status_reports_counts_and_stale_detection_without_sensitive_fields(self):
         status, headers, payload = self.request("/api/status")
         self.assertEqual(status, 200)

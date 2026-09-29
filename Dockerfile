@@ -66,6 +66,9 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     && chmod 0644 /etc/nginx/nginx.conf /etc/supervisor/conf.d/relay.conf \
     && chown -R root:root /app /opt/relay-docker
 
+ARG SOURCE_REVISION=unknown
+ENV RELAY_SOURCE_REVISION=${SOURCE_REVISION}
+
 ENV HOME=/home/relay \
     CODEX_HOME=/data/codex \
     DISPLAY=:99 \

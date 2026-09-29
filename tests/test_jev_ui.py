@@ -102,6 +102,8 @@ class JevUITests(unittest.TestCase):
             if path in {"/api/messages", "/api/orders", "/api/positions", "/api/account"}:
                 if path == "/api/messages":
                     fulfill(route, {"items": state["messages"], "next_offset": None})
+                elif path == "/api/orders":
+                    fulfill(route, {"items": state.get("orders", []), "next_offset": None})
                 elif path == "/api/account":
                     fulfill(route, {"available": False, "status": "unavailable"})
                 else:
@@ -499,9 +501,9 @@ class JevUITests(unittest.TestCase):
                 expect(message_list).to_contain_text("Watch message 1545700000000000003")
                 expect(message_list).to_contain_text("Watch age")
                 expect(message_list).to_contain_text("Attempted")
-                expect(message_list).to_contain_text("Operation <Img>")
+                expect(message_list).not_to_contain_text("Operation <Img>")
                 expect(message_list).to_contain_text("Code Timeout")
-                expect(message_list).to_contain_text("Frame relay/broker.py:123:prepare_entry")
+                expect(message_list).to_contain_text("Frame 1 relay/broker.py:123:prepare_entry")
                 expect(message_list).to_contain_text("selected 2026-09-25")
                 expect(message_list).to_contain_text("Requested date 0 instruments / 0 eligible")
                 expect(message_list).to_contain_text("Selection Requested Date Probe")
@@ -513,6 +515,128 @@ class JevUITests(unittest.TestCase):
                 expect(message_list).to_contain_text("Watch expiry / Requested 2026-09-18 → selected 2026-09-18")
                 expect(message_list).to_contain_text("Requested date 3 instruments / 2 eligible")
                 self.assertEqual(message_list.locator("img").count(), 0)
+            finally:
+                browser.close()
+
+    def test_render_execution_diagnostics_and_preserve_order_submission_outcomes(self):
+        local_event = {
+            "message_id": "message-shared",
+            "created_at": "2026-09-29T12:00:01Z",
+            "state": "held",
+            "decision": {
+                "action": "open",
+                "broker_submission": {"stage": "dispatch", "transport_attempted": False},
+                "execution_diagnostic": {
+                    "id": "a" * 32,
+                    "check": "dispatch_persistence",
+                    "stage": "dispatch",
+                    "broker_operation": "submit_order",
+                    "exception": "BrokerPreflightHold",
+                    "code": "broker_error",
+                    "context": {"symbol": "SPY", "quote_age_seconds": 1.5, "client_order_id": "b" * 32},
+                    "frames": ["relay/broker.py:123:submit_order"],
+                    "causes": [{
+                        "id": "b" * 32,
+                        "check": "quote_age",
+                        "stage": "dispatch",
+                        "code": "timeout",
+                        "context": {"quote_age_seconds": 5.0},
+                        "frames": ["relay/broker.py:124:submit_order"],
+                    }],
+                },
+                "dispatch_checks": [
+                    {
+                        "check": "quote_age",
+                        "status": "passed",
+                        "started_at": "2026-09-29T12:00:00Z",
+                        "duration_seconds": 0.01,
+                        "context": {"quote_age_seconds": 0.5},
+                    },
+                    {
+                        "check": "dispatch_persistence",
+                        "status": "failed",
+                        "started_at": "2026-09-29T12:00:01Z",
+                        "duration_seconds": 0.025,
+                        "context": {"submitted": False, "symbol": "SPY"},
+                    },
+                ],
+            },
+        }
+        broker_rejection = {
+            "message_id": "message-shared",
+            "created_at": "2026-09-29T12:00:00Z",
+            "state": "rejected",
+            "decision": {
+                "order_proposal": {"client_order_id": "order-broker"},
+                "broker_submission": {
+                    "stage": "response", "transport_attempted": True,
+                    "broker_state": "rejected", "status_recognized": True,
+                },
+            },
+        }
+        unresolved = {
+            "message_id": "message-outcome-unknown",
+            "state": "unknown",
+            "decision": {
+                "order_proposal": {"client_order_id": "order-unknown"},
+                "broker_submission": {
+                    "stage": "dispatch", "transport_attempted": True,
+                    "broker_state": "unknown", "status_recognized": False,
+                },
+            },
+        }
+        events = [local_event, broker_rejection, unresolved]
+        messages = [
+            {
+                "id": "message-shared",
+                "source_group": "synthetic",
+                "channel_id": "1",
+                "content": "two orders from one message",
+                "latest_event": local_event,
+            },
+            {
+                "id": unresolved["message_id"],
+                "source_group": "synthetic",
+                "channel_id": "1",
+                "content": "synthetic order event",
+                "latest_event": unresolved,
+            },
+        ]
+        orders = [
+            {"id": "order-broker", "message_id": broker_rejection["message_id"], "status": "rejected", "action": "buy", "mode": "live", "contract": {"symbol": "SPY", "expiry": "2026-10-16", "strike": 600, "option_type": "call"}, "quantity": 1},
+            {"id": "b" * 32, "message_id": local_event["message_id"], "status": "rejected", "action": "buy", "mode": "live", "contract": {"symbol": "SPY", "expiry": "2026-10-16", "strike": 600, "option_type": "call"}, "quantity": 1},
+            {"id": "order-no-evidence", "message_id": local_event["message_id"], "status": "rejected", "action": "buy", "mode": "live", "contract": {"symbol": "SPY", "expiry": "2026-10-16", "strike": 600, "option_type": "call"}, "quantity": 1},
+            {"id": "order-unknown", "message_id": unresolved["message_id"], "status": "unknown", "action": "buy", "mode": "live", "contract": {"symbol": "SPY", "expiry": "2026-10-16", "strike": 600, "option_type": "call"}, "quantity": 1},
+        ]
+        state = {
+            "setup": self.setup_status(),
+            "messages": messages,
+            "events": events,
+            "orders": orders,
+            "evaluation_requests": [],
+            "test_requests": [],
+        }
+
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                order_states = page.locator("#order-list .status-pill").all_text_contents()
+                self.assertEqual(order_states, ["Rejected", "Not submitted", "Rejected", "Unknown"])
+                related_states = page.locator("#message-list .related-order strong").all_text_contents()
+                self.assertEqual(related_states, ["Rejected", "Not submitted", "Rejected", "Unknown"])
+
+                details = page.locator("#message-list details.execution-diagnostics").first
+                expect(details.locator("summary")).to_contain_text("2 dispatch checks")
+                self.assertFalse(details.evaluate("element => element.open"))
+                details.locator("summary").click()
+                expect(details).to_contain_text("Check Dispatch Persistence")
+                expect(details).to_contain_text("Cause 1")
+                expect(details).to_contain_text("Quote Age")
+                expect(details).to_contain_text("Frame 1 relay/broker.py:124:submit_order")
+                expect(details).to_contain_text("Observed context / Quote Age Seconds 5")
+                expect(details).to_contain_text("Dispatch check 2 / Dispatch Persistence · Failed")
+                expect(details).to_contain_text("Check context / Submitted false")
+                expect(details).to_contain_text("Started")
             finally:
                 browser.close()
 

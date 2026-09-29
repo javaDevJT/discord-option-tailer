@@ -6,7 +6,7 @@ from decimal import Decimal
 import importlib.util
 from pathlib import Path
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from relay.broker import BrokerError, BrokerPreflightHold, RobinhoodBroker, regular_session
 
@@ -342,8 +342,15 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(name == "place_option_order" for name, _ in self.calls))
         self.review_alert = {}
         self.place_error = True
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(TimeoutError) as raised:
             await self.broker.submit(self.order)
+        failure = getattr(raised.exception, "_relay_failure", {})
+        self.assertEqual(failure.get("stage"), "placement")
+        self.assertEqual(failure.get("broker_operation"), "submit")
+        trace = self.order["broker_submission"]
+        self.assertEqual(trace["stage"], "dispatch")
+        self.assertTrue(trace["transport_attempted"])
+        self.assertIn("submitted_at", trace)
         with self.assertRaisesRegex(BrokerError, "unknown"):
             await self.broker.submit(self.order)
         self.assertEqual(sum(name == "place_option_order" for name, _ in self.calls), 1)
@@ -357,8 +364,16 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["account_id"], "TEST0001")
             self.assertEqual(quote["option_id"], self.instrument["id"])
             raise ValueError("fixture changed Discord message")
-        with self.assertRaises(BrokerPreflightHold):
+        with self.assertRaises(BrokerPreflightHold) as raised:
             await self.broker.submit(self.order, before_submit=final_check)
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        failure = getattr(raised.exception, "_relay_failure", {})
+        self.assertEqual(failure.get("stage"), "dispatch_guard")
+        self.assertEqual(failure.get("broker_operation"), "submit")
+        trace = self.order["broker_submission"]
+        self.assertEqual(trace["stage"], "dispatch")
+        self.assertFalse(trace["transport_attempted"])
+        self.assertNotIn("submitted_at", trace)
         self.assertNotIn(self.order["client_order_id"], self.broker.attempted)
         self.assertFalse(any(name == "place_option_order" for name, _ in self.calls))
         final = AsyncMock()
@@ -366,6 +381,58 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         final.assert_awaited_once()
         self.assertEqual(result["status"], "filled")
 
+    async def test_non_mapping_placement_response_retains_submitted_evidence(self):
+        original_data = self.broker._data.side_effect
+
+        async def malformed_response(name, args):
+            result = await original_data(name, args)
+            if name == "place_option_order":
+                return {"order": None}
+            return result
+
+        self.broker._data.side_effect = malformed_response
+        with self.assertRaises(BrokerError) as raised:
+            await self.broker.submit(self.order)
+
+        trace = self.order["broker_submission"]
+        failure = getattr(raised.exception, "_relay_failure", {})
+        self.assertEqual(failure.get("stage"), "response_validation")
+        self.assertEqual(failure.get("broker_operation"), "submit")
+        self.assertEqual(trace["stage"], "response")
+        self.assertTrue(trace["transport_attempted"])
+        self.assertIn("submitted_at", trace)
+        self.assertEqual(sum(name == "place_option_order" for name, _ in self.calls), 1)
+
+    async def test_preflight_retry_ignores_changing_diagnostic_telemetry(self):
+        async def reject(snapshot, quote):
+            raise ValueError("dispatch context changed")
+
+        self.order["dispatch_checks"] = {"attempt": 1}
+        self.order["execution_diagnostic"] = {"attempt": 1}
+        with self.assertRaises(BrokerPreflightHold):
+            await self.broker.submit(self.order, before_submit=reject)
+
+        self.order["dispatch_checks"] = {"attempt": 2}
+        self.order["execution_diagnostic"] = {"attempt": 2}
+        with self.assertRaises(BrokerPreflightHold):
+            await self.broker.submit(self.order, before_submit=reject)
+
+        self.assertFalse(any(name == "place_option_order" for name, _ in self.calls))
+
+    async def test_annotation_failure_does_not_mask_callback_cause(self):
+        original = ValueError("original callback failure")
+
+        async def reject(snapshot, quote):
+            raise original
+
+        with patch("relay.broker.annotate_failure", side_effect=RuntimeError("broker diagnostics failed")):
+            with patch("relay.status.annotate_failure", side_effect=RuntimeError("status diagnostics failed")):
+                with self.assertRaises(BrokerPreflightHold) as raised:
+                    await self.broker.submit(self.order, before_submit=reject)
+
+        self.assertIs(raised.exception.__cause__, original)
+        self.assertFalse(self.order["broker_submission"]["transport_attempted"])
+        self.assertFalse(any(name == "place_option_order" for name, _ in self.calls))
     async def test_calendar_holidays_and_schema_drift_fail_closed(self):
         for day in (6, 7):
             self.now = datetime(2026, 9, day, 15, tzinfo=timezone.utc)

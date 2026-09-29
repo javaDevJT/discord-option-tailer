@@ -20,7 +20,7 @@ from .core import Store, channel_allows_author, load_config
 from .interpreter import CodexInterpreter, InterpretationError, safe_interpretation_reason
 from .evaluation import evaluation_settings, credential_configured as jev_credential_configured
 from .pacing import discord_delay
-from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, failure_detail, previous_auth_state
+from .status import AUTH_REQUIRED_STATES, HEALTHY_STATES, configure_execution_log, execution_failure, failure_detail, log_execution, previous_auth_state
 
 LOG = logging.getLogger(__name__)
 
@@ -134,6 +134,7 @@ async def run_until_change(operation, paths, status, *, initial_signature=None):
         if worker in done:
             await worker
             raise RuntimeError("Discord worker stopped")
+        await watcher
     finally:
         worker.cancel()
         watcher.cancel()
@@ -142,6 +143,8 @@ async def run_until_change(operation, paths, status, *, initial_signature=None):
 
 async def serve(config_path):
     config_path = Path(config_path).resolve()
+    configure_execution_log(config_path.parent / "state/execution-diagnostics.log")
+    log_execution("worker_start")
     status = RuntimeStatus(config_path.parent / "state/runtime-status.json")
     delay = 5
     while True:
@@ -221,6 +224,7 @@ async def serve(config_path):
                     failure_frame = failure_frame.tb_next
                 location = f" at {Path(failure_frame.tb_frame.f_code.co_filename).name}:{failure_frame.tb_lineno}" if failure_frame else ""
                 failures.append(f"{type(failure).__name__}{location}")
+            execution_failure(exc, stage="worker")
             detail = failure_detail(exc, provider="Worker", phase="startup or processing")
             status.write(state="error", detail=f"{detail} ({'; '.join(failures)}). Automatic retry in {retry_delay:.1f} seconds.")
             await asyncio.sleep(retry_delay)

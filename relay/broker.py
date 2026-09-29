@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 import webbrowser
 import uuid
 
-from .status import annotate_failure, failure_detail, publish_status
+from .status import annotate_failure, failure_detail, failure_stage, publish_status
 from .schema_contracts import cursor_mode, schema_problem
 
 
@@ -53,6 +53,13 @@ def _broker_state(value):
     return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z_]{0,47}", value) else None
 
 
+def _annotate_failure_safely(error, **fields):
+    try:
+        annotate_failure(error, **fields)
+    except Exception:
+        pass
+
+
 class _ExecutionReadScope:
     def __init__(self):
         self.active = True
@@ -67,6 +74,18 @@ class _ExecutionReadScope:
         self.quotes.clear()
 
 
+def _failure_stage_operation(stage):
+    def decorate(method):
+        @functools.wraps(method)
+        async def wrapped(self, *args, **kwargs):
+            with failure_stage(stage):
+                return await method(self, *args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
 def _scope_operation(method):
     @functools.wraps(method)
     async def wrapped(self, *args, **kwargs):
@@ -75,7 +94,7 @@ def _scope_operation(method):
         except BaseException as error:
             self._invalidate_execution_scope()
             if isinstance(error, Exception):
-                annotate_failure(error, broker_operation=method.__name__)
+                _annotate_failure_safely(error, broker_operation=method.__name__)
             raise
 
     return wrapped
@@ -808,14 +827,14 @@ class RobinhoodMCP:
         import jsonschema
         try:
             jsonschema.validate(args, self.schemas[name])
-        except (jsonschema.ValidationError, jsonschema.SchemaError):
+        except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
             error = BrokerError("Arguments do not satisfy the authenticated tool schema")
-            annotate_failure(error, tool=name)
-            raise error from None
+            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            raise error from exc
         result = await self._call_tool(name, args)
         if result.isError:
             error = BrokerError("Robinhood returned a tool error; no result has been accepted")
-            annotate_failure(error, tool=name)
+            _annotate_failure_safely(error, tool=name)
             raise error
         return result.model_dump(mode="json", exclude_none=True)
 
@@ -823,7 +842,7 @@ class RobinhoodMCP:
         try:
             result = await self.session.call_tool(name, arguments=args)
         except Exception as exc:
-            annotate_failure(exc, tool=name)
+            _annotate_failure_safely(exc, tool=name)
             self._connection_failed(exc)
             raise
         if result.isError:
@@ -1189,12 +1208,12 @@ class RobinhoodBroker(RobinhoodMCP):
         tool = self.catalog.get(name)
         if not tool or name not in SCHEMA_PINS:
             error = BrokerError(f"Required broker tool {name} missing from qualified catalog")
-            annotate_failure(error, tool=name, code="schema_incompatible")
+            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
             raise error
         problem = self._schema_problem(tool)
         if problem:
             error = BrokerError(f"schema changed for {name}: {problem}; compatibility review required")
-            annotate_failure(error, tool=name, code="schema_incompatible")
+            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
             raise error
         return tool
 
@@ -1205,15 +1224,19 @@ class RobinhoodBroker(RobinhoodMCP):
             raise BrokerError("Open RobinhoodBroker using async with")
         try:
             jsonschema.validate(args, tool["inputSchema"])
-        except (jsonschema.ValidationError, jsonschema.SchemaError):
-            raise BrokerError("Normalized broker arguments do not match the qualified schema") from None
+        except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
+            error = BrokerError("Normalized broker arguments do not match the qualified schema")
+            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            raise error from exc
         result = await self._call_tool(name, args)
         if result.isError or not isinstance(result.structuredContent, dict):
             raise BrokerError("Robinhood returned an error or omitted its structured response")
         try:
             jsonschema.validate(result.structuredContent, tool["outputSchema"])
-        except (jsonschema.ValidationError, jsonschema.SchemaError):
-            raise BrokerError("Robinhood response does not match the qualified schema") from None
+        except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
+            error = BrokerError("Robinhood response does not match the qualified schema")
+            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            raise error from exc
         return result.structuredContent["data"]
 
     async def _pages(self, name, args, key):
@@ -2214,7 +2237,7 @@ class RobinhoodBroker(RobinhoodMCP):
         order_type = order.get("order_type", "limit")
         identity = {
             key: value for key, value in order.items()
-            if key not in {"entry_evaluation", "broker_submission", "entry_cancel_at", "limit_price", "stop_price", "time_in_force", "order_type"}
+            if key not in {"entry_evaluation", "broker_submission", "entry_cancel_at", "limit_price", "stop_price", "time_in_force", "order_type", "dispatch_checks", "execution_diagnostic"}
         }
         identity["contract"] = _contract_key(order.get("contract"))
         identity["order_type"] = order_type
@@ -2233,12 +2256,26 @@ class RobinhoodBroker(RobinhoodMCP):
         self.order_bodies[client_id] = body
         self.order_inputs[client_id] = copy.deepcopy(order)
         trace = order.setdefault("broker_submission", {})
+        trace["transport_attempted"] = False
         trace["stage"] = "snapshot"
 
         async def timed(name, work):
             started = time.monotonic()
+            stage = {
+                "snapshot": "snapshot",
+                "review": "review",
+                "dispatch_guard": "dispatch_guard",
+                "placement": "placement",
+            }.get(name)
             try:
-                return await work
+                if stage is None:
+                    return await work
+                try:
+                    with failure_stage(stage):
+                        return await work
+                except Exception as exc:
+                    _annotate_failure_safely(exc, stage=stage, broker_operation="submit")
+                    raise
             finally:
                 trace[name + "_seconds"] = round(time.monotonic() - started, 6)
 
@@ -2293,9 +2330,11 @@ class RobinhoodBroker(RobinhoodMCP):
             self._live_enabled()
             if not self._market_open():
                 raise BrokerError("Regular session ended before dispatch")
-        except BrokerPreflightHold:
+        except BrokerPreflightHold as exc:
+            _annotate_failure_safely(exc, broker_operation="submit")
             raise
         except BrokerError as exc:
+            _annotate_failure_safely(exc, broker_operation="submit")
             raise BrokerPreflightHold(f"Order preflight validation held the order: {exc}") from exc
         ref_id = _order_ref_id(self.account_number, client_id)
         trace["stage"] = "dispatch"
@@ -2309,9 +2348,12 @@ class RobinhoodBroker(RobinhoodMCP):
                 if not self._market_open():
                     raise BrokerError("Regular session ended before dispatch")
             except Exception as exc:
-                raise BrokerPreflightHold("Final dispatch validation held the order; nothing was submitted") from exc
+                _annotate_failure_safely(exc, stage="dispatch_guard", broker_operation="submit")
+                hold = BrokerPreflightHold("Final dispatch validation held the order; nothing was submitted")
+                _annotate_failure_safely(hold, stage="dispatch_guard", broker_operation="submit")
+                raise hold from exc
         self.attempted.add(client_id)
-        trace["submitted_at"] = self.clock().isoformat()
+        trace.update(transport_attempted=True, submitted_at=self.clock().isoformat())
         try:
             result = await timed("placement", self._data("place_option_order", dict(args, ref_id=ref_id)))
         finally:
@@ -2330,7 +2372,11 @@ class RobinhoodBroker(RobinhoodMCP):
                     pass
         started = time.monotonic()
         try:
-            normalized = self._order_result(raw, client_id, args)
+            with failure_stage("response_validation"):
+                normalized = self._order_result(raw, client_id, args)
+        except Exception as exc:
+            _annotate_failure_safely(exc, stage="response_validation", broker_operation="submit")
+            raise
         finally:
             trace["response_validation_seconds"] = round(time.monotonic() - started, 6)
         trace.update(stage="validated", status_recognized=normalized.get("status_recognized", True))
@@ -2537,6 +2583,8 @@ class RobinhoodBroker(RobinhoodMCP):
             "timestamp": raw.get("updated_at") or raw["created_at"],
         }
 
+    @_scope_operation
+    @_failure_stage_operation("reconciliation")
     async def order_status(self, order_id, *, broker_order_id=None, expected_order=None):
         direct_known = self.order_results.get(order_id)
         known = direct_known
@@ -2664,6 +2712,8 @@ class RobinhoodBroker(RobinhoodMCP):
             self._invalidate_execution_scope()
         return result
 
+    @_scope_operation
+    @_failure_stage_operation("cancellation")
     async def cancel_order(self, order_id, *, broker_order_id=None, expected_order=None):
         self._live_enabled()
         known = self.order_results.get(order_id)

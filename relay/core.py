@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from .broker import BrokerPreflightHold
 from .interpreter import InterpretationError, safe_interpretation_reason
-from .status import annotate_failure, execution_failure, failure_stage
+from .status import annotate_failure, execution_check, execution_failure, failure_stage, log_execution
 
 UTC = timezone.utc
 EASTERN = ZoneInfo("America/New_York")
@@ -439,6 +439,11 @@ class Store:
         with self.db:
             self.db.execute("UPDATE events SET state=?,reason=?,decision=? WHERE message_id=? AND revision=?", (
                 state, reason, json.dumps(decision) if decision else None, message["id"], message["revision"]))
+        if decision and state not in {"evaluating", "evaluated", "recovery_pending", "recovery_evaluating"}:
+            order = decision.get("order_proposal") or {}
+            log_execution("outcome", context={"message_id": message["id"], "revision": message["revision"],
+                          "client_order_id": order.get("client_order_id"), "action": decision.get("action"), "state": state},
+                          diagnostic=decision.get("execution_diagnostic"), checks=decision.get("dispatch_checks"))
         return {"message_id": message["id"], "state": state, "reason": reason}
 
     def context(self, message, limit=60):
@@ -707,27 +712,45 @@ class Engine:
                 self.source_latest[group] = max(int(identity), self.source_latest.get(group, 0))
 
     def unchanged(self, message):
+        context = {"message_id": message.get("id"), "expected_revision": message.get("revision")}
+        try:
+            self._unchanged(message, context)
+        except Exception as error:
+            annotate_failure(error, check="source_consistency", context=context)
+            raise
+
+    def _unchanged(self, message, context):
         claim = message.get("_evaluation_claim")
         if claim is not None:
-            if self.store.source_generation(message["source_group"]) != claim["source_generation"]:
+            context.update(expected_source_generation=claim["source_generation"],
+                           actual_source_generation=self.store.source_generation(message["source_group"]))
+            if context["actual_source_generation"] != claim["source_generation"]:
                 raise Hold("source context changed during evaluation; reassessment required")
-            if self.store.position_generation(message["source_group"]) != claim["position_generation"]:
+            context.update(expected_position_generation=claim["position_generation"],
+                           actual_position_generation=self.store.position_generation(message["source_group"]))
+            if context["actual_position_generation"] != claim["position_generation"]:
                 raise Hold("owned inventory or orders changed during evaluation; reassessment required")
         stored = self.store.db.execute("SELECT revision FROM messages WHERE id=?", (message["id"],)).fetchone()
+        context["actual_revision"] = stored[0] if stored else None
         if stored and stored[0] != message["revision"]:
             raise Hold("message changed during interpretation")
-        if self.observations.get(message["id"], message["revision"]) != message["revision"]:
+        context["actual_revision"] = self.observations.get(message["id"], message["revision"])
+        if context["actual_revision"] != message["revision"]:
             raise Hold("message was revised during interpretation")
         latest = self.store.db.execute(
             "SELECT id FROM messages WHERE source_group=? ORDER BY length(id) DESC,id DESC LIMIT 1",
             (message["source_group"],)).fetchone()
-        if max(self.source_latest.get(message["source_group"], 0), int(latest[0]) if latest else 0) > int(message["id"]):
+        context["latest_message_id"] = str(max(self.source_latest.get(message["source_group"], 0), int(latest[0]) if latest else 0))
+        if int(context["latest_message_id"]) > int(message["id"]):
             raise Hold("a newer source message requires interpretation before this action")
 
     def fresh(self, message, now):
         age = (now - instant(message["timestamp"])).total_seconds()
         if age < -5 or age > self.config["risk"]["max_signal_age_seconds"]:
-            raise Hold("signal is stale or its timestamp is in the future")
+            error = Hold("signal is stale or its timestamp is in the future")
+            annotate_failure(error, check="signal_freshness", context={"signal_age_seconds": age,
+                             "max_signal_age_seconds": self.config["risk"]["max_signal_age_seconds"]})
+            raise error
 
     def origin(self, message, decision):
         origin_id = decision.get("origin_message_id")
@@ -747,77 +770,116 @@ class Engine:
         return origin
 
     async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None, verify_source=True):
-        """Recheck intent after broker review and immediately before its placement boundary."""
-        async def current(*, refresh=False):
+        """Recheck intent after broker review and retain the result of each guard."""
+        trace = decision.setdefault("dispatch_checks", [])
+        order["dispatch_checks"] = trace
+        context = self.diagnostic_context(message, decision, order)
+
+        def check(name, **observed):
+            return execution_check(trace, name, context=context | observed)
+
+        async def current(*, refresh=False, phase="before_review"):
+            context["phase"] = phase
             now = self.clock()
             if expiry_guard is not None:
-                if decision["action"] != "CLOSE" or order["side"] != "sell":
-                    raise Hold("expiry policy may only close owned contracts")
-                await expiry_guard(refresh=refresh)
-                if refresh:
-                    with self.store.db:
-                        self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
-                                              (json.dumps(order), order["client_order_id"]))
+                with check("dispatch_intent"):
+                    if decision["action"] != "CLOSE" or order["side"] != "sell":
+                        raise Hold("expiry policy may only close owned contracts")
+                    await expiry_guard(refresh=refresh)
+                    if refresh:
+                        with self.store.db:
+                            self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
+                                                  (json.dumps(order), order["client_order_id"]))
             elif recovery_guard is None:
-                self.fresh(message, now)
-                self.fresh(self.origin(message, decision), now)
-                self.unchanged(message)
+                with check("signal_freshness"):
+                    self.fresh(message, now)
+                with check("origin_evidence"):
+                    self.fresh(self.origin(message, decision), now)
+                with check("source_consistency"):
+                    self.unchanged(message)
             else:
-                if decision["action"] not in {"REDUCE", "CLOSE"} or order["side"] != "sell":
-                    raise Hold("recovery execution is restricted to closing owned contracts")
-                recovery_guard()
-            self.check_execution_mode()
-            if Path(self.config["kill_switch"]).exists():
-                raise Hold("kill switch is present")
-            if order.get("prepared_entry") and order.get("entry_cancel_at") and instant(order["entry_cancel_at"]) <= now:
-                raise Hold("prepared entry validity window elapsed before submission")
+                with check("dispatch_intent"):
+                    if decision["action"] not in {"REDUCE", "CLOSE"} or order["side"] != "sell":
+                        raise Hold("recovery execution is restricted to closing owned contracts")
+                    recovery_guard()
+            with check("execution_mode"):
+                self.check_execution_mode()
+            with check("kill_switch") as facts:
+                facts["kill_switch_present"] = Path(self.config["kill_switch"]).exists()
+                if facts["kill_switch_present"]:
+                    raise Hold("kill switch is present")
+            with check("entry_window") as facts:
+                if order.get("prepared_entry") and order.get("entry_cancel_at"):
+                    remaining = (instant(order["entry_cancel_at"]) - now).total_seconds()
+                    facts["entry_remaining_seconds"] = remaining
+                    if remaining <= 0:
+                        raise Hold("prepared entry validity window elapsed before submission")
             if order.get("prepared_entry"):
-                watched = self.watches.match(message, decision, with_source=True)
-                if watched is None or watched != order.get("prepared_watch"):
-                    raise Hold("prepared watch changed or expired before submission")
+                with check("prepared_watch") as facts:
+                    watched = self.watches.match(message, decision, with_source=True)
+                    facts["watch_matches"] = watched is not None and watched == order.get("prepared_watch")
+                    if not facts["watch_matches"]:
+                        raise Hold("prepared watch changed or expired before submission")
             if quote is not None or not order.get("prepared_entry"):
-                self.check_quote_age(quote if quote is not None else {"timestamp": order["quote_timestamp"]}, now)
-            self.check_quote_age(snapshot if snapshot is not None else {"timestamp": order["account_timestamp"]}, now, "account snapshot")
+                with check("quote_age"):
+                    self.check_quote_age(quote if quote is not None else {"timestamp": order["quote_timestamp"]}, now)
+            with check("snapshot_age"):
+                self.check_quote_age(snapshot if snapshot is not None else {"timestamp": order["account_timestamp"]}, now, "account snapshot")
             if snapshot is not None:
-                if snapshot.get("account_id") != self.account or snapshot.get("market_open") is not True:
-                    raise Hold("bound account or options session changed during broker review")
+                with check("account_session", account_matches=snapshot.get("account_id") == self.account,
+                           market_open=snapshot.get("market_open") is True):
+                    if snapshot.get("account_id") != self.account or snapshot.get("market_open") is not True:
+                        raise Hold("bound account or options session changed during broker review")
                 restrictions = snapshot.get("restrictions", [])
-                if not isinstance(restrictions, list) or restrictions:
-                    raise Hold("broker account restrictions prevent this action")
-                if quote is None or canonical_contract(quote.get("contract")) != order["contract"] or quote.get("tradable") is not True:
-                    raise Hold("reviewed quote no longer identifies this tradable contract")
-                bid, ask = money(quote.get("bid"), positive=True), money(quote.get("ask"), positive=True)
-                if ask < bid or (expiry_guard is None and (ask - bid) / ask > money(self.config["risk"]["max_spread_fraction"])):
-                    raise Hold("reviewed quote spread exceeds the configured limit")
+                with check("account_restrictions", restriction_count=len(restrictions) if isinstance(restrictions, list) else -1):
+                    if not isinstance(restrictions, list) or restrictions:
+                        raise Hold("broker account restrictions prevent this action")
+                with check("contract_tradability"):
+                    if quote is None or canonical_contract(quote.get("contract")) != order["contract"] or quote.get("tradable") is not True:
+                        raise Hold("reviewed quote no longer identifies this tradable contract")
+                with check("quote_spread", bid=quote.get("bid"), ask=quote.get("ask"),
+                           max_spread_fraction=self.config["risk"]["max_spread_fraction"]):
+                    bid, ask = money(quote.get("bid"), positive=True), money(quote.get("ask"), positive=True)
+                    if ask < bid or (expiry_guard is None and (ask - bid) / ask > money(self.config["risk"]["max_spread_fraction"])):
+                        raise Hold("reviewed quote spread exceeds the configured limit")
                 if order["side"] == "buy":
-                    evaluation = entry_chase_evaluation(ask, decision["alert_price"], order["limit_price"], self.config["risk"]["max_chase_fraction"])
-                    decision["entry_evaluation"] = order["entry_evaluation"] = evaluation
-                    # Notifications read the durable order reserved before broker review.
-                    with self.store.db:
-                        self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
-                                              (json.dumps(order), order["client_order_id"]))
-                    within_cap = (money(order["limit_price"], positive=True)
-                                  <= money(decision["alert_price"], positive=True)
-                                  * (1 + money(self.config["risk"]["max_chase_fraction"])))
-                    if not within_cap or (not order.get("prepared_entry") and not entry_chase_within_cap(evaluation)):
-                        raise Hold(entry_chase_reason("current ask exceeds permitted chase during broker review", evaluation))
-                    quantity, _ = entry_size(self.config["risk"], snapshot, order["contract"], decision["confidence"], order["limit_price"], message["source_group"])
-                    if quantity < order["quantity"]:
-                        raise Hold("available account risk capacity fell during broker review")
+                    with check("entry_chase", ask=quote.get("ask"), alert_price=decision.get("alert_price"),
+                               limit_price=order.get("limit_price"), max_chase_fraction=self.config["risk"]["max_chase_fraction"]) as facts:
+                        evaluation = entry_chase_evaluation(ask, decision["alert_price"], order["limit_price"], self.config["risk"]["max_chase_fraction"])
+                        decision["entry_evaluation"] = order["entry_evaluation"] = evaluation
+                        # Notifications read the durable order reserved before broker review.
+                        with self.store.db:
+                            self.store.db.execute("UPDATE orders SET body=? WHERE id=? AND status='submitting'",
+                                                  (json.dumps(order), order["client_order_id"]))
+                        within_cap = (money(order["limit_price"], positive=True)
+                                      <= money(decision["alert_price"], positive=True)
+                                      * (1 + money(self.config["risk"]["max_chase_fraction"])))
+                        facts["within_cap"] = within_cap
+                        if not within_cap or (not order.get("prepared_entry") and not entry_chase_within_cap(evaluation)):
+                            raise Hold(entry_chase_reason("current ask exceeds permitted chase during broker review", evaluation))
+                    with check("entry_capacity", buying_power=snapshot.get("buying_power"), equity=snapshot.get("equity"),
+                               quantity=order.get("quantity"), limit_price=order.get("limit_price")) as facts:
+                        quantity, _ = entry_size(self.config["risk"], snapshot, order["contract"], decision["confidence"], order["limit_price"], message["source_group"])
+                        facts["calculated_quantity"] = quantity
+                        if quantity < order["quantity"]:
+                            raise Hold("available account risk capacity fell during broker review")
                 else:
-                    tick = money(quote.get("tick_size"), positive=True)
-                    executable_price = (bid / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-                    self.check_exit_profit(message, decision, order, executable_price)
+                    with check("exit_profit", bid=quote.get("bid"), quantity=order.get("quantity")):
+                        tick = money(quote.get("tick_size"), positive=True)
+                        executable_price = (bid / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                        self.check_exit_profit(message, decision, order, executable_price)
 
-        await current(refresh=snapshot is not None)
+        await current(refresh=snapshot is not None, phase="after_review" if snapshot is not None else "before_review")
         if verify_source and expiry_guard is None and (recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification")):
-            options = {} if recovery_guard is None else {"recovery": True, "latest_id": recovery_guard()}
-            if self.verify_current is None or not await self.measure(decision, "source_verification_seconds", self.verify_current(message, **options)):
-                raise RetryHold("current Discord message could not be verified before dispatch")
-            origin = self.origin(message, decision)
-            if recovery_guard is not None and origin["id"] != message["id"] and not await self.measure(decision, "source_verification_seconds", self.verify_current(origin, **options)):
-                raise RetryHold("original Discord exit could not be verified before dispatch")
-        await current()
+            with check("source_verification"):
+                options = {} if recovery_guard is None else {"recovery": True, "latest_id": recovery_guard()}
+                if self.verify_current is None or not await self.measure(decision, "source_verification_seconds", self.verify_current(message, **options)):
+                    raise RetryHold("current Discord message could not be verified before dispatch")
+            with check("origin_verification"):
+                origin = self.origin(message, decision)
+                if recovery_guard is not None and origin["id"] != message["id"] and not await self.measure(decision, "source_verification_seconds", self.verify_current(origin, **options)):
+                    raise RetryHold("original Discord exit could not be verified before dispatch")
+        await current(phase="after_source")
 
     async def resolve_expiry(self, message, decision):
         contract = decision.get("contract")
@@ -966,7 +1028,9 @@ class Engine:
                 self.store.record(message, "context", "Worker stopped during evaluation; retained for context, never automatically replayed", decision or {"evaluation_timing": timing})
             raise
         except Hold as exc:
-            return self.store.record(message, "held", str(exc), decision or {"evaluation_timing": timing})
+            decision = decision or {"evaluation_timing": timing}
+            self.diagnose_failure(decision, exc, message=message)
+            return self.store.record(message, "held", str(exc), decision)
         except InterpretationError as exc:
             # The interpreter owns provider details and retry accounting.
             # Persist only its allowlisted diagnostic contract; no broker
@@ -975,13 +1039,16 @@ class Engine:
             if isinstance(provider_timing, dict):
                 timing.update(provider_timing)
             decision = (decision or {}) | {"evaluation_timing": timing}
+            self.diagnose_failure(decision, exc, stage="interpretation", message=message)
             return self.store.record(message, "error", safe_interpretation_reason(exc), decision)
         except Exception as exc:
             # Do not leak response bodies, tokens, or Discord message content.
             if decision is None:
+                decision = {"evaluation_timing": timing}
+                self.diagnose_failure(decision, exc, stage="interpretation", message=message)
                 return self.store.record(message, "error", safe_interpretation_reason(
                     InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False),
-                ), {"evaluation_timing": timing})
+                ), decision)
             detail = self.diagnose_failure(decision, exc)
             return self.store.record(message, "error", f"Execution failed; {detail}; no retry submitted", decision)
         finally:
@@ -1004,9 +1071,23 @@ class Engine:
             timing = decision.setdefault("evaluation_timing", {})
             timing[stage] = round(timing.get(stage, 0) + time.monotonic() - started, 6)
 
-    def diagnose_failure(self, decision, error, *, stage="execution"):
-        detail, diagnostic = execution_failure(error, stage=stage)
+    def diagnostic_context(self, message, decision, order=None):
+        order = order or decision.get("order_proposal") or {}
+        return {"message_id": message.get("id", decision.get("origin_message_id")),
+                "channel_id": message.get("channel_id"), "revision": message.get("revision"),
+                "origin_message_id": decision.get("origin_message_id"),
+                "attempt_id": (message.get("_evaluation_claim") or {}).get("attempt_id"),
+                "client_order_id": order.get("client_order_id"), "action": decision.get("action"),
+                "mode": self.mode, "side": order.get("side"), "quantity": order.get("quantity"),
+                "limit_price": order.get("limit_price"), "prepared_entry": order.get("prepared_entry") is True,
+                **(decision.get("contract") or {})}
+
+    def diagnose_failure(self, decision, error, *, stage="execution", message=None, order=None):
+        detail, diagnostic = execution_failure(error, stage=stage,
+                                               context=self.diagnostic_context(message or {}, decision, order))
         decision["execution_diagnostic"] = diagnostic
+        if order is not None:
+            order["execution_diagnostic"] = diagnostic
         return detail
 
     async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
@@ -1052,6 +1133,7 @@ class Engine:
                                      decision | {"order_proposal": order})
         with failure_stage("order_reservation"):
             self.store.reserve(message, decision, order, self.clock())
+        log_execution("reserved", context=self.diagnostic_context(message, decision, order))
         if message.get("_evaluation_claim") is not None:
             # The reservation is our own serialized mutation, not competing inventory.
             message["_evaluation_claim"]["position_generation"] = self.store.position_generation(message["source_group"])
@@ -1065,7 +1147,11 @@ class Engine:
                 timing["received_to_submission_seconds"] = round(now - received, 6)
                 if "posted_to_receipt_seconds" in timing:
                     timing["posted_to_submission_seconds"] = round(timing["posted_to_receipt_seconds"] + now - received, 6)
-            self.store.arm_entry_deadline(order, self.clock())
+            with execution_check(decision.setdefault("dispatch_checks", []), "dispatch_persistence",
+                                 context=self.diagnostic_context(message, decision, order)):
+                self.store.arm_entry_deadline(order, self.clock())
+            log_execution("dispatch", context=self.diagnostic_context(message, decision, order),
+                          checks=decision.get("dispatch_checks"))
 
         submission_trace = order.setdefault("broker_submission", {})
         if not isinstance(submission_trace, dict):
@@ -1082,15 +1168,16 @@ class Engine:
             with failure_stage("result_recording"):
                 self.store.apply_result(order["client_order_id"], result)
         except BrokerPreflightHold as exc:
+            diagnostic_detail = self.diagnose_failure(decision, exc, stage="preflight", message=message, order=order)
             self.store.reject_before_submission(order["client_order_id"])
             evaluation = decision.get("entry_evaluation")
             detail = "no order submitted: " + str(exc)
             if evaluation and not entry_chase_within_cap(evaluation):
                 detail = "no order submitted: current ask or rounded limit exceeds permitted chase during broker review"
-            return self.store.record(message, "held", reason(detail), decision | {"order_proposal": order})
+            return self.store.record(message, "held", reason(detail + "; " + diagnostic_detail), decision | {"order_proposal": order})
         except Exception as exc:
+            detail = self.diagnose_failure(decision, exc, stage="submission", message=message, order=order)
             self.store.mark_unknown(order["client_order_id"])
-            detail = self.diagnose_failure(decision, exc, stage="submission")
             return self.store.record(message, "unknown", f"Submission or fill result uncertain; {detail}; all new orders blocked pending reconciliation", decision)
         state = "paper_order" if self.mode == "paper" else "broker_order"
         label = "simulated order: " if self.mode == "paper" else "broker order: "
@@ -1324,4 +1411,7 @@ class Engine:
     def check_quote_age(self, quote, now, label="option quote"):
         age = (now - instant(quote.get("timestamp"))).total_seconds()
         if age < -5 or age > self.config["risk"]["max_quote_age_seconds"]:
-            raise RetryHold(label + " is stale or future-dated")
+            error = RetryHold(label + " is stale or future-dated")
+            key = "snapshot_age_seconds" if label == "account snapshot" else "quote_age_seconds"
+            annotate_failure(error, context={key: age, "max_quote_age_seconds": self.config["risk"]["max_quote_age_seconds"]})
+            raise error

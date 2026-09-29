@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .core import EASTERN, Hold, RetryHold, canonical_contract, contract_key, channel_allows_author, entry_size, instant, money, entry_chase_evaluation, entry_chase_reason, entry_chase_within_cap
 from .interpreter import InterpretationError, safe_interpretation_reason
+from .status import execution_failure, failure_stage
 
 
 class SourceContextChanged(Hold):
@@ -156,9 +157,12 @@ class RecoveryEvaluator:
                     self.store.persist_active_order_body(row["id"], body)
                     self.store.apply_result(row["id"], result)
                     return
-                except Exception:
+                except Exception as exc:
                     # A fill can win the cancel race; ask the broker for the final state.
-                    pass
+                    execution_failure(exc, stage="cancellation", context={
+                        "action": row["action"], "message_id": row["message_id"],
+                        "client_order_id": row["id"],
+                    })
         result = await self.engine.broker.order_status(row["id"], **options)
         self.store.apply_result(row["id"], result)
 
@@ -190,21 +194,71 @@ class RecoveryEvaluator:
                 WHERE status NOT IN ('filled','canceled','rejected','expired')""").fetchone()[0]
             if newest <= self._reconcile_seen_rowid and not self._has_urgent_orders():
                 return 0
-        rows = self.store.db.execute("""SELECT rowid AS ledger_rowid,id,broker_id,body,action,status,created_at FROM orders
+        rows = self.store.db.execute("""SELECT rowid AS ledger_rowid,id,message_id,broker_id,body,action,status,created_at FROM orders
             WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
         if rows:
             self._reconcile_seen_rowid = max(self._reconcile_seen_rowid, *(row["ledger_rowid"] for row in rows))
         for row in rows:
             try:
                 await self._reconcile_order(row)
-            except Exception:
+            except Exception as exc:
+                _, diagnostic = execution_failure(
+                    exc,
+                    stage="reconciliation",
+                    context={
+                        "action": row["action"],
+                        "message_id": row["message_id"],
+                        "client_order_id": row["id"],
+                    },
+                )
                 if row["action"] == "UPDATE_STOP":
                     self.store.mark_unknown(row["id"])
                     request = self.store.db.execute("SELECT * FROM stop_requests WHERE order_id=?", (row["id"],)).fetchone()
                     if request:
                         self.engine.stops.state(request, "pending", "Native protection awaiting broker status confirmation")
+                try:
+                    with self.store.db:
+                        candidates = self.store.db.execute(
+                            "SELECT id, revision, decision FROM events WHERE message_id=? ORDER BY id DESC",
+                            (row["message_id"],),
+                        ).fetchall()
+                        event = None
+                        for candidate in candidates:
+                            candidate_decision = json.loads(candidate["decision"] or "{}")
+                            nested_order = candidate_decision.get("order_proposal")
+                            candidate_order_id = candidate_decision.get("client_order_id")
+                            if isinstance(nested_order, dict):
+                                candidate_order_id = candidate_order_id or nested_order.get("client_order_id")
+                            if candidate_order_id == row["id"] or hashlib.sha256(
+                                (row["message_id"] + ":" + candidate["revision"]).encode()
+                            ).hexdigest() == row["id"]:
+                                event = candidate
+                                break
+                        if event is not None:
+                            decision = json.loads(event["decision"] or "{}")
+                            decision["reconciliation_diagnostic"] = diagnostic
+                            self.store.db.execute(
+                                "UPDATE events SET decision=? WHERE id=? AND message_id=? AND revision=?",
+                                (
+                                    json.dumps(decision, separators=(",", ":"), sort_keys=True),
+                                    event["id"],
+                                    row["message_id"],
+                                    event["revision"],
+                                ),
+                            )
+                except Exception as persist_error:
+                    execution_failure(
+                        persist_error,
+                        stage="result_recording",
+                        context={
+                            "action": row["action"],
+                            "message_id": row["message_id"],
+                            "client_order_id": row["id"],
+                        },
+                    )
         if not self.engine.observe_only:
-            await self.engine.stops.maintain()
+            with failure_stage("stop"):
+                await self.engine.stops.maintain()
         pending = self.store.db.execute("""SELECT status,action,body FROM orders
             WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
         now = self.engine.clock()
@@ -231,8 +285,9 @@ class RecoveryEvaluator:
                     await self.reconcile_orders()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # The next pass retries; unresolved orders remain fail-closed.
+                execution_failure(exc, stage="reconciliation")
                 self.next_reconcile = time.monotonic() + 1
             await asyncio.sleep(min(1.0, max(0.05, self.next_reconcile - time.monotonic())))
 
@@ -359,7 +414,8 @@ class RecoveryEvaluator:
             engine.check_quote_age(snapshot, engine.clock(), "account snapshot")
         except Hold as exc:
             blockers.append(str(exc))
-        except Exception:
+        except Exception as exc:
+            execution_failure(exc, stage="recovery", context={"message_id": message["id"]})
             blockers.append("Current account data is unavailable")
             snapshot = None
         try:
@@ -387,7 +443,8 @@ class RecoveryEvaluator:
                     facts["affordable_quantity"] = quantity
         except Hold as exc:
             blockers.append(str(exc))
-        except Exception:
+        except Exception as exc:
+            execution_failure(exc, stage="recovery", context={"message_id": message["id"]})
             blockers.append("Current option quote or affordability is unavailable")
         return facts
 
@@ -483,12 +540,13 @@ class RecoveryEvaluator:
                     decision = {"evaluation_timing": timing}
                 else:
                     decision = decision | {"recovery": {"evaluation_timing": timing}}
+            if decision is None:
+                decision = {}
+            detail = engine.diagnose_failure(decision, exc, stage="recovery", message=message)
             if isinstance(exc, InterpretationError):
                 reason = safe_interpretation_reason(exc)
             else:
-                if decision is None:
-                    decision = {}
-                reason = "Recovery failed; " + engine.diagnose_failure(decision, exc, stage="recovery")
+                reason = "Recovery failed; " + detail
             return self.store.record(message, "recovery_error", reason, decision)
 
     async def consume(self, fresh_queue, emit):

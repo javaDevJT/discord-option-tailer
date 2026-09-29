@@ -2,9 +2,15 @@
 import builtins
 import json
 import logging
+import math
+import os
 import re
+import time
 import traceback
+import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -12,6 +18,8 @@ _FAILURE_STAGES = frozenset({
     "execution", "planning", "snapshot", "quote", "contract_resolution",
     "source_verification", "order_reservation", "submission", "result_recording",
     "recovery", "expiry", "stop", "stop_submission", "reconciliation", "watch_preparation",
+    "preflight", "review", "dispatch_guard", "placement", "response_validation", "cancellation",
+    "interpretation", "worker", "discovery", "expiry_session",
 })
 _BROKER_OPERATIONS = frozenset({
     "snapshot", "quote", "nearest_expiry", "prepare_contract", "prepare_entry",
@@ -40,16 +48,175 @@ _FAILURE_CODES = frozenset({
     "internal_error", "broker_error", "schema_incompatible", "dns_failed", "tls_failed", "timeout",
     "browser_profile_busy", "runtime_missing", "local_permission", "network_unavailable",
 })
+_EXECUTION_CHECKS = frozenset({
+    "dispatch_intent", "signal_freshness", "origin_evidence", "source_consistency",
+    "execution_mode", "kill_switch", "entry_window", "prepared_watch", "quote_age",
+    "snapshot_age", "account_session", "account_restrictions", "contract_tradability",
+    "quote_spread", "entry_chase", "entry_capacity", "exit_profit", "source_verification",
+    "origin_verification", "dispatch_persistence",
+})
+
+
+def project_execution_context(value):
+    """Only explicitly named business facts, never raw requests, account IDs or tokens."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    numbers = {
+        "quantity", "available_quantity", "calculated_quantity", "buying_power", "equity",
+        "bid", "ask", "limit_price", "alert_price", "max_chase_fraction", "max_spread_fraction",
+        "spread_fraction", "signal_age_seconds", "quote_age_seconds", "snapshot_age_seconds",
+        "max_signal_age_seconds", "max_quote_age_seconds", "entry_remaining_seconds",
+        "expected_source_generation", "actual_source_generation", "restriction_count",
+        "filled_quantity", "requested_quantity", "fee", "strike", "duration_seconds",
+    }
+    flags = {"prepared_entry", "market_open", "account_matches", "tradable", "kill_switch_present",
+             "watch_matches", "within_cap", "transport_attempted", "live_enabled", "submitted"}
+    ids = {"message_id", "channel_id", "origin_message_id", "latest_message_id", "watch_message_id"}
+    hashes = {"revision", "expected_revision", "actual_revision", "client_order_id",
+              "expected_position_generation", "actual_position_generation", "diagnostic_id", "attempt_id"}
+    enums = {"mode": {"live", "paper", "shadow"}, "side": {"buy", "sell"},
+             "action": {"OPEN", "ADD", "REDUCE", "CLOSE", "HOLD", "IGNORE", "UPDATE_STOP"},
+             "option_type": {"call", "put"}, "phase": {"before_review", "after_review", "after_source"},
+             "state": {"held", "error", "unknown", "broker_order", "paper_order", "shadow_order", "filled",
+                       "canceled", "rejected", "expired", "open", "partially_filled", "context"}}
+    for key, item in value.items():
+        if key in numbers:
+            if type(item) in (int, float) and math.isfinite(item) and abs(item) <= 1e15:
+                result[key] = item
+            elif isinstance(item, str) and re.fullmatch(r"[+-]?[0-9]{1,16}(?:\.[0-9]{1,32})?", item):
+                result[key] = item
+        elif key in flags and type(item) is bool:
+            result[key] = item
+        elif key in ids and isinstance(item, str) and re.fullmatch(r"[0-9]{15,22}", item):
+            result[key] = item
+        elif key in hashes and isinstance(item, str) and re.fullmatch(r"[a-f0-9]{32,64}", item):
+            result[key] = item
+        elif key in enums and isinstance(item, str) and item in enums[key]:
+            result[key] = item
+        elif key == "symbol" and isinstance(item, str) and re.fullmatch(r"[A-Z][A-Z0-9.]{0,9}", item):
+            result[key] = item
+        elif key == "expiry" and isinstance(item, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", item):
+            result[key] = item
+    return result
+
+
+def project_dispatch_checks(value):
+    result = []
+    for item in value[:96] if isinstance(value, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("check"), str) or item["check"] not in _EXECUTION_CHECKS:
+            continue
+        row = {"check": item["check"]}
+        if isinstance(item.get("status"), str) and item["status"] in {"running", "passed", "failed"}:
+            row["status"] = item["status"]
+        duration = item.get("duration_seconds")
+        if type(duration) in (int, float) and math.isfinite(duration) and 0 <= duration <= 86400:
+            row["duration_seconds"] = duration
+        at = item.get("started_at")
+        if isinstance(at, str) and re.fullmatch(r"[0-9T:.+Z-]{20,40}", at):
+            row["started_at"] = at
+        row["context"] = project_execution_context(item.get("context"))
+        result.append(row)
+    return result
+
+
+def log_execution(event, *, context=None, diagnostic=None, checks=None):
+    """A safe log failure must never change an execution outcome."""
+    if event not in {"check", "failure", "outcome", "reserved", "dispatch", "worker_start"}:
+        return
+    try:
+        record = {"event": event, "at": datetime.now(timezone.utc).isoformat(),
+                  "context": project_execution_context(context)}
+        revision = os.environ.get("RELAY_SOURCE_REVISION", "")
+        if re.fullmatch(r"[a-f0-9]{40}", revision):
+            record["build_revision"] = revision
+        if diagnostic is not None:
+            record["diagnostic"] = project_execution_diagnostic(diagnostic)
+        if checks is not None:
+            record["checks"] = project_dispatch_checks(checks)
+        writer = logging.getLogger(__name__).error if event == "failure" else logging.getLogger(__name__).info
+        writer("Execution diagnostic %s", json.dumps(record, sort_keys=True))
+    except Exception:
+        pass
+
+
+class _PrivateExecutionLog(RotatingFileHandler):
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", encoding="utf-8")
+
+    def handleError(self, record):
+        # Keep a second sink for a failed disk write, without duplicating every
+        # successful record into the container's separately managed log storage.
+        try:
+            logging.getLogger().handle(record)
+        except Exception:
+            pass
+
+
+def configure_execution_log(path):
+    """Rotate only the safe execution logger on the persistent data volume."""
+    logger = logging.getLogger(__name__)
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise OSError("execution log may not be a symlink")
+        fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        os.chmod(path, 0o600)
+        for handler in logger.handlers:
+            if isinstance(handler, RotatingFileHandler) and handler.baseFilename == str(path.resolve()):
+                return
+        handler = _PrivateExecutionLog(path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    except Exception as error:
+        # The container log remains a second sink if the volume is unavailable.
+        execution_failure(error, stage="worker")
+
+
+@contextmanager
+def execution_check(trace, check, *, context=None):
+    started = time.monotonic()
+    row = {"check": check, "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        yield context
+    except BaseException as error:
+        row["status"] = "failed"
+        try:
+            annotate_failure(error, stage="dispatch_guard", check=check, context=context)
+        except Exception:
+            pass
+        raise
+    else:
+        row["status"] = "passed"
+    finally:
+        # This also runs on cancellation; it does not swallow cancellation.
+        try:
+            row.update(duration_seconds=round(time.monotonic() - started, 6),
+                       context=project_execution_context(context))
+            if isinstance(trace, list) and len(trace) < 96:
+                trace.append(row)
+            if row["status"] == "failed":
+                log_execution("check", context=context, checks=[row])
+        except Exception:
+            pass
 
 
 def annotate_failure(error, **fields):
     """Keep provenance on the exception, not shared concurrent task state."""
-    allowed = {"stage": _FAILURE_STAGES, "broker_operation": _BROKER_OPERATIONS, "tool": _FAILURE_TOOLS, "code": _FAILURE_CODES}
+    allowed = {"stage": _FAILURE_STAGES, "broker_operation": _BROKER_OPERATIONS, "tool": _FAILURE_TOOLS, "code": _FAILURE_CODES, "check": _EXECUTION_CHECKS}
     try:
         details = dict(getattr(error, "_relay_failure", {}))
         for key, value in fields.items():
             if key in allowed and isinstance(value, str) and value in allowed[key]:
                 details.setdefault(key, value)
+        if isinstance(fields.get("context"), dict):
+            details["context"] = project_execution_context(fields["context"]) | details.get("context", {})
         error._relay_failure = details
     except Exception:
         pass  # Diagnostics must never replace the original failure.
@@ -60,7 +227,10 @@ def failure_stage(stage):
     try:
         yield
     except Exception as error:
-        annotate_failure(error, stage=stage)
+        try:
+            annotate_failure(error, stage=stage)
+        except Exception:
+            pass
         raise
 
 
@@ -70,7 +240,7 @@ def project_execution_diagnostic(value):
         if not isinstance(item, dict):
             return {}
         result = {}
-        for key, choices in (("stage", _FAILURE_STAGES), ("broker_operation", _BROKER_OPERATIONS), ("tool", _FAILURE_TOOLS)):
+        for key, choices in (("stage", _FAILURE_STAGES), ("broker_operation", _BROKER_OPERATIONS), ("tool", _FAILURE_TOOLS), ("check", _EXECUTION_CHECKS)):
             if isinstance(item.get(key), str) and item[key] in choices:
                 result[key] = item[key]
         if isinstance(item.get("exception"), str):
@@ -80,22 +250,30 @@ def project_execution_diagnostic(value):
             result["code"] = code
         frames = item.get("frames", [])
         if isinstance(frames, list):
-            result["frames"] = [frame for frame in frames[:8] if isinstance(frame, str) and re.fullmatch(
+            result["frames"] = [frame for frame in frames[:16] if isinstance(frame, str) and re.fullmatch(
                 r"relay/[a-z_]+\.py:[1-9][0-9]{0,5}:[A-Za-z_][A-Za-z0-9_]{0,79}", frame
             )]
+        if isinstance(item.get("id"), str) and re.fullmatch(r"[a-f0-9]{32}", item["id"]):
+            result["id"] = item["id"]
+        if isinstance(item.get("build_revision"), str) and re.fullmatch(r"[a-f0-9]{40}", item["build_revision"]):
+            result["build_revision"] = item["build_revision"]
+        if isinstance(item.get("at"), str) and re.fullmatch(r"[0-9T:.+Z-]{20,40}", item["at"]):
+            result["at"] = item["at"]
+        if isinstance(item.get("context"), dict):
+            result["context"] = project_execution_context(item["context"])
         return result
     result = project(value)
     if isinstance(value, dict) and isinstance(value.get("causes"), list):
-        result["causes"] = [project(item) for item in value["causes"][:3] if isinstance(item, dict)]
+        result["causes"] = [project(item) for item in value["causes"][:8] if isinstance(item, dict)]
     return result
 
 
-def execution_failure(error, *, stage="execution"):
+def execution_failure(error, *, stage="execution", context=None):
     """Return and log safe diagnostics without messages, source text, locals, or paths."""
-    annotate_failure(error, stage=stage)
     pending, seen, items = [error], set(), []
     try:
-        while pending and len(items) < 4:
+        annotate_failure(error, stage=stage, context=context)
+        while pending and len(items) < 9:
             current = pending.pop(0)
             if not isinstance(current, BaseException) or id(current) in seen:
                 continue
@@ -117,21 +295,27 @@ def execution_failure(error, *, stage="execution"):
                     frames.append(f"relay/{path.name}:{line}:{frame.f_code.co_name}")
             attached = project_execution_diagnostic(getattr(current, "_relay_failure", {}))
             items.append(project_execution_diagnostic(attached | {
-                "exception": name, "code": attached.get("code", code), "frames": frames[-8:],
+                "exception": name, "code": attached.get("code", code), "frames": frames[-16:],
             }))
             if isinstance(current, BaseExceptionGroup):
-                pending.extend(current.exceptions[:4])
+                pending.extend(current.exceptions[:8])
             pending.extend(item for item in (current.__cause__, current.__context__) if isinstance(item, BaseException))
         diagnostic = items[0] | ({"causes": items[1:]} if len(items) > 1 else {})
     except Exception:
         diagnostic = {"stage": stage if stage in _FAILURE_STAGES else "execution", "exception": "Exception", "code": "internal_error", "frames": []}
-    parts = [f"{key}={diagnostic[key]}" for key in ("stage", "exception", "code", "broker_operation", "tool") if key in diagnostic]
+    diagnostic["id"] = uuid.uuid4().hex
+    diagnostic["at"] = datetime.now(timezone.utc).isoformat()
+    revision = os.environ.get("RELAY_SOURCE_REVISION", "")
+    if re.fullmatch(r"[a-f0-9]{40}", revision):
+        diagnostic["build_revision"] = revision
+    # Keep the innermost named check in the summary even through generic wrappers.
+    checks = [item.get("check") for item in [diagnostic] + diagnostic.get("causes", []) if item.get("check")]
+    if checks:
+        diagnostic["check"] = checks[-1]
+    parts = [f"{key}={diagnostic[key]}" for key in ("id", "stage", "check", "exception", "code", "broker_operation", "tool") if key in diagnostic]
     if diagnostic.get("frames"):
         parts.append("at=" + diagnostic["frames"][-1])
-    try:
-        logging.getLogger(__name__).error("Execution diagnostic %s", json.dumps(diagnostic, sort_keys=True))
-    except Exception:
-        pass
+    log_execution("failure", context=context, diagnostic=diagnostic)
     return "; ".join(parts), diagnostic
 
 

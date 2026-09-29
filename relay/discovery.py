@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
-import logging
 import os
 from pathlib import Path
 import re
@@ -24,6 +23,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from .pacing import discord_delay
+from .status import execution_failure, project_execution_diagnostic
 
 
 SNOWFLAKE = re.compile(r"\d{15,22}\Z")
@@ -147,6 +147,9 @@ def _public_projection(value: object) -> dict:
     channel_id = value.get("channel_id") if SNOWFLAKE.fullmatch(str(value.get("channel_id", ""))) else None
     result = _empty_snapshot(state=state, request_id=request_id, guild_id=guild_id,
                              channel_id=channel_id, detail=value.get("detail", ""))
+    diagnostic = project_execution_diagnostic(value.get("execution_diagnostic"))
+    if diagnostic:
+        result["execution_diagnostic"] = diagnostic
 
     seen_guilds: set[str] = set()
     for item in value.get("guilds", []) if isinstance(value.get("guilds"), list) else []:
@@ -883,12 +886,13 @@ async def _process_request(page: object, request: dict) -> dict:
     except Exception as exc:
         # Keep exception text out of the result: Playwright errors can include
         # URLs, DOM text, or browser details that do not belong in setup state.
-        logging.getLogger(__name__).warning("Discord discovery failed: %s", str(exc).splitlines()[0][:240])
+        _, diagnostic = execution_failure(exc, stage="discovery")
         return {
             "state": "failed", "request_id": request["request_id"],
             "guild_id": request.get("guild_id"), "channel_id": request.get("channel_id"),
             "guilds": [], "channels": [], "authors": [],
             "detail": "Discord discovery could not read the rendered page; retry after the browser is ready.",
+            "execution_diagnostic": diagnostic,
         }
 
 
@@ -955,12 +959,14 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
                                 _prepare_and_process(context, page, request),
                                 timeout=REQUEST_TIMEOUT_SECONDS,
                             )
-                    except asyncio.TimeoutError:
+                    except asyncio.TimeoutError as exc:
+                        _, diagnostic = execution_failure(exc, stage="discovery")
                         result = {
                             "state": "failed", "request_id": request["request_id"],
                             "guild_id": request.get("guild_id"), "channel_id": request.get("channel_id"),
                             "guilds": [], "channels": [], "authors": [],
                             "detail": "Discord discovery request timed out; retry discovery.",
+                            "execution_diagnostic": diagnostic,
                         }
                     except asyncio.CancelledError:
                         raise
@@ -972,12 +978,13 @@ async def serve_discovery(context: object, runtime_path: str | os.PathLike[str],
                             "detail": "Complete Discord sign-in or verification in the browser before discovery.",
                         }
                     except Exception as exc:
-                        logging.getLogger(__name__).warning("Discord discovery failed (%s)", type(exc).__name__)
+                        _, diagnostic = execution_failure(exc, stage="discovery")
                         result = {
                             "state": "failed", "request_id": request["request_id"],
                             "guild_id": request.get("guild_id"), "channel_id": request.get("channel_id"),
                             "guilds": [], "channels": [], "authors": [],
                             "detail": "Discord discovery could not read the channel directory; retry when Discord is connected.",
+                            "execution_diagnostic": diagnostic,
                         }
                     result = _persistable_result(result, completed_at=_utc_now().isoformat())
                     # A request can be replaced after timeout.  Never let a

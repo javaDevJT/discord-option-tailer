@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from relay.core import Engine, Store
 from relay.expiry import ExpiryExits
@@ -141,6 +141,24 @@ class ExpiryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["state"], "held")
         self.assertIn("market closed", result[0]["reason"])
         self.assertEqual(self.broker.submissions, [])
+
+    async def test_session_lookup_failure_keeps_safe_expiry_diagnostic(self):
+        self.seed()
+        private = "provider token and response body"
+        with patch("relay.expiry.regular_session", side_effect=RuntimeError(private)):
+            with self.assertLogs("relay.status", level="ERROR") as captured:
+                result = await self.monitor.check()
+
+        self.assertEqual(result[0]["state"], "held")
+        self.assertIn("session unavailable", result[0]["reason"])
+        self.assertEqual(self.broker.submissions, [])
+        event = self.store.db.execute(
+            "SELECT decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1",
+            (result[0]["message_id"],),
+        ).fetchone()
+        decision = json.loads(event["decision"])
+        self.assertEqual(decision["execution_diagnostic"]["stage"], "expiry_session")
+        self.assertNotIn(private, result[0]["reason"] + event["decision"] + "\n".join(captured.output))
 
     async def test_after_utc_midnight_audits_same_new_york_expiry_day(self):
         self.now = datetime(2026, 9, 22, 0, 30, tzinfo=timezone.utc)

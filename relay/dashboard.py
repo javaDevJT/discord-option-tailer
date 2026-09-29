@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import tempfile
 from .account import AUTH_ERROR, CACHE_KEY, REFRESH_ERROR, REFRESH_SECONDS
-from .status import project_execution_diagnostic
+from .status import project_dispatch_checks, project_execution_diagnostic
 from .images import collect_images, download_images, ImageTransportError, MAX_IMAGES
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
@@ -42,7 +42,7 @@ DECISION_FIELDS = (
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
     "evaluation_timing", "entry_preparation", "expiry_resolution", "broker_submission", "profit_only", "exit_evaluation",
     "stop_evaluation", "order_reconciliation",
-    "execution_diagnostic",
+    "execution_diagnostic", "reconciliation_diagnostic", "dispatch_checks",
 )
 BROKER_SUBMISSION_STAGES = frozenset({"snapshot", "review", "dispatch", "response", "validated"})
 EXPIRY_SELECTION_SOURCES = frozenset({"bulk", "requested_date_probe", "later_date"})
@@ -236,6 +236,8 @@ def _project_broker_submission(value):
         result["broker_state"] = broker_state
     if type(submission.get("status_recognized")) is bool:
         result["status_recognized"] = submission["status_recognized"]
+    if type(submission.get("transport_attempted")) is bool:
+        result["transport_attempted"] = submission["transport_attempted"]
     broker_id = _safe_broker_id(submission.get("broker_order_id"))
     if broker_id:
         result["broker_order_id"] = broker_id
@@ -647,8 +649,12 @@ def _project_decision(value):
             projected = _project_expiry_resolution(current)
             if projected is not None:
                 result[key] = projected
-        elif key == "execution_diagnostic":
+        elif key in {"execution_diagnostic", "reconciliation_diagnostic"}:
             result[key] = project_execution_diagnostic(current)
+        elif key == "dispatch_checks":
+            projected = project_dispatch_checks(current)
+            if projected:
+                result[key] = projected
         elif key == "evaluation_timing":
             result[key] = _project_evaluation_timing(current)
         elif key == "stop_evaluation":

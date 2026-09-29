@@ -8,6 +8,7 @@ from datetime import timedelta
 
 from .broker import regular_session
 from .core import EASTERN, Hold, contract_key, money
+from .status import execution_failure
 
 
 EXIT_WINDOW = timedelta(minutes=60)
@@ -57,10 +58,16 @@ class ExpiryExits:
         positions = [p for p in self.store.positions() if p["contract"]["expiry"] == today]
         if not positions:
             return results
+        session_failure = None
         try:
             session = regular_session(engine.clock())
-        except Exception:
+        except Exception as exc:
             session = None
+            session_failure = execution_failure(
+                exc,
+                stage="expiry_session",
+                context={"action": "CLOSE", "expiry": today},
+            )
         if session is not None and engine.clock() < session[1] - EXIT_WINDOW:
             return results
         await self.reconcile()
@@ -83,6 +90,10 @@ class ExpiryExits:
                 if entry is None:
                     raise Hold("Expiry protection blocked: current relay-owned entry cannot be identified")
                 if session is None:
+                    if session_failure is not None:
+                        failure_detail, diagnostic = session_failure
+                        decision["execution_diagnostic"] = diagnostic
+                        raise Hold(f"Expiry protection blocked: exchange session unavailable; {failure_detail}")
                     raise Hold("Expiry protection blocked: exchange session is unavailable")
                 if engine.clock() >= session[1]:
                     decision["expiry_exit"]["status"] = "market_closed"

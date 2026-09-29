@@ -117,8 +117,8 @@ function relayReadTimeoutSignal() {
     return "";
   }
 
-  function statusPill(value) {
-    const pill = node("span", `status-pill ${classForState(value)}`, humanize(value));
+  function statusPill(value, label = humanize(value)) {
+    const pill = node("span", `status-pill ${classForState(value)}`, label);
     return pill;
   }
 
@@ -578,6 +578,41 @@ function relayReadTimeoutSignal() {
       seen.add(orderId);
       return true;
     });
+  }
+
+  function latestEventForOrder(order) {
+    const messageId = firstValue(order?.message_id, order?.messageId);
+    if (messageId === undefined) return null;
+    const message = state.data.messages.find((item) => String(firstValue(item?.id, item?.message_id, "")) === String(messageId));
+    const latest = message?.latest_event || message?.latestEvent;
+    const candidates = [];
+    if (latest && eventMatchesOrderIdentity(latest, order)) candidates.push(latest);
+    state.data.events.forEach((event) => {
+      if (String(firstValue(event?.message_id, event?.messageId, "")) === String(messageId)
+          && eventMatchesOrderIdentity(event, order)) candidates.push(event);
+    });
+    return candidates
+      .sort((left, right) => new Date(firstValue(right?.created_at, right?.timestamp, 0)).getTime()
+        - new Date(firstValue(left?.created_at, left?.timestamp, 0)).getTime())[0] || null;
+  }
+
+  function eventMatchesOrderIdentity(event, order) {
+    if (!event || !order) return false;
+    const decision = readDecision(event);
+    const orderIdentity = firstValue(order.client_order_id, order.id, order.order_id);
+    if (orderIdentity === undefined || orderIdentity === null || orderIdentity === "") return false;
+    const diagnosticIdentity = decision.execution_diagnostic?.context?.client_order_id;
+    const eventIdentities = [decision.order_proposal?.client_order_id, diagnosticIdentity]
+      .filter((value) => value !== undefined && value !== null && value !== "");
+    return eventIdentities.some((identity) => String(identity) === String(orderIdentity));
+  }
+
+  function orderProvenNotSubmitted(order, event = latestEventForOrder(order)) {
+    if (!eventMatchesOrderIdentity(event, order)) return false;
+    const submission = readDecision(event).broker_submission;
+    return normalized(order?.status) === "rejected"
+      && normalized(event?.state) === "held"
+      && submission?.transport_attempted === false;
   }
 
   async function request(path, params = {}) {
@@ -1040,22 +1075,104 @@ function renderEntryPreparation(parent, preparation, directExpiryResolution) {
     }
     if (parts.length) append(parent, node("p", "record-meta", `Entry preparation / ${parts.join(" · ")}`));
 
-    const failure = preparation.failure;
-    if (failure && typeof failure === "object" && !Array.isArray(failure)) {
-      const candidates = [failure, ...(Array.isArray(failure.causes) ? failure.causes.slice(0, 3) : [])];
-      const operation = firstValue(...candidates.flatMap((item) => [item?.broker_operation, item?.tool, item?.stage]));
-      const code = firstValue(...candidates.map((item) => item?.code));
-      const frame = firstValue(...candidates.flatMap((item) => Array.isArray(item?.frames) ? item.frames : []));
-      const details = [
-        operation ? `Operation ${humanize(operation)}` : "",
-        code ? `Code ${humanize(code)}` : "",
-        frame ? `Frame ${safeString(frame)}` : "",
-      ].filter(Boolean);
-      if (details.length) append(parent, node("p", "record-meta", `Preparation failure / ${details.join(" · ")}`));
-    }
     renderExpiryResolution(parent, preparation.expiry_resolution, "Watch expiry");
   }
   renderExpiryResolution(parent, directExpiryResolution, "Expiry resolution");
+}
+
+function diagnosticText(value) {
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(value) ? value : "";
+}
+
+function diagnosticContext(parent, context, label = "Observed context") {
+  if (!context || typeof context !== "object" || Array.isArray(context)) return;
+  const entries = Object.entries(context).filter(([key, value]) =>
+    /^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(key)
+    && (typeof value === "string" || typeof value === "boolean"
+      || (typeof value === "number" && Number.isFinite(value)))
+  ).slice(0, 32);
+  for (const [key, value] of entries) {
+    const rendered = typeof value === "string" ? value.slice(0, 256) : String(value);
+    append(parent, node("p", "record-meta", `${label} / ${humanize(key)} ${rendered}`));
+  }
+}
+
+function diagnosticEntry(parent, diagnostic, label) {
+  if (!diagnostic || typeof diagnostic !== "object" || Array.isArray(diagnostic)) return [];
+  const parts = [];
+  if (typeof diagnostic.id === "string" && /^[a-f0-9]{32}$/i.test(diagnostic.id)) parts.push(`ID ${diagnostic.id}`);
+  if (typeof diagnostic.at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(diagnostic.at)) parts.push(`At ${formatDate(diagnostic.at, true)}`);
+  if (typeof diagnostic.build_revision === "string" && /^[a-f0-9]{40}$/.test(diagnostic.build_revision)) parts.push(`Build ${diagnostic.build_revision.slice(0, 12)}`);
+  for (const [key, title] of [
+    ["check", "Check"], ["stage", "Stage"], ["tool", "Tool"],
+    ["broker_operation", "Operation"], ["type", "Type"], ["exception", "Exception"], ["code", "Code"],
+  ]) {
+    const value = diagnosticText(diagnostic[key]);
+    if (value) parts.push(`${title} ${humanize(value)}`);
+  }
+  append(parent, node("p", "record-meta", `${label}${parts.length ? ` / ${parts.join(" · ")}` : ""}`));
+  diagnosticContext(parent, diagnostic.context);
+  const frames = Array.isArray(diagnostic.frames) ? diagnostic.frames.slice(0, 16) : [];
+  frames.forEach((frame, index) => {
+    if (typeof frame === "string" && /^relay\/[A-Za-z0-9_./-]{1,200}:[1-9][0-9]{0,5}:[A-Za-z_][A-Za-z0-9_]{0,79}$/.test(frame)) {
+      append(parent, node("p", "record-meta", `Frame ${index + 1} ${frame}`));
+    }
+  });
+  return Array.isArray(diagnostic.causes) ? diagnostic.causes.filter((cause) => cause && typeof cause === "object" && !Array.isArray(cause)) : [];
+}
+
+function diagnosticTree(parent, diagnostic, label) {
+  const causes = diagnosticEntry(parent, diagnostic, label);
+  const queue = causes.map((item) => ({ item, depth: 1 }));
+  let count = 0;
+  while (queue.length && count < 8) {
+    const { item, depth } = queue.shift();
+    count += 1;
+    const nested = diagnosticEntry(parent, item, `Cause ${count}`);
+    if (depth < 8) nested.forEach((cause) => queue.push({ item: cause, depth: depth + 1 }));
+  }
+}
+
+function renderExecutionDiagnostics(parent, decision) {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision)) return;
+  const preparationFailure = decision.entry_preparation?.failure;
+  const executionFailure = decision.execution_diagnostic;
+  const reconciliationFailure = decision.reconciliation_diagnostic;
+  const checks = Array.isArray(decision.dispatch_checks) ? decision.dispatch_checks.slice(0, 96) : [];
+  const hasPreparationFailure = preparationFailure && typeof preparationFailure === "object" && !Array.isArray(preparationFailure);
+  const hasExecutionFailure = executionFailure && typeof executionFailure === "object" && !Array.isArray(executionFailure);
+  const hasReconciliationFailure = reconciliationFailure && typeof reconciliationFailure === "object" && !Array.isArray(reconciliationFailure);
+  if (!hasPreparationFailure && !hasExecutionFailure && !hasReconciliationFailure && checks.length === 0) return;
+
+  const summaryParts = ["Execution diagnostics"];
+  if (checks.length) summaryParts.push(`${checks.length} dispatch checks`);
+  const failedCheck = [...checks].reverse().find((item) => item?.status === "failed");
+  if (failedCheck && diagnosticText(failedCheck.check)) summaryParts.push(`Failed ${humanize(failedCheck.check)}`);
+  else if (diagnosticText(executionFailure?.check)) summaryParts.push(humanize(executionFailure.check));
+  else if (diagnosticText(preparationFailure?.check)) summaryParts.push(humanize(preparationFailure.check));
+
+  const details = node("details", "advanced-channel execution-diagnostics");
+  append(details, node("summary", "", summaryParts.join(" · ")));
+  if (hasExecutionFailure) diagnosticTree(details, executionFailure, "Execution failure");
+  if (hasReconciliationFailure) diagnosticTree(details, reconciliationFailure, "Last reconciliation failure");
+  if (hasPreparationFailure) diagnosticTree(details, preparationFailure, "Preparation failure");
+  checks.forEach((check, index) => {
+    if (!check || typeof check !== "object" || Array.isArray(check)) return;
+    const parts = [];
+    const name = diagnosticText(check.check);
+    if (name) parts.push(humanize(name));
+    if (["passed", "failed", "running"].includes(check.status)) parts.push(humanize(check.status));
+    if (typeof check.started_at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(check.started_at)) {
+      parts.push(`Started ${formatDate(check.started_at, true)}`);
+    }
+    if (typeof check.duration_seconds === "number" && Number.isFinite(check.duration_seconds)
+        && check.duration_seconds >= 0 && check.duration_seconds <= 315_360_000) {
+      parts.push(formatEvaluationDuration(check.duration_seconds));
+    }
+    append(details, node("p", "record-meta", `Dispatch check ${index + 1}${parts.length ? ` / ${parts.join(" · ")}` : ""}`));
+    diagnosticContext(details, check.context, "Check context");
+  });
+  append(parent, details);
 }
 
 function renderBrokerLifecycle(parent, submission, reconciliation) {
@@ -1183,6 +1300,7 @@ function renderStopOrder(parent, order) {
       if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
       renderEvaluationTiming(decisionPanel, event);
       renderEntryPreparation(decisionPanel, readDecision(event).entry_preparation, readDecision(event).expiry_resolution);
+      renderExecutionDiagnostics(decisionPanel, readDecision(event));
       renderBrokerLifecycle(decisionPanel, readDecision(event).broker_submission, readDecision(event).order_reconciliation);
       renderProtection(decisionPanel, readDecision(event).stop_evaluation);
         }
@@ -1201,6 +1319,7 @@ function renderStopOrder(parent, order) {
       append(decisionPanel, node("p", "decision-reason", decisionReason(previous)));
       renderEvaluationTiming(decisionPanel, previous);
       renderEntryPreparation(decisionPanel, readDecision(previous).entry_preparation, readDecision(previous).expiry_resolution);
+      renderExecutionDiagnostics(decisionPanel, readDecision(previous));
       renderBrokerLifecycle(decisionPanel, readDecision(previous).broker_submission, readDecision(previous).order_reconciliation);
     }
     const related = getOrdersForMessage(messageId);
@@ -1209,8 +1328,9 @@ function renderStopOrder(parent, order) {
         related.forEach((order) => {
           const filled = firstValue(order.filled_quantity, order.filledQuantity, 0);
           const quantity = firstValue(order.quantity, 0);
+          const notSubmitted = orderProvenNotSubmitted(order, event);
           const chip = node("span", "related-order");
-          append(chip, node("strong", "", humanize(firstValue(order.status, "recorded"))), node("span", "", `${formatNumber(filled)} / ${formatNumber(quantity)} filled`));
+          append(chip, node("strong", "", notSubmitted ? "Not submitted" : humanize(firstValue(order.status, "recorded"))), node("span", "", `${formatNumber(filled)} / ${formatNumber(quantity)} filled`));
           relatedOrders.appendChild(chip);
         });
         append(decisionPanel, relatedOrders);
@@ -1247,7 +1367,8 @@ function renderStopOrder(parent, order) {
       const price = node("div", "record-detail");
       append(price, node("strong", "", formatMoney(firstValue(order.filled_notional, order.limit_price))), node("div", "record-meta", order.filled_notional !== undefined ? "filled notional" : "limit price"));
       const action = node("div", "record-action");
-      append(action, statusPill(firstValue(order.status, "unknown")), node("div", "record-meta", `ID / ${shortId(firstValue(order.id, order.order_id))}`));
+      const notSubmitted = orderProvenNotSubmitted(order);
+      append(action, statusPill(notSubmitted ? "held" : firstValue(order.status, "unknown"), notSubmitted ? "Not submitted" : undefined), node("div", "record-meta", `ID / ${shortId(firstValue(order.id, order.order_id))}`));
       append(row, contract, quantities, price, action);
       list.appendChild(row);
     });
@@ -1502,6 +1623,7 @@ function renderStopOrder(parent, order) {
       state.panelErrors.delete("messages");
       completeResource("messages", state.data.messages.length > 0);
       renderMessages();
+      renderOrders();
       return true;
     } catch (error) {
       failResource("messages", error);
@@ -1584,6 +1706,8 @@ function renderStopOrder(parent, order) {
       state.panelErrors.delete("events");
       completeResource("events", state.data.events.length > 0);
       renderEvents();
+      renderOrders();
+      renderMessages();
       return true;
     } catch (error) {
       failResource("events", error);

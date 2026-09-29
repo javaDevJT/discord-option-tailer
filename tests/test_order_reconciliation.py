@@ -3,7 +3,7 @@ import json
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from relay.recovery import RecoveryEvaluator
 from tests import test_core
@@ -59,6 +59,63 @@ class OrderReconciliationChecks(unittest.IsolatedAsyncioTestCase):
         self.broker.order_status.assert_awaited_once()
         self.broker.cancel_order.assert_not_awaited()
         self.engine.stops.maintain.assert_not_awaited()
+
+    async def test_order_status_failure_persists_safe_reconciliation_diagnostic(self):
+        order = self.order("entry-reconcile-failure")
+        message = self.reserve(order)
+        self.store.record(message, "unknown", "awaiting broker", {
+            "action": "OPEN", "order_proposal": order,
+        })
+        message_id = self.store.db.execute(
+            "SELECT message_id FROM orders WHERE id=?", (order["client_order_id"],)
+        ).fetchone()["message_id"]
+        self.store.mark_unknown(order["client_order_id"])
+        private = "private broker response token"
+        self.broker.order_status = AsyncMock(side_effect=RuntimeError(private))
+        evaluator = self.recovery()
+
+        with self.assertLogs("relay.status", level="ERROR") as captured:
+            await evaluator.reconcile_orders(force=True)
+
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM orders WHERE id=?", (order["client_order_id"],)
+        ).fetchone()["status"], "unknown")
+        event = self.store.db.execute(
+            "SELECT decision FROM events WHERE message_id=? ORDER BY id DESC LIMIT 1", (message_id,)
+        ).fetchone()
+        decision = json.loads(event["decision"])
+        diagnostic = decision["reconciliation_diagnostic"]
+        self.assertEqual(diagnostic["stage"], "reconciliation")
+        self.assertEqual(diagnostic["context"]["action"], "OPEN")
+        self.assertEqual(decision["action"], "OPEN")
+        self.assertEqual(decision["order_reconciliation"]["status"], "unknown")
+        self.assertNotIn(private, event["decision"] + "\n".join(captured.output))
+        self.assertEqual(self.broker.submissions, [])
+
+    async def test_reconciliation_failure_does_not_attach_to_unrelated_event(self):
+        order = self.order("unmatched-entry")
+        self.reserve(order)
+        self.broker.order_status = AsyncMock(side_effect=RuntimeError("broker unavailable"))
+        with self.assertLogs("relay.status", level="ERROR"):
+            await self.recovery().reconcile_orders(force=True)
+        decisions = self.store.db.execute("SELECT decision FROM events").fetchall()
+        self.assertTrue(decisions)
+        self.assertTrue(all("reconciliation_diagnostic" not in json.loads(row["decision"] or "{}")
+                            for row in decisions))
+
+    async def test_cancel_error_is_logged_before_successful_status_fallback(self):
+        order = self.order("cancel-race", deadline=(NOW - timedelta(seconds=1)).isoformat())
+        self.reserve(order)
+        self.broker.cancel_order = AsyncMock(side_effect=RuntimeError("private cancel response"))
+        self.broker.order_status = AsyncMock(return_value={
+            "id": "paper-cancel-race", "status": "filled", "filled_quantity": 2, "fill_price": "1.00",
+        })
+        with self.assertLogs("relay.status", level="ERROR") as captured:
+            await self.recovery().reconcile_orders(force=True)
+        self.assertIn('"stage": "cancellation"', "\n".join(captured.output))
+        self.assertNotIn("private cancel response", "\n".join(captured.output))
+        self.assertEqual(self.store.db.execute("SELECT status FROM orders WHERE id=?",
+                                              (order["client_order_id"],)).fetchone()["status"], "filled")
 
     async def test_dispatch_deadline_is_persisted_and_survives_restart(self):
         order = self.order("entry-1", after_seconds=3)
