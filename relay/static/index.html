@@ -835,7 +835,20 @@
           </section>
         </section>
 
-        <section class="panel-section" id="events" aria-labelledby="events-title">
+    <section class="panel-section" id="monitors" aria-labelledby="monitors-title">
+      <div class="section-heading section-heading-compact">
+        <div>
+          <span class="eyebrow">06 / PERSISTENT MONITORING</span>
+          <h2 id="monitors-title">Position monitors</h2>
+        </div>
+        <span class="section-stamp" id="monitor-active-count" aria-live="polite">0 pending reassessments</span>
+      </div>
+      <p class="panel-note" id="monitor-boundary">Position monitors request Codex reassessment. They do not place a protective broker stop or promise immediate stop execution.</p>
+      <div class="list-shell monitor-list" id="monitor-list" aria-live="polite">
+        <p class="loading-state">Loading position monitors…</p>
+      </div>
+    </section>
+    <section class="panel-section" id="events" aria-labelledby="events-title">
           <div class="section-heading">
             <div>
               <p class="eyebrow">05 / AUDIT TRAIL</p>

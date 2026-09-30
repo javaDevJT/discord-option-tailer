@@ -139,6 +139,16 @@ Evaluation retries once for transient failures and invalid structured output or 
 
 ## Monitor and operate
 
+### Codex position monitoring
+
+Codex can attach a `monitor` plan to a `WAIT` decision for a specific, currently owned position from the same Discord source. It chooses a duration (30 seconds to seven days), a polling interval (5–300 seconds), and either a timed reassessment or price/return/quantity conditions. Conditions can watch option bid/ask, underlying price, unrealized return, or held quantity. Any matching condition or elapsed reassessment timer wakes Codex with current broker observations and source context; the trigger is not itself a sell instruction.
+
+Plans and claimed evaluations are saved in SQLite and resumed after restart. Monitoring ends at the deadline, when the entry is no longer owned, or when a newer plan supersedes it. Codex can explicitly continue monitoring within the existing deadline, finish without action, or reduce/close the owned position through the normal execution and source-verification checks. Monitor callbacks cannot open positions. Polling and model evaluation run outside the entry execution lock and yield to fresh messages.
+
+The dashboard's position-monitor list shows the plan, deadline, observations, triggers, decisions, and diagnostic failures. These targeted reads are separate from the ordinary hourly account overview. Polling and Codex reassessment require the app and provider credentials to remain available; this is not a broker-native protective order.
+
+Relative dates remain tied to the original Discord message. The current Robinhood tool schema has no underlying daily-low/high or historical-bars fields. A request such as "under today's low" therefore needs a grounded numeric level from source context; unavailable references are reported explicitly, never replaced by the option low or a different day's price. A timed reassessment can continue while that reference is unresolved, but unresolved conditions do not authorize an exit.
+
 ### Agent-directed stop losses
 
 Codex interprets stop instructions; stop-bearing messages bypass JEV and literal entry parsing. A partial exit plus a breakeven instruction produces one `REDUCE` decision with `stop_price="breakeven"`. A standalone stop change produces `UPDATE_STOP`. Numeric stops refer to the option premium; an underlying stock-price level is not treated as an option-premium stop.

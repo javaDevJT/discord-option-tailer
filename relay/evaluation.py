@@ -364,6 +364,36 @@ class EvaluationRouter:
                 dict(facts),
             )
 
+    async def assess_monitor(
+        self,
+        message: Mapping[str, Any],
+        context: Sequence[Mapping[str, Any]],
+        positions: Sequence[Mapping[str, Any]],
+        plan: Mapping[str, Any],
+        facts: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Reassess one persisted monitor through serialized Codex evaluation."""
+        if self._closed:
+            raise InterpretationError(
+                "evaluation router closed",
+                code="internal_error",
+                retryable=False,
+            )
+        started = time.monotonic()
+        async with self._codex_lock:
+            decision = await self.codex.assess_monitor(
+                message,
+                list(context),
+                list(positions),
+                dict(plan),
+                dict(facts),
+            )
+        return _merge_timing(
+            decision,
+            {"evaluator": "codex", "route": "monitor"},
+            time.monotonic() - started,
+        )
+
     async def aclose(self) -> None:
         self._closed = True
         await self.jev.aclose()

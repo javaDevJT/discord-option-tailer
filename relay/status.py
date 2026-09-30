@@ -19,7 +19,7 @@ _FAILURE_STAGES = frozenset({
     "source_verification", "order_reservation", "submission", "result_recording",
     "recovery", "expiry", "stop", "stop_submission", "reconciliation", "watch_preparation",
     "preflight", "review", "dispatch_guard", "placement", "response_validation", "cancellation",
-    "interpretation", "worker", "discovery", "expiry_session",
+    "interpretation", "worker", "discovery", "expiry_session", "monitor_poll", "monitor_evaluation",
 })
 _BROKER_OPERATIONS = frozenset({
     "snapshot", "quote", "nearest_expiry", "prepare_contract", "prepare_entry",
@@ -69,17 +69,20 @@ def project_execution_context(value):
         "max_signal_age_seconds", "max_quote_age_seconds", "entry_remaining_seconds",
         "expected_source_generation", "actual_source_generation", "restriction_count",
         "filled_quantity", "requested_quantity", "fee", "strike", "duration_seconds",
+        "poll_interval_seconds", "reassess_after_seconds", "monitor_generation", "condition_count",
+        "owned_quantity", "broker_quantity", "underlying_price", "unrealized_return_fraction",
     }
     flags = {"prepared_entry", "market_open", "account_matches", "tradable", "kill_switch_present",
              "watch_matches", "within_cap", "transport_attempted", "live_enabled", "submitted"}
     ids = {"message_id", "channel_id", "origin_message_id", "latest_message_id", "watch_message_id"}
     hashes = {"revision", "expected_revision", "actual_revision", "client_order_id",
-              "expected_position_generation", "actual_position_generation", "diagnostic_id", "attempt_id"}
+              "expected_position_generation", "actual_position_generation", "diagnostic_id", "attempt_id", "monitor_id"}
     enums = {"mode": {"live", "paper", "shadow"}, "side": {"buy", "sell"},
-             "action": {"OPEN", "ADD", "REDUCE", "CLOSE", "HOLD", "IGNORE", "UPDATE_STOP"},
+             "action": {"OPEN", "ADD", "REDUCE", "CLOSE", "HOLD", "WAIT", "IGNORE", "UPDATE_STOP"},
              "option_type": {"call", "put"}, "phase": {"before_review", "after_review", "after_source"},
              "state": {"held", "error", "unknown", "broker_order", "paper_order", "shadow_order", "filled",
-                       "canceled", "rejected", "expired", "open", "partially_filled", "context"}}
+                       "canceled", "rejected", "expired", "open", "partially_filled", "context",
+                        "active", "evaluating", "completed", "monitoring"}}
     for key, item in value.items():
         if key in numbers:
             if type(item) in (int, float) and math.isfinite(item) and abs(item) <= 1e15:
@@ -122,7 +125,8 @@ def project_dispatch_checks(value):
 
 def log_execution(event, *, context=None, diagnostic=None, checks=None):
     """A safe log failure must never change an execution outcome."""
-    if event not in {"check", "failure", "outcome", "reserved", "dispatch", "worker_start"}:
+    if event not in {"check", "failure", "outcome", "reserved", "dispatch", "worker_start",
+                     "monitor_armed", "monitor_polled", "monitor_triggered", "monitor_evaluated", "monitor_finished"}:
         return
     try:
         record = {"event": event, "at": datetime.now(timezone.utc).isoformat(),

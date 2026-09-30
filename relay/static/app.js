@@ -13,8 +13,9 @@ function relayReadTimeoutSignal() {
     messages: "/api/messages",
     orders: "/api/orders",
     events: "/api/events",
-    positions: "/api/positions",
-    account: "/api/account",
+  positions: "/api/positions",
+  monitors: "/api/monitors",
+  account: "/api/account",
   });
   const PAGE_SIZE = 25;
   const expandedImagePreviews = new Set();
@@ -51,8 +52,8 @@ function relayReadTimeoutSignal() {
       orders: { offset: 0, nextOffset: null, page: 1 },
       events: { offset: 0, nextOffset: null, page: 1 },
     },
-    loaded: { messages: false, orders: false, positions: false, events: false, account: false },
-    data: { messages: [], orders: [], relationOrders: [], positions: [], events: [], account: null },
+  loaded: { messages: false, orders: false, positions: false, monitors: false, events: false, account: false },
+  data: { messages: [], orders: [], relationOrders: [], positions: [], monitors: [], monitorCount: 0, events: [], account: null },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -109,8 +110,8 @@ function relayReadTimeoutSignal() {
     if (["recovery_review", "viable"].includes(stateName)) return "is-recovery";
     if (["recovery_error", "invalidated"].includes(stateName)) return "is-error";
     if (stateName === "not_actionable") return "is-context";
-    if (["held", "pending", "waiting", "review", "evaluating"].includes(stateName)) return "is-held";
-    if (["evaluated", "interpretation_ready"].includes(stateName)) return "is-context";
+    if (["held", "pending", "waiting", "review", "evaluating", "active", "monitoring"].includes(stateName)) return "is-held";
+    if (["evaluated", "interpretation_ready", "completed"].includes(stateName)) return "is-context";
     if (["paper_order", "shadow_proposal", "shadow_order", "broker_order", "filled", "open", "partially_filled", "submitted"].includes(stateName)) return "is-order";
     if (["context", "duplicate", "canceled", "cancelled", "expired"].includes(stateName)) return "is-context";
     if (["rejected", "unknown", "error", "failed"].includes(stateName)) return "is-error";
@@ -1133,6 +1134,24 @@ function diagnosticTree(parent, diagnostic, label) {
   }
 }
 
+function renderMonitorPlan(parent, plan) {
+  if (!plan || typeof plan !== "object") return;
+  const details = node("div", "monitor-plan-detail");
+  append(details, node("strong", "", "Position monitoring · Codex reassessment"));
+  append(details, node("p", "monitor-boundary-note", "This requests Codex reassessment. It does not place a protective broker stop or guarantee immediate stop execution."));
+  const schedule = `Poll every ${formatDuration(plan.poll_interval_seconds)} for ${formatDuration(plan.duration_seconds)}`;
+  append(details, node("p", "monitor-meta", schedule));
+  if (plan.reassess_after_seconds !== null && plan.reassess_after_seconds !== undefined) {
+    append(details, node("p", "monitor-meta", `Scheduled Codex reassessment after ${formatDuration(plan.reassess_after_seconds)}`));
+  }
+  const conditions = Array.isArray(plan.conditions) ? plan.conditions : [];
+  const why = conditions.length
+    ? conditions.map((condition) => `${humanize(condition.metric)} ${condition.comparison === "lte" ? "≤" : "≥"} ${["source_day_low", "source_day_high", "entry_premium"].includes(condition.threshold) ? humanize(condition.threshold) : formatNumber(condition.threshold)}`).join("; ")
+    : "Time-based reassessment";
+  append(details, node("p", "monitor-reason", `Why monitoring: ${why}`));
+  parent.appendChild(details);
+}
+
 function renderExecutionDiagnostics(parent, decision) {
   if (!decision || typeof decision !== "object" || Array.isArray(decision)) return;
   const preparationFailure = decision.entry_preparation?.failure;
@@ -1300,8 +1319,9 @@ function renderStopOrder(parent, order) {
       if (contract) append(decisionPanel, node("p", "record-meta", `Contract / ${formatContract(contract)}`));
       renderEvaluationTiming(decisionPanel, event);
       renderEntryPreparation(decisionPanel, readDecision(event).entry_preparation, readDecision(event).expiry_resolution);
-      renderExecutionDiagnostics(decisionPanel, readDecision(event));
-      renderBrokerLifecycle(decisionPanel, readDecision(event).broker_submission, readDecision(event).order_reconciliation);
+    renderExecutionDiagnostics(decisionPanel, readDecision(event));
+    renderBrokerLifecycle(decisionPanel, readDecision(event).broker_submission, readDecision(event).order_reconciliation);
+    renderMonitorPlan(decisionPanel, readDecision(event).monitor);
       renderProtection(decisionPanel, readDecision(event).stop_evaluation);
         }
       } else {
@@ -1321,6 +1341,7 @@ function renderStopOrder(parent, order) {
       renderEntryPreparation(decisionPanel, readDecision(previous).entry_preparation, readDecision(previous).expiry_resolution);
       renderExecutionDiagnostics(decisionPanel, readDecision(previous));
       renderBrokerLifecycle(decisionPanel, readDecision(previous).broker_submission, readDecision(previous).order_reconciliation);
+      renderMonitorPlan(decisionPanel, readDecision(previous).monitor);
     }
     const related = getOrdersForMessage(messageId);
       if (related.length) {
@@ -1531,7 +1552,95 @@ function renderStopOrder(parent, order) {
     if (positions.length) renderAccountPositions(positions);
   }
 
-  function renderEvents() {
+function renderMonitors() {
+  const list = $("#monitor-list");
+  if (!list) return;
+  list.replaceChildren();
+  const count = Number(state.data.monitorCount);
+  setText("#monitor-active-count", `${formatNumber(Number.isFinite(count) ? count : 0)} pending reassessments`);
+  if (!state.loaded.monitors) {
+    list.appendChild(node("p", "loading-state", "Loading position monitors…"));
+    return;
+  }
+  if (state.panelErrors.has("monitors")) {
+    list.appendChild(node("p", "error-state", "Position monitors could not be loaded."));
+    return;
+  }
+  const monitors = Array.isArray(state.data.monitors) ? state.data.monitors : [];
+  if (!monitors.length) {
+    list.appendChild(node("p", "empty-state", "No persistent position monitors."));
+    return;
+  }
+  monitors.forEach((monitor) => {
+    const card = node("article", "monitor-card");
+    const heading = node("div", "monitor-heading");
+    append(heading,
+      node("strong", "", formatContract(monitor.contract)),
+      statusPill(monitor.state));
+    const meta = node("div", "monitor-meta");
+    const source = node("a", "monitor-source-link", `Source message ${safeString(monitor.source_message_id, "unavailable")}`);
+    source.href = "#messages";
+    append(meta, source,
+      node("span", "", `Group ${safeString(monitor.source_group, "unknown")}`),
+      node("span", "", `Original source date ${safeString(monitor.source_market_date, "unavailable")}`));
+    const plan = monitor.plan && typeof monitor.plan === "object" ? monitor.plan : {};
+    const schedule = node("div", "monitor-meta");
+    const nextPoll = node("time", "", `Next poll ${formatDate(monitor.next_poll_at)}`);
+    const deadline = node("time", "", `Deadline ${formatDate(monitor.expires_at)}`);
+    if (monitor.next_poll_at) nextPoll.dateTime = monitor.next_poll_at;
+    if (monitor.expires_at) deadline.dateTime = monitor.expires_at;
+    append(schedule,
+      node("span", "", `Poll interval ${formatDuration(plan.poll_interval_seconds)}`),
+      nextPoll,
+      deadline);
+    if (monitor.review_at) {
+      const review = node("time", "", `Next Codex reassessment ${formatDate(monitor.review_at)}`);
+      review.dateTime = monitor.review_at;
+      schedule.appendChild(review);
+    }
+    const reason = monitor.reason || (Array.isArray(plan.conditions) && plan.conditions.length
+      ? plan.conditions.map((condition) => `${humanize(condition.metric)} ${condition.comparison === "lte" ? "≤" : "≥"} ${["source_day_low", "source_day_high", "entry_premium"].includes(condition.threshold) ? humanize(condition.threshold) : formatNumber(condition.threshold)}`).join("; ")
+      : "Scheduled reassessment");
+    append(card, heading, meta, schedule, node("p", "monitor-reason", `Why monitoring: ${safeString(reason, "unavailable")}`));
+
+    const observation = monitor.observation && typeof monitor.observation === "object" ? monitor.observation : {};
+    const facts = [];
+    if (observation.market_open !== undefined) facts.push(`Market open ${observation.market_open ? "yes" : "no"}`);
+    for (const key of ["owned_quantity", "broker_quantity", "average_entry_price", "option_bid", "option_ask", "underlying_price", "source_day_low", "source_day_high"]) {
+      if (observation[key] !== undefined && observation[key] !== null) facts.push(`${humanize(key)} ${formatNumber(observation[key])}`);
+    }
+    if (observation.unrealized_return_fraction !== undefined && observation.unrealized_return_fraction !== null) {
+      facts.push(`Unrealized return ${formatNumber(Number(observation.unrealized_return_fraction) * 100)}%`);
+    }
+    facts.push(`Observed ${formatDate(observation.observed_at || observation.evaluated_at)}`);
+    append(card, node("p", "monitor-meta", `Most recent observation: ${facts.join(" · ")}`));
+    if (Array.isArray(observation.blockers) && observation.blockers.length) {
+      append(card, node("p", "monitor-reason", `Observation blockers: ${observation.blockers.map((blocker) => safeString(blocker, "unknown")).join("; ")}`));
+    }
+
+    const triggered = Array.isArray(observation.triggered_conditions) ? observation.triggered_conditions : [];
+    const triggerText = triggered.length
+      ? triggered.map((index) => plan.conditions?.[index]).filter(Boolean)
+        .map((condition) => `${humanize(condition.metric)} ${condition.comparison === "lte" ? "≤" : "≥"} ${["source_day_low", "source_day_high", "entry_premium"].includes(condition.threshold) ? humanize(condition.threshold) : formatNumber(condition.threshold)}`).join("; ")
+      : observation.trigger_reason ? humanize(observation.trigger_reason) : "No trigger recorded";
+    append(card, node("p", "monitor-meta", `Most recent trigger: ${triggerText}${monitor.triggered_at ? ` · ${formatDate(monitor.triggered_at)}` : ""}`));
+    if (monitor.conditions_resolved === true || (Array.isArray(monitor.conditions_resolved) && monitor.conditions_resolved.length)) {
+      append(card, node("p", "monitor-meta", `Conditions resolved: ${monitor.conditions_resolved === true ? "yes" : monitor.conditions_resolved.map((index) => index + 1).join(", ")}`));
+    }
+    if (monitor.result || monitor.decision) {
+      const decision = monitor.decision || {};
+      const result = monitor.result || [decision.action, decision.reason].filter(Boolean).join(" · ");
+      append(card, node("p", "monitor-result", `Latest reevaluation ${formatDate(monitor.evaluated_at)}: ${safeString(result, "Result recorded")}`));
+      if (decision.evaluation_timing) renderEvaluationTiming(card, decision);
+    } else {
+      append(card, node("p", "monitor-result", "No reevaluation recorded yet."));
+    }
+    if (monitor.diagnostic) diagnosticTree(card, monitor.diagnostic, "Monitor diagnostic");
+    list.appendChild(card);
+  });
+}
+
+function renderEvents() {
     const list = $("#event-list");
     if (!list) return;
     while (list.firstChild) list.removeChild(list.firstChild);
@@ -1677,7 +1786,26 @@ function renderStopOrder(parent, order) {
     }
   }
 
-  async function loadAccount() {
+async function loadMonitors() {
+  try {
+    const payload = await request(API.monitors);
+    state.data.monitors = Array.isArray(payload?.monitors) ? payload.monitors : [];
+    state.data.monitorCount = Number.isFinite(Number(payload?.active_count)) ? Number(payload.active_count) : 0;
+    state.loaded.monitors = true;
+    state.panelErrors.delete("monitors");
+    renderMonitors();
+    return true;
+  } catch (error) {
+    state.data.monitors = [];
+    state.data.monitorCount = 0;
+    state.loaded.monitors = true;
+    state.panelErrors.add("monitors");
+    renderMonitors();
+    return false;
+  }
+}
+
+async function loadAccount() {
     beginResource("account");
     try {
       const payload = await request(API.account);
@@ -1731,7 +1859,8 @@ function renderStopOrder(parent, order) {
         loadMessages(),
         loadOrders(),
         loadRelationshipOrders(),
-        loadPositions(),
+    loadPositions(),
+    loadMonitors(),
         loadAccount(),
         loadEvents(),
       ]);

@@ -230,6 +230,7 @@ async def run(config, *, observe_only=False, on_status=None):
             recovery_consumer = tasks.create_task(recovery.consume(queue, emit))
             order_reconciler = tasks.create_task(recovery.reconcile_loop(emit))
             watch_preparer = tasks.create_task(engine.watches.run())
+            position_monitor = tasks.create_task(engine.monitors.run(queue, emit))
             expiry_consumer = tasks.create_task(expiry.run(emit))
             if config["mode"] != "paper":
                 from .account import AccountCache
@@ -245,6 +246,7 @@ async def run(config, *, observe_only=False, on_status=None):
                     recovery_consumer.cancel()
                     order_reconciler.cancel()
                     watch_preparer.cancel()
+                    position_monitor.cancel()
                     expiry_consumer.cancel()
                     if account_reader is not None:
                         account_reader.cancel()

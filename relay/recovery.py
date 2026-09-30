@@ -106,6 +106,9 @@ class RecoveryEvaluator:
             AND EXISTS (SELECT 1 FROM positions p WHERE p.source_group=m.source_group AND p.quantity>0)
             AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.message_id=m.id)
             AND NOT EXISTS (SELECT 1 FROM events x WHERE x.message_id=m.id AND x.revision!=m.revision)
+            AND NOT EXISTS (SELECT 1 FROM position_monitors pm
+                            WHERE json_extract(pm.body,'$.source_message_id')=m.id
+                            AND json_extract(pm.body,'$.source_revision')=m.revision)
             ORDER BY e.id LIMIT 100""", (self.exit_scan_cursor,)).fetchall()
         for row in rows:
             self.exit_scan_cursor = row["id"]
@@ -473,6 +476,10 @@ class RecoveryEvaluator:
                 decision["evaluation_timing"]["path"] = "recovery"
             decision = await engine.resolve_expiry(message, decision)
             now = engine.clock()
+            if decision["action"] == "WAIT" and decision.get("monitor") is not None:
+                monitor = engine.monitors.arm(message, decision)
+                decision["position_monitor"] = {"id": monitor["id"], "state": monitor["state"]}
+                return self.store.record(message, "monitoring", monitor["reason"], decision)
             if decision["action"] in {"IGNORE", "WAIT", "UPDATE_STOP"}:
                 assessment = dict(status="not_actionable" if decision["action"] == "IGNORE" else "uncertain",
                                   confidence=decision["confidence"], reason=decision["reason"], evidence=decision["evidence"])

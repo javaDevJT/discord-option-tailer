@@ -1398,6 +1398,56 @@ h2 {
   display: none !important;
 }
 
+.monitor-list {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.monitor-card {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  border-radius: 12px;
+  padding: 1rem;
+  background: var(--surface-raised, rgba(255, 255, 255, 0.025));
+}
+
+.monitor-plan-detail {
+  margin-top: 0.6rem;
+  padding: 0.7rem;
+  border-left: 2px solid var(--accent, #9cc8ff);
+  border-radius: 0 8px 8px 0;
+  background: var(--surface-raised, rgba(255, 255, 255, 0.025));
+}
+
+.monitor-heading,
+.monitor-facts,
+.monitor-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1rem;
+}
+
+.monitor-heading {
+  justify-content: space-between;
+}
+
+.monitor-meta,
+.monitor-facts,
+.monitor-reason,
+.monitor-result,
+.monitor-boundary-note {
+  color: var(--muted, #aab2bf);
+  font-size: 0.9rem;
+}
+
+.monitor-source-link {
+  color: var(--accent, #9cc8ff);
+}
+
+.monitor-diagnostic {
+  margin-top: 0.6rem;
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 218px minmax(0, 1fr);

@@ -326,6 +326,11 @@ class Store:
             position_generation TEXT NOT NULL, state TEXT NOT NULL,
                 PRIMARY KEY(message_id,revision));
             CREATE INDEX IF NOT EXISTS messages_source_chronology ON messages(source_group,length(id),id);
+            CREATE TABLE IF NOT EXISTS position_monitors (
+                id TEXT PRIMARY KEY, source_group TEXT NOT NULL, contract TEXT NOT NULL,
+                entry_order_id TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL, next_poll_at TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS position_monitors_due ON position_monitors(state,next_poll_at);
         """)
         self.db.execute("UPDATE evaluation_attempts SET state='interrupted' WHERE state IN ('evaluating','accepted')")
         # A crash after dispatch cannot establish whether the broker accepted an order.
@@ -689,6 +694,8 @@ class Engine:
         self.stops = StopLoss(self)
         from .watch import WatchEntries
         self.watches = WatchEntries(self)
+        from .monitoring import PositionMonitors
+        self.monitors = PositionMonitors(self)
 
     def check_execution_mode(self):
         if self.mode not in {"paper", "shadow", "live"} or self.config.get("mode") != self.mode:
@@ -769,7 +776,7 @@ class Engine:
             raise Hold("the original action message was revised")
         return origin
 
-    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None, verify_source=True):
+    async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None, verify_source=True, source_message=None):
         """Recheck intent after broker review and retain the result of each guard."""
         trace = decision.setdefault("dispatch_checks", [])
         order["dispatch_checks"] = trace
@@ -873,11 +880,12 @@ class Engine:
         if verify_source and expiry_guard is None and (recovery_guard is not None or self.config.get("require_source_verification") or self.config.get("require_browser_verification")):
             with check("source_verification"):
                 options = {} if recovery_guard is None else {"recovery": True, "latest_id": recovery_guard()}
-                if self.verify_current is None or not await self.measure(decision, "source_verification_seconds", self.verify_current(message, **options)):
+                verification_message = source_message if source_message is not None else message
+                if self.verify_current is None or not await self.measure(decision, "source_verification_seconds", self.verify_current(verification_message, **options)):
                     raise RetryHold("current Discord message could not be verified before dispatch")
             with check("origin_verification"):
                 origin = self.origin(message, decision)
-                if recovery_guard is not None and origin["id"] != message["id"] and not await self.measure(decision, "source_verification_seconds", self.verify_current(origin, **options)):
+                if recovery_guard is not None and origin["id"] != verification_message["id"] and not await self.measure(decision, "source_verification_seconds", self.verify_current(origin, **options)):
                     raise RetryHold("original Discord exit could not be verified before dispatch")
         await current(phase="after_source")
 
@@ -1019,6 +1027,10 @@ class Engine:
                 decision = await self.resolve_expiry(message, decision)
                 # Interpreter validates the complete schema and evidence; controls remain deterministic below.
                 if decision["action"] in {"IGNORE", "WAIT"}:
+                    if decision.get("monitor") is not None and not context_only:
+                        monitor = self.monitors.arm(message, decision)
+                        decision["position_monitor"] = {"id": monitor["id"], "state": monitor["state"]}
+                        return self.store.record(message, "monitoring", monitor["reason"], decision)
                     return self.store.record(message, decision["action"].lower(), decision["reason"], decision)
                 if context_only:
                     raise Hold("historical, baseline, or revised message; analysis only")
@@ -1090,18 +1102,18 @@ class Engine:
             order["execution_diagnostic"] = diagnostic
         return detail
 
-    async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
+    async def execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None, source_message=None):
         if decision["action"] == "UPDATE_STOP":
             return await self.stops.update(message, decision)
         try:
             with getattr(self.broker, "execution_reads", nullcontext)():
                 return await self._execute_decision(message, decision, recovery_guard=recovery_guard,
-                                                    expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot)
+                                                    expiry_guard=expiry_guard, prepared_snapshot=prepared_snapshot, source_message=source_message)
         finally:
             if decision["action"] in {"REDUCE", "CLOSE"} and self.mode != "shadow" and not asyncio.current_task().cancelling():
                 await self.stops.restore(message, decision)
 
-    async def _execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
+    async def _execute_decision(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None, source_message=None):
         def reason(label):
             if expiry_guard is not None:
                 facts = decision["expiry_exit"]
@@ -1127,7 +1139,7 @@ class Engine:
                 message["_evaluation_claim"]["position_generation"] = self.store.position_generation(message["source_group"])
         # Live placement repeats local checks and performs one authoritative source
         # verification after broker review, immediately before submitting.
-        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard, expiry_guard=expiry_guard, verify_source=self.mode != "live")
+        await self.verify_dispatch(message, decision, order, recovery_guard=recovery_guard, expiry_guard=expiry_guard, verify_source=self.mode != "live", source_message=source_message)
         if self.mode == "shadow":
             return self.store.record(message, "shadow_order", reason("account-sized proposal; no order submitted"),
                                      decision | {"order_proposal": order})
@@ -1138,7 +1150,7 @@ class Engine:
             # The reservation is our own serialized mutation, not competing inventory.
             message["_evaluation_claim"]["position_generation"] = self.store.position_generation(message["source_group"])
         async def before_submit(snapshot, quote):
-            await self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard, expiry_guard=expiry_guard)
+            await self.verify_dispatch(message, decision, order, snapshot, quote, recovery_guard=recovery_guard, expiry_guard=expiry_guard, source_message=source_message)
             timing = decision.setdefault("evaluation_timing", {})
             timing["submission_started_at"] = datetime.now(UTC).isoformat()
             received = message.get("_received_monotonic")
@@ -1187,7 +1199,7 @@ class Engine:
             if protection is not None:
                 decision["stop_evaluation"] = protection
         if recovery_guard is not None:
-            label = "missed exit catch-up; " + label
+            label = ("position monitor reassessment; " if source_message is not None else "missed exit catch-up; ") + label
         detail = reason(label + result["status"])
         if protection is not None:
             detail += "; " + protection["reason"]

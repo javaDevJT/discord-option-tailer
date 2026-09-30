@@ -29,7 +29,7 @@ MESSAGE_STATES = frozenset({
     "observed", "evaluating", "evaluated", "context", "ignore", "wait", "open", "reduce", "close", "update_stop",
     "shadow_order", "paper_order", "broker_order", "held", "unknown", "error", "duplicate",
     "invalid", "untrusted", "recovery_pending", "recovery_evaluating", "recovery_review",
-    "recovery_error",
+    "recovery_error", "monitoring",
 })
 RECOVERY_STATUSES = frozenset({"viable", "invalidated", "uncertain", "not_actionable"})
 ORDER_STATUSES = frozenset({
@@ -41,7 +41,7 @@ DECISION_FIELDS = (
     "action", "origin_message_id", "contract", "quantity", "fraction", "alert_price", "stop_price",
     "confidence", "ambiguous", "reason", "evidence", "order_proposal", "recovery", "entry_evaluation",
     "evaluation_timing", "entry_preparation", "expiry_resolution", "broker_submission", "profit_only", "exit_evaluation",
-    "stop_evaluation", "order_reconciliation",
+    "stop_evaluation", "order_reconciliation", "monitor",
     "execution_diagnostic", "reconciliation_diagnostic", "dispatch_checks",
 )
 BROKER_SUBMISSION_STAGES = frozenset({"snapshot", "review", "dispatch", "response", "validated"})
@@ -462,7 +462,7 @@ def _project_evaluation_timing(value):
         if timestamp is not None:
             result[key] = timestamp
     path = _safe_text(timing.get("path"), 32)
-    if path in {"direct", "recovery", "historical"}:
+    if path in {"direct", "recovery", "historical", "monitor"}:
         result["path"] = path
     for key in ("evaluator", "provider"):
         provider = _safe_text(timing.get(key), 32).lower()
@@ -618,6 +618,71 @@ def _project_entry_preparation(value):
     return result or None
 
 
+MONITOR_STATES = frozenset({"active", "evaluating", "completed", "expired", "canceled", "error"})
+
+def _project_monitor_plan(value):
+    plan = _json_object(value)
+    keys = ("duration_seconds", "poll_interval_seconds", "reassess_after_seconds", "conditions")
+    candidate = {key: plan[key] for key in keys if key in plan}
+    conditions = candidate.get("conditions")
+    if isinstance(conditions, list):
+        candidate["conditions"] = [
+            {key: condition[key] for key in ("metric", "comparison", "threshold") if key in condition}
+            if isinstance(condition, dict) else condition
+            for condition in conditions
+        ]
+    try:
+        from .monitor_contract import validate_monitor_plan
+        return validate_monitor_plan(candidate)
+    except (ImportError, KeyError, TypeError, ValueError, InvalidOperation):
+        return None
+
+def _project_monitor_observation(value):
+    observation = _json_object(value)
+    if not observation:
+        return None
+    try:
+        from .monitor_contract import project_monitor_facts
+        projected = project_monitor_facts(observation)
+    except (ImportError, KeyError, TypeError, ValueError, InvalidOperation):
+        return None
+    return projected if isinstance(projected, dict) and projected else None
+
+def _project_monitor(value):
+    body = _json_object(value["body"])
+    raw_state = _safe_text(value["state"], 32).lower()
+    resolved = body.get("conditions_resolved")
+    if isinstance(resolved, list):
+        resolved = sorted({index for index in resolved
+                           if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < 8})
+    elif not isinstance(resolved, bool):
+        resolved = []
+    return {
+        "id": _safe_identifier(value["id"]),
+        "source_group": _safe_identifier(value["source_group"]),
+        "contract": _project_contract(value["contract"]),
+        "entry_order_id": _safe_identifier(value["entry_order_id"], 256),
+        "state": raw_state if raw_state in MONITOR_STATES else "error",
+        "created_at": _safe_timestamp(value["created_at"]),
+        "expires_at": _safe_timestamp(value["expires_at"]),
+        "next_poll_at": _safe_timestamp(value["next_poll_at"]),
+        "source_message_id": _safe_identifier(body.get("source_message_id")),
+        "source_revision": _safe_identifier(body.get("source_revision"), 128),
+        "source_market_date": _safe_date(body.get("source_market_date")),
+        "plan": _project_monitor_plan(body.get("plan")),
+        "generation": body.get("generation") if isinstance(body.get("generation"), int) and not isinstance(body.get("generation"), bool) and body.get("generation") >= 0 else None,
+        "conditions_resolved": resolved,
+        "review_at": _safe_timestamp(body.get("review_at")),
+        "reason": _safe_text(body.get("reason"), 1000),
+        "observation": _project_monitor_observation(body.get("observation")),
+        "triggered_at": _safe_timestamp(body.get("triggered_at")),
+        "event_id": _safe_identifier(body.get("event_id")),
+        "evaluated_at": _safe_timestamp(body.get("evaluated_at")),
+        "decision": _project_decision(body.get("decision")),
+        "result": _safe_text(body.get("result"), 2000),
+        "diagnostic": project_execution_diagnostic(body.get("diagnostic")) or None,
+    }
+
 def _project_decision(value):
     decision = _json_object(value)
     if not decision:
@@ -639,6 +704,10 @@ def _project_decision(value):
             result[key] = _project_entry_evaluation(current)
         elif key == "entry_preparation":
             projected = _project_entry_preparation(current)
+            if projected is not None:
+                result[key] = projected
+        elif key == "monitor":
+            projected = _project_monitor_plan(current)
             if projected is not None:
                 result[key] = projected
         elif key == "broker_submission":
@@ -1390,6 +1459,24 @@ class DashboardApp:
         result, _ = self._ledger(config, read, {"items": [], "next_offset": None})
         return result
 
+    def monitors(self):
+        config = self.snapshot()
+
+        def read(connection, tables):
+            if "position_monitors" not in tables:
+                return {"monitors": [], "active_count": 0}
+            rows = connection.execute(
+                "SELECT * FROM position_monitors ORDER BY created_at DESC, id DESC LIMIT 200"
+            ).fetchall()
+            count = connection.execute(
+                "SELECT COUNT(*) FROM position_monitors WHERE state IN ('active','evaluating','error')"
+            ).fetchone()[0]
+            return {"monitors": [_project_monitor(row) for row in rows],
+                    "active_count": int(count) if isinstance(count, int) and count >= 0 else 0}
+
+        payload, _available = self._ledger(config, read, {"monitors": [], "active_count": 0})
+        return payload
+
     def positions(self):
         config = self.snapshot()
 
@@ -1694,6 +1781,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if parsed.query:
                     raise QueryError("evaluation metrics does not accept query parameters")
                 self._json(200, self.app.evaluation_metrics(), api=True, head=head)
+                return
+            if path == "/api/monitors":
+                if parsed.query:
+                    raise QueryError("monitors does not accept query parameters")
+                self._json(200, self.app.monitors(), api=True, head=head)
                 return
             if path == "/api/messages":
                 self._json(200, self.app.messages(parsed.query), api=True, head=head)
