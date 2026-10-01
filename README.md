@@ -6,6 +6,8 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 
 ## Project index
 
+- [Active watch polling](docs/container.md#active-watch-polling): ten-minute market refresh windows, broker request budgets, and fresh deterministic-entry snapshot reuse.
+
 - [Codex position monitoring](docs/container.md#codex-position-monitoring): bounded broker polling, saved triggers, restart recovery, and Codex reassessment without another Discord post.
 
 - [Execution failure diagnostics](docs/container.md#execution-failure-diagnostics): inspect named dispatch checks, chained causes, correlation IDs, and persistent credential-safe logs.

@@ -6,8 +6,9 @@ from decimal import Decimal
 from pathlib import Path
 import json
 import sqlite3
+import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 from tests import test_core as fixtures
 from relay.core import Engine, Hold, Store
@@ -67,6 +68,112 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         resolved = await self.engine.resolve_expiry(entry, decision)
         self.assertEqual(resolved["contract"], fixtures.CONTRACT)
         self.assertEqual(self.broker.nearest_expiry.await_count, 1)
+
+    async def test_hot_poll_window_uses_notice_time_and_does_not_extend_on_duplicate(self):
+        watch = await self.warm()
+        first = self.engine.watches.entries[watch["id"]]["hot_until"]
+        self.now += timedelta(seconds=120)
+        # A delayed repeat of the same event cannot restart its ten-minute budget.
+        self.engine.fresh = lambda *_: None
+        self.engine.watches.note(watch)
+        await asyncio.gather(*list(self.engine.watches.tasks))
+        entry = self.engine.watches.entries[watch["id"]]
+        self.assertAlmostEqual(first - entry["hot_until"], 120, delta=1)
+        entry["hot_until"] = time.monotonic() - 1
+        self.broker.refresh_watch_market = AsyncMock()
+        self.assertIsNone(self.engine.watches._next_market_entry())
+        await self.engine.watches._refresh_market(entry)
+        self.broker.refresh_watch_market.assert_not_awaited()
+
+    async def test_market_poll_rotation_deduplicates_contracts_and_records_failure(self):
+        first = await self.warm("On watch BAC $63C 9/18")
+        second = await self.warm("On watch QQQ $740P 9/18")
+        duplicate = await self.warm("On watch BAC $63C 9/18")
+        entries = self.engine.watches.entries
+        entries[first["id"]]["market_polled_at"] = 10
+        entries[duplicate["id"]]["market_polled_at"] = 0
+        entries[second["id"]]["market_polled_at"] = 5
+        selected = self.engine.watches._next_market_entry()
+        self.assertIs(selected, entries[second["id"]])
+        self.broker.refresh_watch_market = AsyncMock(side_effect=RuntimeError("offline"))
+        await self.engine.watches._refresh_market(selected)
+        self.assertEqual(selected["market_diagnostic"]["state"], "failed")
+        self.assertGreater(selected["market_polled_at"], 10)
+        self.assertIs(self.engine.watches._next_market_entry(), entries[duplicate["id"]])
+        self.assertEqual(self.broker.submissions, [])
+
+    async def test_slow_refresh_yields_to_another_contract_before_watch_window_ends(self):
+        first = await self.warm("On watch BAC $63C 9/18")
+        second = await self.warm("On watch QQQ $740P 9/18")
+        entry = self.engine.watches.entries[first["id"]]
+
+        async def pending_read(_contract):
+            await asyncio.Event().wait()
+
+        self.broker.refresh_watch_market = pending_read
+        with patch("relay.watch.WATCH_REFRESH_TIMEOUT_SECONDS", .02):
+            await self.engine.watches._refresh_market(entry)
+        self.assertEqual(entry["market_diagnostic"]["state"], "failed")
+        self.assertGreater(entry["hot_until"], time.monotonic())
+        self.assertIs(self.engine.watches._next_market_entry(), self.engine.watches.entries[second["id"]])
+
+    async def test_market_poll_cancels_pending_read_at_window_end(self):
+        watch = await self.warm()
+        entry = self.engine.watches.entries[watch["id"]]
+        entry["hot_until"] = time.monotonic() + .02
+        cancelled = asyncio.Event()
+
+        async def pending_read(_contract):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.broker.refresh_watch_market = pending_read
+        await self.engine.watches._refresh_market(entry)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(entry["market_diagnostic"]["state"], "failed")
+        self.assertIsNone(self.engine.watches._next_market_entry())
+
+    async def test_watch_snapshot_only_bypasses_rpc_for_current_rules_entry(self):
+        watch = await self.warm()
+        message = self.message()
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(message)
+        decision = copy.deepcopy(self.interpreter.decision)
+        decision["evaluation_timing"] = {"evaluator": "rules"}
+        self.broker.snapshot = AsyncMock(return_value=self.broker.account)
+        self.broker.watch_entry_snapshot = Mock(return_value=copy.deepcopy(self.broker.account))
+        result = await self.engine.entry_snapshot(message, decision)
+        self.assertEqual(result, self.broker.account)
+        self.broker.snapshot.assert_not_awaited()
+        self.broker.watch_entry_snapshot.assert_called_once()
+        decision["evaluation_timing"]["evaluator"] = "codex"
+        await self.engine.entry_snapshot(message, decision)
+        self.broker.snapshot.assert_awaited_once()
+        decision["evaluation_timing"]["evaluator"] = "rules"
+        self.engine.observations[watch["id"]] = "changed"
+        await self.engine.entry_snapshot(message, decision)
+        self.assertEqual(self.broker.snapshot.await_count, 2)
+        self.broker.watch_entry_snapshot.assert_called_once()
+
+    async def test_missing_watch_snapshot_falls_back_and_explicit_expiry_plan_uses_cache(self):
+        await self.warm("On watch BAC $63C 9/18")
+        message = self.message()
+        message["source_group"] = self.config["channels"][0]["source_group"]
+        self.store.observe(message)
+        decision = copy.deepcopy(self.interpreter.decision)
+        decision["origin_message_id"] = message["id"]
+        decision["evaluation_timing"] = {"evaluator": "rules"}
+        self.broker.snapshot = AsyncMock(return_value=self.broker.account)
+        self.broker.watch_entry_snapshot = Mock(return_value=None)
+        await self.engine.entry_snapshot(message, decision)
+        self.broker.snapshot.assert_awaited_once()
+        self.broker.snapshot.reset_mock()
+        self.broker.watch_entry_snapshot.return_value = copy.deepcopy(self.broker.account)
+        order = await self.engine.plan(message, decision)
+        self.assertTrue(order["prepared_entry"])
+        self.broker.snapshot.assert_not_awaited()
 
     async def test_observed_compact_and_spaced_watch_embeds_prepare_same_put(self):
         contract = dict(symbol="QQQ", strike="740", option_type="put", expiry=fixtures.CONTRACT["expiry"])

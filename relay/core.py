@@ -1022,7 +1022,7 @@ class Engine:
                         and (decision.get("contract") or {}).get("expiry") == "nearest"):
                     # Fresh account reads do not depend on expiry discovery.
                     async def read_snapshot():
-                        return await self.measure(decision, "snapshot_seconds", self.broker.snapshot())
+                        return await self.entry_snapshot(message, decision)
                     prepared_snapshot = asyncio.create_task(read_snapshot())
                 decision = await self.resolve_expiry(message, decision)
                 # Interpreter validates the complete schema and evidence; controls remain deterministic below.
@@ -1212,6 +1212,24 @@ class Engine:
         if entry is not None and instant(entry["created_at"]) > instant(self.origin(message, decision)["timestamp"]):
             raise Hold("signal predates the current relay-owned entry; it cannot change a reopened position")
 
+    async def entry_snapshot(self, message, decision):
+        async def read():
+            cached = getattr(self.broker, "watch_entry_snapshot", None)
+            if (decision.get("action") == "OPEN"
+                    and decision.get("evaluation_timing", {}).get("evaluator") == "rules"
+                    and callable(cached)):
+                contract = self.watches.match(message, decision)
+                diagnostic = decision.setdefault("watch_market_data", {})
+                if contract is not None:
+                    snapshot = cached(contract, diagnostic=diagnostic)
+                    if snapshot is not None:
+                        return snapshot
+                else:
+                    diagnostic.update(source="fresh", reason="no_current_matching_watch")
+            return await self.broker.snapshot()
+
+        return await self.measure(decision, "snapshot_seconds", read())
+
     async def plan(self, message, decision, *, recovery_guard=None, expiry_guard=None, prepared_snapshot=None):
         risk = self.config["risk"]
         self.check_execution_mode()
@@ -1340,8 +1358,8 @@ class Engine:
                     raise Hold(entry_chase_reason("current ask or rounded limit exceeds permitted chase from alert premium", evaluation))
             return quote, price
 
-        # Reject an invalid quote immediately; accepted entries still need both fresh reads.
-        reads = [prepared_snapshot if prepared_snapshot is not None else asyncio.create_task(self.measure(decision, "snapshot_seconds", self.broker.snapshot())),
+        # Reject an invalid quote immediately; a rules entry may reuse a bounded watch snapshot.
+        reads = [prepared_snapshot if prepared_snapshot is not None else asyncio.create_task(self.entry_snapshot(message, decision)),
                  asyncio.create_task(checked_quote())]
         try:
             snapshot, (quote, price) = await asyncio.gather(*reads)

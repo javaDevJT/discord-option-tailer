@@ -4,15 +4,19 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
-from contextlib import AsyncExitStack, contextmanager
+from collections import deque
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 import functools
 import json
 import logging
+import math
 import hmac
 import hashlib
 import os
+import random
 import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,6 +26,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 import uuid
+import weakref
 
 from .status import annotate_failure, failure_detail, failure_stage, publish_status
 from .schema_contracts import cursor_mode, schema_problem
@@ -38,6 +43,15 @@ _BROKER_READ_CONCURRENCY = 4
 _EXECUTION_READ_REUSE_SECONDS = 1.0
 _PREPARED_ENTRY_TTL_SECONDS = 60.0
 _PREPARED_ENTRY_CACHE_LIMIT = 64
+_WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS = 10.0
+_WATCH_ACCOUNT_REFRESH_SECONDS = 6.0
+_READ_BUDGET_WINDOW_SECONDS = 60.0
+_READ_BUDGET_TOTAL = 90
+_READ_BUDGET_BACKGROUND = 60
+_BACKGROUND_BURST = 4
+_BACKGROUND_RATE_PER_SECOND = 1.0
+_BACKGROUND_READS = contextvars.ContextVar("broker_background_reads", default=False)
+_BROKER_READ_BUDGETS = weakref.WeakKeyDictionary()
 
 
 class BrokerError(RuntimeError):
@@ -65,13 +79,19 @@ class _ExecutionReadScope:
         self.active = True
         self.handoffs = {}
         self.snapshot = None
+        self.snapshot_deadline = None
+        self.snapshot_generation = None
         self.quotes = {}
+        self.quote_deadlines = {}
 
     def deactivate(self):
         self.active = False
         self.handoffs.clear()
         self.snapshot = None
+        self.snapshot_deadline = None
+        self.snapshot_generation = None
         self.quotes.clear()
+        self.quote_deadlines.clear()
 
 
 def _failure_stage_operation(stage):
@@ -140,6 +160,155 @@ _AUTHENTICATION_CODES = frozenset({
     "invalid_client", "unauthorized", "unauthenticated", "authentication_required",
     "authorization_required", "insufficient_scope",
 })
+
+
+class _BrokerReadBudget:
+    """Per-account rolling request limits with a small background burst."""
+
+    def __init__(self, *, clock=time.monotonic, sleep=asyncio.sleep, wall_clock=time.time, random_value=random.random):
+        self.clock = clock
+        self.sleep = sleep
+        self.wall_clock = wall_clock
+        self.random_value = random_value
+        self.requests = deque()
+        self.background_requests = deque()
+        self.background_tokens = float(_BACKGROUND_BURST)
+        self.background_refill_at = clock()
+        self.foreground_waiters = 0
+        self.cooldown_until = 0.0
+        self.throttle_strikes = 0
+        self.wait_seconds = 0.0
+        self.lock = asyncio.Lock()
+
+    def _prune(self, now):
+        cutoff = now - _READ_BUDGET_WINDOW_SECONDS
+        while self.requests and self.requests[0] <= cutoff:
+            self.requests.popleft()
+        while self.background_requests and self.background_requests[0] <= cutoff:
+            self.background_requests.popleft()
+        elapsed = max(0.0, now - self.background_refill_at)
+        self.background_tokens = min(
+            float(_BACKGROUND_BURST),
+            self.background_tokens + elapsed * _BACKGROUND_RATE_PER_SECOND,
+        )
+        self.background_refill_at = now
+
+    async def acquire(self, *, background=False, wait=True):
+        started_at = self.clock()
+        if not background:
+            async with self.lock:
+                self.foreground_waiters += 1
+        try:
+            while True:
+                async with self.lock:
+                    now = self.clock()
+                    self._prune(now)
+                    delay = max(0.0, self.cooldown_until - now)
+                    if len(self.requests) >= _READ_BUDGET_TOTAL:
+                        delay = max(delay, self.requests[0] + _READ_BUDGET_WINDOW_SECONDS - now)
+                    if background:
+                        if len(self.background_requests) >= _READ_BUDGET_BACKGROUND:
+                            delay = max(
+                                delay,
+                                self.background_requests[0] + _READ_BUDGET_WINDOW_SECONDS - now,
+                            )
+                        if self.background_tokens < 1.0:
+                            delay = max(delay, (1.0 - self.background_tokens) / _BACKGROUND_RATE_PER_SECOND)
+                    if background and self.foreground_waiters:
+                        delay = max(delay, 0.05)
+                    if delay <= 0:
+                        self.requests.append(now)
+                        if background:
+                            self.background_requests.append(now)
+                            self.background_tokens -= 1.0
+                        self.wait_seconds += max(0.0, now - started_at)
+                        return now
+                    if not wait:
+                        error = _BrokerBudgetHold("Broker request budget is full; no request was sent")
+                        _annotate_failure_safely(error, stage="request_budget", code="rate_limited")
+                        raise error
+                await self.sleep(max(0.01, delay))
+        finally:
+            if not background:
+                async with self.lock:
+                    self.foreground_waiters -= 1
+
+    async def rate_limited(self, error):
+        delay = _retry_after_delay(error, wall_clock=self.wall_clock)
+        async with self.lock:
+            self.throttle_strikes += 1
+            if delay is None:
+                ceiling = min(30.0, 0.5 * (2 ** min(self.throttle_strikes - 1, 6)))
+                delay = ceiling * (0.5 + self.random_value() * 0.5)
+            else:
+                delay += self.random_value() * min(1.0, max(0.1, delay * 0.1))
+            self.cooldown_until = max(self.cooldown_until, self.clock() + delay)
+
+    async def succeeded(self):
+        async with self.lock:
+            self.throttle_strikes = 0
+
+    async def stats(self):
+        async with self.lock:
+            now = self.clock()
+            self._prune(now)
+            return {
+                "wait_seconds": round(self.wait_seconds, 3),
+                "cooldown_remaining_seconds": round(max(0.0, self.cooldown_until - now), 3),
+                "total_calls": len(self.requests),
+                "background_calls": len(self.background_requests),
+            }
+
+
+def _retry_after_delay(value, *, wall_clock=time.time):
+    """Read Retry-After without publishing provider text or changing mutations."""
+    candidates = [value]
+    response = getattr(value, "response", None)
+    if response is not None:
+        candidates.append(response)
+    for candidate in candidates:
+        headers = getattr(candidate, "headers", None)
+        if not isinstance(headers, dict) and not hasattr(headers, "get"):
+            continue
+        try:
+            raw = headers.get("Retry-After", headers.get("retry-after"))
+        except (AttributeError, TypeError):
+            raw = None
+        if not isinstance(raw, str):
+            continue
+        try:
+            delay = float(raw)
+        except ValueError:
+            try:
+                target = parsedate_to_datetime(raw)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                delay = (target - datetime.fromtimestamp(wall_clock(), timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if math.isfinite(delay) and delay >= 0:
+            return delay
+    return None
+
+
+class _BrokerBudgetHold(BrokerPreflightHold):
+    """Admission failed before transport; never queue a stale mutation."""
+
+
+def _rate_limited(value):
+    if _status_code(value) == 429 or _status_code(getattr(value, "response", None)) == 429:
+        return True
+    structured = getattr(value, "structuredContent", None)
+    if isinstance(structured, dict):
+        for detail in (structured, structured.get("error")):
+            if isinstance(detail, dict) and (_status_code(detail) == 429 or detail.get("code") in {
+                    "too_many_requests", "rate_limited", "rate_limit_exceeded"}):
+                return True
+    for item in getattr(value, "content", ()) or ():
+        text = getattr(item, "text", "")
+        if isinstance(text, str) and re.search(r"\b429\b|\btoo[ _]many[ _]requests\b|\brate.limit(?:ed|_exceeded)\b", text, re.I):
+            return True
+    return False
 
 
 def _status_code(value):
@@ -838,13 +1007,42 @@ class RobinhoodMCP:
             raise error
         return result.model_dump(mode="json", exclude_none=True)
 
+    @asynccontextmanager
+    async def background_reads(self):
+        token = _BACKGROUND_READS.set(True)
+        try:
+            yield
+        finally:
+            _BACKGROUND_READS.reset(token)
+
+    def _request_budget(self):
+        loop = asyncio.get_running_loop()
+        budgets = _BROKER_READ_BUDGETS.get(loop)
+        if budgets is None:
+            budgets = {}
+            _BROKER_READ_BUDGETS[loop] = budgets
+        account = self.config.get("account_number")
+        key = account if isinstance(account, str) and account else f"client:{id(self)}"
+        return budgets.setdefault(key, _BrokerReadBudget())
+
     async def _call_tool(self, name, args):
+        budget = self._request_budget()
+        read = name.startswith(("get_", "review_"))
+        await budget.acquire(background=_BACKGROUND_READS.get() if read else False, wait=read)
+        if not read and callable(getattr(self, "_invalidate_watch_market", None)):
+            self._invalidate_watch_market()
         try:
             result = await self.session.call_tool(name, arguments=args)
         except Exception as exc:
+            if _rate_limited(exc):
+                await budget.rate_limited(exc)
             _annotate_failure_safely(exc, tool=name)
             self._connection_failed(exc)
             raise
+        if _rate_limited(result):
+            await budget.rate_limited(result)
+        elif not result.isError:
+            await budget.succeeded()
         if result.isError:
             state = "auth_required" if is_auth_required(result) else "unavailable"
         else:
@@ -1074,15 +1272,21 @@ class RobinhoodBroker(RobinhoodMCP):
     def _remember_execution_snapshot(self, snapshot):
         scope = self._active_execution_scope()
         if scope is not None:
-            scope.snapshot = (time.monotonic(), copy.deepcopy(snapshot))
+            started_at = time.monotonic()
+            scope.snapshot = (started_at, copy.deepcopy(snapshot))
+            scope.snapshot_deadline = started_at + _EXECUTION_READ_REUSE_SECONDS
+            scope.snapshot_generation = None
 
     def _execution_snapshot(self):
         scope = self._active_execution_scope()
         if scope is None or scope.snapshot is None:
             return None
         completed_at, snapshot = scope.snapshot
-        if self.account_changed.is_set() or time.monotonic() - completed_at > _EXECUTION_READ_REUSE_SECONDS:
+        deadline = scope.snapshot_deadline or completed_at + _EXECUTION_READ_REUSE_SECONDS
+        if (self.account_changed.is_set() or time.monotonic() > deadline
+                or (scope.snapshot_generation is not None and scope.snapshot_generation != self._watch_generation)):
             scope.snapshot = None
+            scope.snapshot_deadline = None
             return None
         try:
             self._check_quote_age(snapshot["timestamp"], "Account snapshot")
@@ -1090,6 +1294,7 @@ class RobinhoodBroker(RobinhoodMCP):
                 self._check_quote_age(position["quote_timestamp"])
         except (BrokerError, KeyError, TypeError):
             scope.snapshot = None
+            scope.snapshot_deadline = None
             return None
         return copy.deepcopy(snapshot)
 
@@ -1101,7 +1306,9 @@ class RobinhoodBroker(RobinhoodMCP):
             self._fresh_quote(quote)
         except (BrokerError, KeyError, TypeError):
             return
-        scope.quotes[target] = (time.monotonic(), copy.deepcopy(quote))
+        started_at = time.monotonic()
+        scope.quotes[target] = (started_at, copy.deepcopy(quote))
+        scope.quote_deadlines[target] = started_at + _EXECUTION_READ_REUSE_SECONDS
 
     def _execution_quote(self, target):
         scope = self._active_execution_scope()
@@ -1111,6 +1318,7 @@ class RobinhoodBroker(RobinhoodMCP):
         if entry is None:
             return None
         completed_at, quote = entry
+        deadline = scope.quote_deadlines.get(target, completed_at + _EXECUTION_READ_REUSE_SECONDS)
         if (self.account_changed.is_set()
                 or target not in self.contracts
                 or time.monotonic() - completed_at > _EXECUTION_READ_REUSE_SECONDS):
@@ -1189,6 +1397,10 @@ class RobinhoodBroker(RobinhoodMCP):
         self.order_inputs = {}
         self.order_results = {}
         self._prepared_entries = {}
+        self._watch_snapshot = None
+        self._watch_quotes = {}
+        self._watch_generation = 0
+        self._watch_refresh_lock = asyncio.Lock()
         self.attempted = set()
         self.account_changed = asyncio.Event()
         self._portfolio_task = None
@@ -1948,6 +2160,96 @@ class RobinhoodBroker(RobinhoodMCP):
         self.contracts[target] = {"option_id": instrument["id"], "chain_id": chain["id"]}
         return metadata
 
+    def _invalidate_watch_market(self):
+        self._watch_generation += 1
+        self._watch_snapshot = None
+        self._watch_quotes.clear()
+
+    async def refresh_watch_market(self, contract):
+        """Read-only, shared account refresh plus the selected watch's quote."""
+        async with self._watch_refresh_lock, self.background_reads():
+            metadata = self.prepared_entry(contract, Decimal("1"))
+            if metadata is None:
+                raise BrokerError("Watch metadata expired; awaiting contract preparation")
+            started = time.monotonic()
+            generation = self._watch_generation
+            cached = self._watch_snapshot
+            refresh_account = (cached is None or cached[1] != generation or self.account_changed.is_set()
+                               or started - cached[0] >= _WATCH_ACCOUNT_REFRESH_SECONDS)
+            # Background polling must not inherit an entry's execution-read cache.
+            token = self._execution_scope_var.set(None)
+            tasks = []
+            try:
+                tasks.append(asyncio.create_task(self._raw_quote(metadata["option_id"])))
+                if refresh_account:
+                    tasks.append(asyncio.create_task(self.snapshot()))
+                results = await asyncio.gather(*tasks)
+                quote = results[0]
+                self._check_quote_age(quote["updated_at"])
+                bid, ask = _decimal(quote["bid_price"], "watch bid"), _decimal(quote["ask_price"], "watch ask")
+                if bid < 0 or ask <= 0 or ask < bid:
+                    raise BrokerError("Watch quote prices are invalid")
+                if self._watch_generation != generation:
+                    raise BrokerError("Account changed during watch refresh; discarded old data")
+                if refresh_account:
+                    self._watch_snapshot = (started, generation, copy.deepcopy(results[1]))
+                self._watch_quotes[_contract_key(contract)] = (started, generation, copy.deepcopy(quote))
+                while len(self._watch_quotes) > _PREPARED_ENTRY_CACHE_LIMIT:
+                    self._watch_quotes.pop(next(iter(self._watch_quotes)))
+                return {
+                    "account_snapshot": "refreshed" if refresh_account else "cached",
+                    "account_age_seconds": round(time.monotonic() - self._watch_snapshot[0], 3),
+                    "quote_timestamp": quote["updated_at"], "bid": str(bid), "ask": str(ask),
+                    "request_budget": await self._request_budget().stats(),
+                }
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._execution_scope_var.reset(token)
+
+    def watch_entry_snapshot(self, contract, *, diagnostic=None):
+        def miss(reason):
+            if diagnostic is not None:
+                diagnostic.update(source="fresh", reason=reason)
+            return None
+
+        cached = self._watch_snapshot
+        quoted = self._watch_quotes.get(_contract_key(contract))
+        if cached is None or quoted is None:
+            return miss("watch_market_not_ready")
+        started, generation, snapshot = cached
+        quote_started, quote_generation, quote = quoted
+        now = time.monotonic()
+        if self.account_changed.is_set() or generation != self._watch_generation or quote_generation != generation:
+            return miss("watch_account_changed")
+        if not 0 <= now - started <= _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS:
+            return miss("watch_snapshot_expired")
+        if not 0 <= now - quote_started <= _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS:
+            return miss("watch_quote_expired")
+        try:
+            self._check_quote_age(snapshot["timestamp"], "Watch account snapshot")
+            self._check_quote_age(quote["updated_at"])
+            for position in snapshot.get("positions", []):
+                self._check_quote_age(position["quote_timestamp"])
+        except (BrokerError, KeyError, TypeError):
+            return miss("watch_data_stale")
+        result = copy.deepcopy(snapshot)
+        background_timing = result.pop("read_timing", None)
+        if diagnostic is not None:
+            diagnostic.update(source="watch_cache", reason="fresh_watch_snapshot",
+                              account_age_seconds=round(now - started, 6),
+                              quote_age_seconds=round(now - quote_started, 6),
+                              quote_timestamp=quote["updated_at"],
+                              background_read_timing=background_timing)
+        scope = self._active_execution_scope()
+        if scope is not None:
+            scope.snapshot = (started, copy.deepcopy(result))
+            scope.snapshot_deadline = started + _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS
+            scope.snapshot_generation = generation
+        return result
+
     async def prewarm_entry(self, contract):
         """Cache bounded contract metadata for a short-lived prepared entry."""
         metadata = await self._resolve_prepared_entry(contract)
@@ -2356,6 +2658,11 @@ class RobinhoodBroker(RobinhoodMCP):
         trace.update(transport_attempted=True, submitted_at=self.clock().isoformat())
         try:
             result = await timed("placement", self._data("place_option_order", dict(args, ref_id=ref_id)))
+        except _BrokerBudgetHold:
+            self.attempted.discard(client_id)
+            trace["transport_attempted"] = False
+            trace.pop("submitted_at", None)
+            raise
         finally:
             self.account_changed.set()
             self._invalidate_execution_scope()

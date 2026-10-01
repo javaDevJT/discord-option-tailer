@@ -230,6 +230,18 @@ When reporting a failure, include the diagnostic ID, message ID, decision JSON, 
 
 Diagnostics exclude exception messages, provider responses, credentials, absolute paths, source text, and local variables. Only bounded, allowlisted metadata and internal `relay/file.py:line:function` locations are exposed.
 
+### Active watch polling
+
+A fresh, authorized on-watch notice starts a ten-minute polling window anchored to the Discord post time. Delayed or duplicate delivery does not restart that window. The relay rotates through distinct prepared contracts, starting one market refresh about every three seconds after the preceding refresh finishes. Each refresh has a ten-second timeout so one slow contract cannot monopolize the rotation. The account snapshot is shared across these watches and refreshed when due, rather than fetched once per contract. More watches, broker latency, or a request-budget wait can reduce the per-contract frequency.
+
+Background metadata and market reads share a broker request budget with execution. The local ceilings are 90 calls per rolling minute in total and 60 background calls per rolling minute, leaving capacity for execution and other foreground reads under the supplied 100/minute upstream limit. The relay does not treat the advertised burst allowance as a sustained polling rate. Broker 429 responses trigger a shared cooldown with jitter; mutation requests are never blindly retried. Other applications using the same account can still consume upstream capacity.
+
+Robinhood's published 100/minute and 300-burst figures are documented for its Crypto Trading API. An identical Agentic MCP quota has not been independently confirmed; the local limits are conservative operating ceilings, not a claim about that endpoint's entitlement. Server throttling always takes precedence.
+
+Only a deterministic OPEN with a current matching watch may use the warmed account snapshot. The handoff expires after ten seconds measured from the read start, validates quote timestamps, and is invalidated by account/order changes. Missing, expired, or invalid data causes a normal fresh read. Source verification, order review, chase, quantity, and risk checks remain in force. This polling does not authorize an entry, alter the hourly dashboard balance refresh, or guarantee a fill.
+
+The entry's `entry_preparation.market_refresh` and `watch_market_data` diagnostics record refresh outcomes and cache use/fallback. Contract metadata keeps its existing slower refresh after the hot window ends. App restart does not replay old watch notices into a new hot window.
+
 ### Entry price diagnostics
 
 Entry diagnostics show the evaluated ask, cited alert premium, signed percentage deviation, configured chase cap, and rounded order limit. Chase uses `(price / alert premium - 1) × 100`: at a 15% setting, a $1.00 alert permits up to $1.15, including the boundary. Both the ask and the limit after tick rounding must fit the cap, and the check runs again on the final broker-review quote. Exits are not subject to entry chase limits.
