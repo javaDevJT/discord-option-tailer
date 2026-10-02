@@ -41,9 +41,11 @@ class ExitRecoveryChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_trim_sells_one_of_two_once_and_preserves_record(self):
         recovery = await self.open_position()
-        message = await self.missed()
-        self.interpreter.decision.update(action="REDUCE", fraction=.5, profit_only=False)
-        self.store.record(message, "ignore", "Legacy interpreter ignored optional exits")
+        message = await self.missed(content="Trim BAC contracts here @ 2.60")
+        self.interpreter.decision.update(
+            action="REDUCE", quantity=None, fraction=None, profit_only=False
+        )
+        self.store.record(message, "held", "a trim needs an explicit quantity or fraction")
         recovery.recover_position_context()
         state = self.store.db.execute("SELECT state FROM events WHERE message_id=?", (message["id"],)).fetchone()[0]
         self.assertEqual(state, "recovery_pending")

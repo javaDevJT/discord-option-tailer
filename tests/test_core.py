@@ -330,6 +330,35 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
                 remaining = sum(p["quantity"] for p in self.store.positions())
                 self.assertEqual(remaining, owned - expected)
 
+    async def test_unquantified_explicit_trims_default_to_half_and_reject_bad_fractions(self):
+        cases = (
+            (1, None, None, 1),
+            (2, None, None, 1),
+            (3, None, None, 2),
+            (3, 1, None, 1),
+            (3, None, 0, None),
+            (3, None, 1.01, None),
+        )
+        for index, (owned, quantity, fraction, expected) in enumerate(cases):
+            with self.subTest(owned=owned, quantity=quantity, fraction=fraction):
+                self.owned(owned)
+                self.interpreter.decision.update(
+                    action="REDUCE", quantity=quantity, fraction=fraction, profit_only=False
+                )
+                before = len(self.broker.submissions)
+                result = await self.engine.handle(
+                    self.message(content=f"Trim $BAC contracts here @ 2.60 (case {index})")
+                )
+                if expected is None:
+                    self.assertEqual(result["state"], "held", result)
+                    self.assertEqual(len(self.broker.submissions), before)
+                    self.assertEqual(self.store.positions()[0]["quantity"], owned)
+                else:
+                    self.assertEqual(result["state"], "paper_order", result)
+                    self.assertEqual(self.broker.submissions[-1]["quantity"], expected)
+                    remaining = sum(p["quantity"] for p in self.store.positions())
+                    self.assertEqual(remaining, owned - expected)
+
     async def test_profit_update_cannot_sell_owned_contract_even_if_model_repeats_bad_decision(self):
         contract = {"symbol": "DRAM", "expiry": "2026-10-16", "strike": "65", "option_type": "call"}
         self.owned(1, contract=contract)

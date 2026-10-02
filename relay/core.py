@@ -1285,10 +1285,10 @@ class Engine:
                 qty = decision["quantity"]
             elif decision.get("fraction") is not None and 0 < money(decision["fraction"]) <= 1:
                 qty = int((Decimal(qty_owned) * money(decision["fraction"])).to_integral_value(rounding=ROUND_CEILING))
-            elif decision.get("profit_only") is True:
+            elif decision.get("quantity") is None and decision.get("fraction") is None:
                 qty = int((Decimal(qty_owned) / 2).to_integral_value(rounding=ROUND_CEILING))
             else:
-                raise Hold("a trim needs an explicit quantity or fraction")
+                raise Hold("trim quantity or fraction is invalid")
             if qty > qty_owned:
                 raise Hold("sell quantity exceeds the owned position")
         if action != "OPEN" and (type(qty) is not int or qty <= 0):

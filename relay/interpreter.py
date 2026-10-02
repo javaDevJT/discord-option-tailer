@@ -235,7 +235,11 @@ REDUCE when no explicit exit size or full-exit direction was given.
 An optional explicit all-profits or full-exit suggestion is CLOSE with
 profit_only=true. An unquantified optional partial suggestion is REDUCE with
 quantity=null and fraction=null; the deterministic engine chooses its guarded
-default. Explicit sell, trim, "all out", "sold the rest" or "close remaining"
+default. An explicit current partial trim without a stated quantity or fraction
+also uses REDUCE with quantity=null, fraction=null, and profit_only=false. The
+engine sells half of the owned contracts, rounding up; 1 sells 1, 2 sells 1,
+and 3 sells 2. Do not invent a size or wait merely because no size was stated.
+Explicit sell, trim, "all out", "sold the rest" or "close remaining"
 directions are profit_only=false, including current author action reports such
 as "took 50% here"; preserve their exact stated fraction or count. Do not turn
 an explicit full exit into a discretionary profit-only exit. General gains

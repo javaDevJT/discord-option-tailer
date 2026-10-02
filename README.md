@@ -54,6 +54,8 @@ Edited alerts, manual backscroll, imported history, future timestamps, channels 
 
 Fractional exits round up only the fractional remainder: **50% of 1 → sell 1; 50% of 2 → sell 1; 50% of 3 → sell 2**. Explicit full exits sell all remaining relay-owned contracts. Optional current language such as “you can trim/take profits if you'd like” is actionable only when the current tick-rounded sell price exceeds the recorded entry cost plus twice the configured per-contract fee reserve. An unspecified optional trim sells half remaining, rounded up. Explicit exits such as “took 50% here” or “all out” retain their stated size and do not require a profit. Future conditions and performance recaps are not immediate sale instructions.
 
+An explicit partial instruction such as “Trim contracts here” with no stated size defaults to **50%, rounded up**. This applies to live decisions and restart recovery; explicit counts, percentages, and full exits retain their stated sizing.
+
 The trading path supports single-leg, long, standard USD equity or ETF options: buy to open, reduce, and sell to close. It requires an exact symbol, absolute expiry, strike, and call or put. Futures, crypto, shorts, spreads, conditional scheduling, averaging in, and stop amendments are held. `UPDATE_STOP` does not install a protective stop. Missing entry expirations default to 0DTE or the nearest listed expiration at the exact strike/type; dates stated in text, embeds or supplied pictures take precedence. The original message's New York date anchors resolution, and old alerts cannot roll forward. Same-day entry permissions remain in effect.
 
 The default sizing references and eligibility checks are:
