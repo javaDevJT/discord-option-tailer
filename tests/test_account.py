@@ -1,5 +1,6 @@
 """Offline display-cache cadence, failure, and account-isolation checks."""
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
@@ -67,6 +68,28 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current["equity"], "1300.50")
         self.assertEqual(current["positions"][0]["quantity"], "2")
         self.assertEqual(current["positions"][0]["market_value"], "260.50")
+
+    async def test_account_reads_use_background_budget_and_restore_context(self):
+        active = False
+
+        @asynccontextmanager
+        async def background():
+            nonlocal active
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        async def overview():
+            self.assertTrue(active)
+            return self.overview
+
+        self.broker.background_reads = background
+        self.broker.account_overview.side_effect = overview
+        self.assertTrue(await self.cache.refresh())
+        self.broker.account_overview.assert_awaited_once()
+        self.assertFalse(active)
 
     async def test_periodic_refresh_runs_without_an_account_change_event(self):
         await self.cache.refresh()

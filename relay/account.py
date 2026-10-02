@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import logging
@@ -51,7 +52,8 @@ class AccountCache:
         # Persist the attempt too: restarts and failures cannot create a polling storm.
         self.save()
         try:
-            overview = await asyncio.wait_for(self.broker.account_overview(), timeout=60)
+            async with getattr(self.broker, "background_reads", nullcontext)():
+                overview = await asyncio.wait_for(self.broker.account_overview(), timeout=60)
         except Exception as exc:
             self.value["error"] = AUTH_ERROR if is_auth_required(exc) else REFRESH_ERROR
         else:
