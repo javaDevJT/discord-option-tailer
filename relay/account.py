@@ -8,7 +8,7 @@ import logging
 
 from .broker import is_auth_required
 
-REFRESH_SECONDS = 3600
+REFRESH_SECONDS = 600
 CACHE_KEY = "account_overview"
 REFRESH_ERROR = "Account refresh failed. Check the Robinhood connection in Setup."
 AUTH_ERROR = "Robinhood needs reauthentication. Reconnect in Setup."

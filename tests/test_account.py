@@ -42,10 +42,10 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.temp.cleanup()
 
-    async def test_hourly_cache_survives_restart_and_dashboard_reads(self):
+    async def test_ten_minute_cache_survives_restart_and_dashboard_reads(self):
         self.assertFalse(self.app.account()["available"])
         self.assertTrue(await self.cache.refresh())
-        self.now += timedelta(seconds=3599)
+        self.now += timedelta(seconds=599)
         self.cache = AccountCache(self.store, self.broker, clock=lambda: self.now)
         self.assertFalse(await self.cache.refresh())
         for _ in range(3):
@@ -56,8 +56,40 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         self.broker.account_overview.assert_awaited_once()
         self.now += timedelta(seconds=1)
         self.assertEqual(self.cache.seconds_until_due(), 0)
+        self.broker.account_overview.return_value = self.overview | {
+            "equity": "1300.50",
+            "positions": [self.overview["positions"][0] | {"quantity": "2", "market_value": "260.50"}],
+        }
         self.assertTrue(await self.cache.refresh())
         self.assertEqual(self.broker.account_overview.await_count, 2)
+        current = self.app.account()
+        self.assertEqual(current["refresh_interval_seconds"], 600)
+        self.assertEqual(current["equity"], "1300.50")
+        self.assertEqual(current["positions"][0]["quantity"], "2")
+        self.assertEqual(current["positions"][0]["market_value"], "260.50")
+
+    async def test_periodic_refresh_runs_without_an_account_change_event(self):
+        await self.cache.refresh()
+        cache = AccountCache(self.store, self.broker)
+        cache.value["last_attempt_at"] = (datetime.now(timezone.utc) - timedelta(seconds=599.75)).isoformat()
+        cache.save()
+        self.assertGreater(cache.seconds_until_due(), 0)
+        refreshed = asyncio.Event()
+
+        async def overview():
+            refreshed.set()
+            return self.overview
+
+        self.broker.account_overview.reset_mock()
+        self.broker.account_overview.side_effect = overview
+        task = asyncio.create_task(cache.run())
+        try:
+            await asyncio.wait_for(refreshed.wait(), 2)
+            self.broker.account_overview.assert_awaited_once()
+            self.assertFalse(self.broker.account_changed.is_set())
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_failure_preserves_values_throttles_retries_and_hides_provider_details(self):
         await self.cache.refresh()

@@ -145,7 +145,7 @@ Codex can attach a `monitor` plan to a `WAIT` decision for a specific, currently
 
 Plans and claimed evaluations are saved in SQLite and resumed after restart. Monitoring ends at the deadline, when the entry is no longer owned, or when a newer plan supersedes it. Codex can explicitly continue monitoring within the existing deadline, finish without action, or reduce/close the owned position through the normal execution and source-verification checks. Monitor callbacks cannot open positions. Polling and model evaluation run outside the entry execution lock and yield to fresh messages.
 
-The dashboard's position-monitor list shows the plan, deadline, observations, triggers, decisions, and diagnostic failures. These targeted reads are separate from the ordinary hourly account overview. Polling and Codex reassessment require the app and provider credentials to remain available; this is not a broker-native protective order.
+The dashboard's position-monitor list shows the plan, deadline, observations, triggers, decisions, and diagnostic failures. These targeted reads are separate from the ordinary ten-minute account overview. Polling and Codex reassessment require the app and provider credentials to remain available; this is not a broker-native protective order.
 
 Relative dates remain tied to the original Discord message. The current Robinhood tool schema has no underlying daily-low/high or historical-bars fields. A request such as "under today's low" therefore needs a grounded numeric level from source context; unavailable references are reported explicitly, never replaced by the option low or a different day's price. A timed reassessment can continue while that reference is unresolved, but unresolved conditions do not authorize an exit.
 
@@ -240,7 +240,7 @@ Background metadata and market reads share a broker request budget with executio
 
 Robinhood's published 100/minute and 300-burst figures are documented for its Crypto Trading API. An identical Agentic MCP quota has not been independently confirmed; the local limits are conservative operating ceilings, not a claim about that endpoint's entitlement. Server throttling always takes precedence.
 
-Only a deterministic OPEN with a current matching watch may use the warmed account snapshot. The handoff expires after ten seconds measured from the read start, validates quote timestamps, and is invalidated by account/order changes. Missing, expired, or invalid data causes a normal fresh read. Source verification, order review, chase, quantity, and risk checks remain in force. This polling does not authorize an entry, alter the hourly dashboard balance refresh, or guarantee a fill.
+Only a deterministic OPEN with a current matching watch may use the warmed account snapshot. The handoff expires after ten seconds measured from the read start, validates quote timestamps, and is invalidated by account/order changes. Missing, expired, or invalid data causes a normal fresh read. Source verification, order review, chase, quantity, and risk checks remain in force. This polling does not authorize an entry, alter the ten-minute dashboard balance refresh, or guarantee a fill.
 
 The entry's `entry_preparation.market_refresh` and `watch_market_data` diagnostics record refresh outcomes and cache use/fallback. Contract metadata keeps its existing slower refresh after the hot window ends. App restart does not replay old watch notices into a new hot window.
 
@@ -256,7 +256,7 @@ Message and decision rows show **Model evaluation** and **Posted → decision**.
 
 The account panel shows Robinhood's total account value, cash, reported buying power, cash-only buying power, asset-class totals, and account option positions. The reviewed Agentic API exposes detailed option holdings; other asset types appear as portfolio totals. These holdings are separate from positions owned by the relay's ledger.
 
-The connected worker refreshes this display on its first uncached read, hourly thereafter, and after an order submission attempt or an observed order-status change. Dashboard polling reads only the persisted cache. Restarting the worker retains the hourly schedule. Pausing new trading does not stop account refreshes; a disconnected or stopped worker leaves the last cached values visible with their age.
+The connected worker refreshes this display on its first uncached read, every ten minutes thereafter, and after an order submission attempt or an observed order-status change. Dashboard polling reads only the persisted cache. Restarting the worker retains the ten-minute schedule. Pausing new trading does not stop account refreshes; a disconnected or stopped worker leaves the last cached values visible with their age.
 
 Failed refreshes retain the last successful values and show an error. Option marks may be from the previous market session; their quote times remain visible. This display cache never supplies execution-time balance, inventory, or quote checks.
 
