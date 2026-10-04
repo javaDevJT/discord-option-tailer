@@ -1,0 +1,47 @@
+name: Container security gate
+description: Generate a Syft SBOM and fail on any High or Critical Grype finding for every image platform.
+inputs:
+  image:
+    description: Immutable registry digest or local OCI archive to scan
+    required: true
+  platforms:
+    description: Comma-separated image platforms
+    required: true
+  report-directory:
+    description: Job-local directory for SBOMs and vulnerability reports
+    required: true
+  artifact-name:
+    description: Unique artifact name for this job and build
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Syft
+      id: syft
+      uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      with:
+        syft-version: 1.54.0
+    - name: Install Grype
+      id: grype
+      uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+      with:
+        grype-version: 0.118.0
+        cache-db: false
+    - name: Scan every platform and enforce High/Critical gate
+      shell: bash
+      env:
+        SECURITY_IMAGE: ${{ inputs.image }}
+        SECURITY_PLATFORMS: ${{ inputs.platforms }}
+        SECURITY_REPORT_DIRECTORY: ${{ inputs.report-directory }}
+        SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        GRYPE_CMD: ${{ steps.grype.outputs.cmd }}
+        SECURITY_ACTION_PATH: ${{ github.action_path }}
+      run: bash "$SECURITY_ACTION_PATH/container-security.sh" scan
+    - name: Retain SBOMs and vulnerability reports
+      if: ${{ always() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.report-directory }}/
+        retention-days: 14
+        if-no-files-found: warn

@@ -1,6 +1,9 @@
 name: Test and publish image
 
 on:
+  schedule:
+    - cron: '5 4 * * *'
+      timezone: America/Detroit
   push:
   pull_request:
   workflow_dispatch:
@@ -113,9 +116,20 @@ jobs:
       - name: Prepare disk build cache
         id: ci_disk_cache_1
         run: ci-cache "truenas-05c856d3df3df362"
+      - name: Prepare immutable image and release tags
+        id: container_security_1
+        shell: bash
+        env:
+          SECURITY_PUBLISH: "true"
+          SECURITY_RELEASE_TAGS: |
+            ${{ steps.meta.outputs.tags }}
+          SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/build-1
+        run: bash .github/actions/container-security/container-security.sh prepare
       - name: Build and publish image
+        id: container_build_1
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
+          outputs: ${{ steps.container_security_1.outputs.exporter }}
           cache-from: |
             type=local,src=${{ steps.ci_disk_cache_1.outputs.from }}
             type=gha,version=2,scope=truenas-05c856d3df3df362
@@ -125,6 +139,19 @@ jobs:
           build-args: |
             SOURCE_REVISION=${{ github.sha }}
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          push: false # Push-by-digest is configured in the exporter; tags follow the scan.
+          tags: ${{ steps.container_security_1.outputs.repository }}
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Generate SBOM and enforce High/Critical vulnerability gate
+        uses: ./.github/actions/container-security
+        with:
+          image: registry:${{ steps.container_security_1.outputs.repository }}@${{ steps.container_build_1.outputs.digest }}
+          platforms: "linux/amd64"
+          report-directory: ${{ runner.temp }}/container-security/build-1
+          artifact-name: container-security-${{ github.job }}-${{ strategy.job-index || 0 }}-build-1
+      - name: Publish release tags only after the vulnerability gate passes
+        shell: bash
+        env:
+          SECURITY_IMAGE: ${{ steps.container_security_1.outputs.repository }}@${{ steps.container_build_1.outputs.digest }}
+          SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/build-1
+        run: bash .github/actions/container-security/container-security.sh publish
