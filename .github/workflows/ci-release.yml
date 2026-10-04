@@ -77,6 +77,8 @@ jobs:
       BUILDKIT_TLS_CLIENT_CERT: /run/buildkit/tls/client.pem
       BUILDKIT_TLS_CLIENT_KEY: /run/buildkit/tls/client.key
     steps:
+      - name: Start BuildKit storage collection
+        run: ci-storage-efficiency start
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -149,6 +151,19 @@ jobs:
           platforms: "linux/amd64"
           report-directory: ${{ runner.temp }}/container-security/build-1
           artifact-name: container-security-${{ github.job }}-${{ strategy.job-index || 0 }}-build-1
+      - name: Finish and enforce BuildKit storage usage
+        if: always()
+        run: ci-storage-efficiency finish
+      - name: Upload BuildKit storage usage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buildkit-storage-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+          path: |
+            ${{ runner.temp }}/ci-storage-usage-start.json
+            ${{ runner.temp }}/ci-storage-usage.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: Publish release tags only after the vulnerability gate passes
         shell: bash
         env:
