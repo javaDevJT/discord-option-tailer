@@ -36,6 +36,9 @@ runs:
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}
         GRYPE_CMD: ${{ steps.grype.outputs.cmd }}
         SECURITY_ACTION_PATH: ${{ github.action_path }}
+        # Private runners mount /tmp as a 1 GiB tmpfs. Image extraction needs
+        # the job's disk-backed temp directory for larger image layers.
+        TMPDIR: ${{ runner.temp }}
       run: bash "$SECURITY_ACTION_PATH/container-security.sh" scan
     - name: Retain SBOMs and vulnerability reports
       if: ${{ always() }}
