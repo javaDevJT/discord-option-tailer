@@ -268,7 +268,7 @@ Provider credentials remain in the persistent volume and are not copied from the
 
 ## Build and published image path
 
-The Dockerfile groups installation and source copying into two `RUN` steps, using read-only build-context mounts and the existing `.dockerignore` allowlist. This avoids repeated filesystem snapshots on the isolated TrueNAS builder, where even a small standalone `COPY` can take several minutes. Runtime paths, versions and file permissions remain explicit in the Dockerfile.
+The Dockerfile groups runtime installation and source copying into two `RUN` steps, using read-only build-context mounts and the existing `.dockerignore` allowlist. Separate donor stages supply Node/Codex and noVNC's static assets. This limits filesystem snapshots on the isolated TrueNAS builder. Runtime paths, versions and file permissions remain explicit in the Dockerfile.
 
 `compose.yaml` builds from the repository's `Dockerfile`. The source build is:
 
@@ -277,7 +277,11 @@ docker compose build
 docker compose up -d
 ```
 
-GitHub Actions publishes `ghcr.io/javadevjt/discord-option-tailer:latest` for Linux `amd64` after the tests and secret scan pass. For deployment without a source build, follow [the TrueNAS guide](truenas.md) using [compose.truenas.yaml](../compose.truenas.yaml).
+GitHub Actions builds a local OCI archive for Linux `amd64`, generates a Syft SBOM, and rejects every High or Critical Grype finding before publishing `ghcr.io/javadevjt/discord-option-tailer:latest`. Publication verifies the archive checksum, manifest digest, and successful scan of every requested platform, then copies those same bytes to GHCR and verifies each release tag. A failed scan leaves its reports available as workflow artifacts and does not upload the candidate image. Tests and the Git-history secret scan must also pass.
+
+The container uses checksum-pinned Chrome Stable through Playwright's `chrome` channel. Node and Codex are copied from an immutable donor image; npm, npx, Yarn, and unused Apache utilities are absent from the runtime. Native development keeps Playwright's default browser unless `RELAY_BROWSER_CHANNEL` is set. CI refreshes the `runtime` installation stage on every build so a cached dependency layer cannot hide OS package updates. High/Critical findings remain fatal even when an advisory has no available fix.
+
+BuildKit storage telemetry, invalid measurements, and capacity overruns remain fatal. Valid utilization below the runner's 80% reservation target is advisory; it indicates an oversized reservation rather than an insecure image. For deployment without a source build, follow [the TrueNAS guide](truenas.md) using [compose.truenas.yaml](../compose.truenas.yaml).
 
 ## Validation
 

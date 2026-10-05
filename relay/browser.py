@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import logging
+import os
 from pathlib import Path
 import re
 import time
@@ -374,6 +375,7 @@ async def login(profile_dir: str, *, keep_open=False, on_status=None, discovery_
     async with _playwright()() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             _profile(profile_dir), headless=False, accept_downloads=False,
+            channel=os.environ.get("RELAY_BROWSER_CHANNEL") or None,
         )
         discovery_task = None
         diagnostics = DiscordLoginDiagnostics(context)
@@ -457,6 +459,7 @@ async def monitor(config: dict, on_message, register_verifier=None, on_status=No
     async with _playwright()() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             profile, headless=False, accept_downloads=False,
+            channel=os.environ.get("RELAY_BROWSER_CHANNEL") or None,
         )
         discovery_task = None
         diagnostics = DiscordLoginDiagnostics(context)

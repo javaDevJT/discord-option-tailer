@@ -9,9 +9,12 @@ if [ "$(id -u)" -eq 0 ]; then
     exec su relay -s /bin/sh -c 'HOME=/home/relay exec /usr/local/bin/relay-browser "$1"' relay-browser "$1"
 fi
 
-chromium="$(find /ms-playwright -type f -name chrome -perm -0100 -print -quit 2>/dev/null || true)"
+chromium=/usr/bin/google-chrome-stable
+if [ ! -x "$chromium" ]; then
+    chromium="$(find /ms-playwright -type f -name chrome -perm -0100 -print -quit 2>/dev/null || true)"
+fi
 if [ -z "$chromium" ]; then
-    echo "Playwright Chromium is not installed" >&2
+    echo "Chrome browser is not installed" >&2
     exit 127
 fi
 

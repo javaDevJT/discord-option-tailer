@@ -1,8 +1,8 @@
 name: Container security gate
 description: Generate a Syft SBOM and fail on any High or Critical Grype finding for every image platform.
 inputs:
-  image:
-    description: Immutable registry digest or local OCI archive to scan
+  archive:
+    description: Local OCI archive to scan before publication
     required: true
   platforms:
     description: Comma-separated image platforms
@@ -30,7 +30,7 @@ runs:
     - name: Scan every platform and enforce High/Critical gate
       shell: bash
       env:
-        SECURITY_IMAGE: ${{ inputs.image }}
+        SECURITY_ARCHIVE: ${{ inputs.archive }}
         SECURITY_PLATFORMS: ${{ inputs.platforms }}
         SECURITY_REPORT_DIRECTORY: ${{ inputs.report-directory }}
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}

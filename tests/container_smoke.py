@@ -170,6 +170,7 @@ def main():
             page.wait_for_function("() => document.querySelector('[data-channel-field=name]').value === 'Demo signals'")
             rows = page.locator(".channel-editor")
             for index, channel in enumerate(original["channels"]):
+                rows.nth(index).locator("details.advanced-channel").evaluate("element => element.open = true")
                 rows.nth(index).locator('[data-channel-field="url"]').fill("https://discord.com/channels/111111111111111111/" + channel["id"])
             rows.nth(0).locator('[data-channel-field="name"]').fill("Saved in frontend")
             page.locator("#poll-seconds").fill("3")
@@ -204,11 +205,11 @@ def main():
             browser.close()
         checks.append("actual container UI renders ledger data and mobile layout; noVNC desktop connects")
 
-        cookie_script = '''import json, sys, time
+        cookie_script = '''import json, os, sys, time
 from playwright.sync_api import sync_playwright
 c=json.load(open('/data/config.json'))
 with sync_playwright() as p:
-    browser=p.chromium.launch_persistent_context(c['browser']['profile_dir'], headless=False)
+    browser=p.chromium.launch_persistent_context(c['browser']['profile_dir'], headless=False, channel=os.environ.get('RELAY_BROWSER_CHANNEL') or None)
     if sys.argv[1]=='write':
         browser.add_cookies([{'name':'relay_smoke','value':'synthetic','domain':'example.invalid','path':'/','expires':time.time()+3600}])
     else:

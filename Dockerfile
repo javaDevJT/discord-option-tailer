@@ -1,13 +1,34 @@
-FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS codex-runtime
+ARG CODEX_VERSION=0.153.4
+RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}"
+
+FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS novnc-assets
+ARG NOVNC_VERSION=1:1.6.0-2
+WORKDIR /tmp
+# Only the static client is served by nginx; Python websockify handles sockets.
+RUN apt-get update \
+    && apt-get download "novnc=${NOVNC_VERSION}" \
+    && mkdir /novnc \
+    && dpkg-deb --extract /tmp/novnc_*.deb /novnc \
+    && dpkg-deb --field /tmp/novnc_*.deb Package Version Source \
+        > /novnc/usr/share/novnc/package-provenance.txt
+
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 AS runtime
+COPY --from=codex-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=codex-runtime /usr/local/lib/node_modules/@openai /usr/local/lib/node_modules/@openai
+COPY --from=novnc-assets /novnc/usr/share/novnc /usr/share/novnc
+COPY --from=novnc-assets /novnc/usr/share/doc/novnc /usr/share/doc/novnc
 
 ARG CODEX_VERSION=0.153.4
-ARG PLAYWRIGHT_VERSION=1.62.0
+ARG PLAYWRIGHT_VERSION=1.63.0
+ARG CHROME_VERSION=154.0.8037.97-1
+ARG CHROME_SHA256=a4edbe95e9b01db6c9b97d7a1323121eda18362b5620df06abac1b59bee80053
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    RELAY_BROWSER_CHANNEL=chrome \
     PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /app
@@ -16,41 +37,44 @@ WORKDIR /app
 RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,readonly \
     --mount=type=cache,target=/root/.cache/pip \
     apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
-        apache2-utils \
         ca-certificates \
         curl \
         fonts-liberation \
         fonts-noto-color-emoji \
         nginx \
-        novnc \
         openbox \
         openssl \
         procps \
         python3 \
-        python3-pip \
         python3-venv \
         supervisor \
         websockify \
         x11vnc \
         x11-xserver-utils \
         xvfb \
+    && curl --fail --silent --show-error --location \
+        "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${CHROME_VERSION}_amd64.deb" \
+        --output /tmp/google-chrome.deb \
+    && printf '%s  %s\n' "${CHROME_SHA256}" /tmp/google-chrome.deb | sha256sum --check \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome.deb \
+    && rm -f /tmp/google-chrome.deb \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/python -m pip install --no-cache-dir --upgrade 'setuptools>=68' \
-    && npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" \
+    && ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex \
     && test -x /usr/local/bin/codex \
+    && codex --version \
     && groupadd --gid 1001 relay \
     && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/relay --shell /usr/sbin/nologin relay \
-    && mkdir -p /app /ms-playwright /opt/relay-docker /run/nginx /var/log/supervisor \
+    && mkdir -p /app /opt/relay-docker /run/nginx /var/log/supervisor \
     && chown relay:relay /home/relay \
     && python3 -c 'import tomllib; p=tomllib.load(open("/tmp/relay-project.toml", "rb"))["project"]; print("\n".join(p.get("dependencies", []) + p["optional-dependencies"]["browser"] + p["optional-dependencies"]["robinhood"] + p["optional-dependencies"]["discord"]))' > /tmp/relay-requirements.txt \
     && printf 'playwright==%s\n' "${PLAYWRIGHT_VERSION}" > /tmp/relay-constraints.txt \
     && /opt/venv/bin/pip install --timeout 120 --constraint /tmp/relay-constraints.txt -r /tmp/relay-requirements.txt \
-    && /opt/venv/bin/python -m playwright install --with-deps chromium \
     && rm -f /tmp/relay-constraints.txt /tmp/relay-requirements.txt \
     && rm -rf /var/lib/apt/lists/* \
-    && chmod -R a+rX /ms-playwright \
     && install -d -o relay -g relay -m 0700 /data
 
 RUN --mount=type=bind,source=.,target=/src,readonly \
