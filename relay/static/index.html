@@ -42,7 +42,7 @@
             <span id="sidebar-status-label">Connecting</span>
           </div>
           <p id="sidebar-status-detail">Waiting for the relay runtime.</p>
-          <a class="browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify">
+          <a class="browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=/browser/websockify">
             <span class="browser-link-icon" aria-hidden="true">↗</span>
             <span>Browser login</span>
           </a>
@@ -257,7 +257,7 @@
                   <span class="status-pill is-context" id="discord-setup-status">Not connected</span>
                 </div>
                 <p class="setup-help">Choose a browser session or Gateway (discord.py-self). Browser login keeps its session on the relay; gateway login uses your personal token.</p>
-                <a class="button button-quiet setup-browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify">Open Browser login <span aria-hidden="true">↗</span></a>
+                <a class="button button-quiet setup-browser-link" data-provider="discord" href="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=/browser/websockify">Open Browser login <span aria-hidden="true">↗</span></a>
                 <form id="discord-setup-form" class="discord-setup-form" autocomplete="off" novalidate>
                   <label class="field" for="discord-transport"><span class="field-label">Connection</span><select id="discord-transport" name="transport"><option value="browser">Browser session</option><option value="gateway">Gateway (discord.py-self)</option></select></label>
                   <div id="discord-gateway-fields" class="discord-gateway-fields" hidden>
@@ -362,7 +362,7 @@
                   <span class="status-pill is-context" id="browser-login-status-label">Waiting</span>
                   <p id="browser-login-detail">Waiting for setup status.</p>
                 </div>
-                <iframe id="browser-login-frame" title="Discord login browser" src="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=browser/websockify" loading="lazy"></iframe>
+                <iframe id="browser-login-frame" title="Discord login browser" src="/browser/vnc.html?autoconnect=true&amp;resize=scale&amp;path=/browser/websockify" loading="lazy"></iframe>
               </div>
             </dialog>
 

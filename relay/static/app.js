@@ -1972,7 +1972,7 @@ async function loadAccount() {
 (function setupUi() {
   "use strict";
 
-  const BROWSER_LOGIN_URL = "/browser/vnc.html?autoconnect=true&resize=scale&path=browser/websockify";
+  const BROWSER_LOGIN_URL = "/browser/vnc.html?autoconnect=true&resize=scale&path=/browser/websockify";
   const setupState = {
     csrfToken: "",
     status: null,

@@ -52,7 +52,7 @@ SAFE_GROUP = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 CODEX_DEVICE_HOSTS = {"auth.openai.com"}
 CODEX_DEVICE_PATHS = {"/codex/device"}
 AUTH_PROVIDERS = {"codex", "robinhood"}
-PUBLIC_BROWSER_URL = "/browser/vnc.html?autoconnect=true&resize=scale&path=browser/websockify"
+PUBLIC_BROWSER_URL = "/browser/vnc.html?autoconnect=true&resize=scale&path=/browser/websockify"
 CODEX_AUTH_TIMEOUT_SECONDS = 900
 PUBLIC_RISK_FIELDS = frozenset({
     "max_signal_age_seconds", "min_confidence", "entry_risk_min_fraction",

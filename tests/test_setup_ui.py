@@ -450,7 +450,7 @@ class SetupUITests(unittest.TestCase):
                 expect(dialog).to_be_visible()
                 self.assertNotIn("/browser/vnc.html", page.url)
                 expect(page.locator("#browser-login-frame")).to_have_attribute(
-                    "src", "/browser/vnc.html?autoconnect=true&resize=scale&path=browser/websockify"
+                    "src", "/browser/vnc.html?autoconnect=true&resize=scale&path=/browser/websockify"
                 )
                 expect(page.locator("#browser-login-status-label")).to_have_text("Waiting")
                 expect(page.locator("#browser-login-detail")).to_have_text("Complete Discord sign-in.")

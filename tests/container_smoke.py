@@ -200,7 +200,7 @@ def main():
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert not errors, errors
             vnc = context.new_page()
-            vnc.goto(origin + "/browser/vnc.html?autoconnect=true&resize=scale&path=browser/websockify")
+            vnc.goto(origin + page.locator(".browser-link").get_attribute("href"))
             vnc.wait_for_function("() => document.documentElement.classList.contains('noVNC_connected')", timeout=20000)
             browser.close()
         checks.append("actual container UI renders ledger data and mobile layout; noVNC desktop connects")
