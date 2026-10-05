@@ -58,7 +58,7 @@ def write_oci_archive(path: Path, platforms: tuple[str, ...] = ("linux/amd64", "
                     "mediaType": "application/vnd.oci.image.index.v1+json",
                     "digest": image_digest,
                     "size": len(image_index),
-                    "annotations": {"org.opencontainers.image.ref.name": "security-scan"},
+                    "annotations": {"org.opencontainers.image.ref.name": "latest"},
                 }
             ],
         },
@@ -171,6 +171,15 @@ class ContainerSecurityTests(unittest.TestCase):
         )
         self.assertNotIn("push", outputs["exporter"])
 
+    def test_prepare_accepts_metadata_whitespace_and_rejects_invalid_tags(self) -> None:
+        env = self.env.copy()
+        env["SECURITY_RELEASE_TAGS"] = "\n " + self.env["SECURITY_RELEASE_TAGS"] + "\n\n"
+        self.run_action("prepare", env=env)
+        self.assertEqual((self.report / "release-tags.txt").read_text().splitlines(), self.env["SECURITY_RELEASE_TAGS"].splitlines())
+        for tags in ("\n \n", "ghcr.io/example/relay:latest\nghcr.io/example/relay:latest", "not-a-registry-tag"):
+            env["SECURITY_RELEASE_TAGS"] = tags
+            self.run_action("prepare", success=False, env=env)
+
     def test_syft_resolves_archive_path_without_an_oci_reference_suffix(self) -> None:
         self.scan()
         sources = self.syft_source_log.read_text().splitlines()
@@ -222,6 +231,16 @@ class ContainerSecurityTests(unittest.TestCase):
             archive.write(b"changed")
         self.publish(success=False)
         self.assertFalse(self.oras_log.exists())
+
+    def test_mismatched_remote_digest_stops_remaining_tags(self) -> None:
+        self.scan()
+        env = self.env.copy()
+        env["ORAS_DIGEST"] = "sha256:" + "f" * 64
+        result = self.run_action("publish", success=False, env=env)
+        self.assertIn("Published image digest differs", result.stderr)
+        copies = [line for line in self.oras_log.read_text().splitlines() if line.startswith("cp ")]
+        self.assertEqual(len(copies), 1)
+        self.assertEqual((self.report / "published-digests.txt").read_text(), "")
 
     def test_exact_pass_coverage_promotes_archive_digest_to_each_release_tag(self) -> None:
         self.scan()

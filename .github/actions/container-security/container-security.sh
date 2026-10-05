@@ -236,7 +236,8 @@ case "${1:-}" in
       repository=""
       declare -a seen_tags=()
       while IFS= read -r tag || [[ -n "$tag" ]]; do
-        [[ -n "$tag" ]] || die "Release tags contain an empty entry"
+        tag=$(trim "$tag")
+        [[ -n "$tag" ]] || continue
         [[ "$tag" =~ ^ghcr\.io/[a-zA-Z0-9._/-]+:[a-zA-Z0-9_.-]+$ ]] || die "Unsupported release tag: $tag"
         duplicate=false
         for prior in "${seen_tags[@]:-}"; do
