@@ -15,7 +15,7 @@ export function checkStorage(exitCode, output, report) {
       5n * BigInt(report.peak_used_bytes) > 4n * BigInt(report.requested_bytes)) {
     throw new Error('BuildKit storage collector failed');
   }
-  return 'Low BuildKit disk utilization; review the reservation using cold and cached build measurements. Capacity and telemetry checks passed.';
+  throw new Error(failures[0]);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
