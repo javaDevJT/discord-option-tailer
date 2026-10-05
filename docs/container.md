@@ -281,7 +281,13 @@ GitHub Actions builds a local OCI archive for Linux `amd64`, generates a Syft SB
 
 The container uses checksum-pinned Chrome Stable through Playwright's `chrome` channel. Node and Codex are copied from an immutable donor image; npm, npx, Yarn, and unused Apache utilities are absent from the runtime. Native development keeps Playwright's default browser unless `RELAY_BROWSER_CHANNEL` is set. CI refreshes the `runtime` installation stage on every build so a cached dependency layer cannot hide OS package updates. High/Critical findings remain fatal even when an advisory has no available fix.
 
-BuildKit storage telemetry, invalid measurements, and capacity overruns remain fatal. Valid utilization below the runner's 80% reservation target is advisory; it indicates an oversized reservation rather than an insecure image. For deployment without a source build, follow [the TrueNAS guide](truenas.md) using [compose.truenas.yaml](../compose.truenas.yaml).
+BuildKit storage telemetry must be valid, peak usage must stay within the runner's
+allocation, and peak utilization must exceed 80% before publication. The image
+job requests 11 GiB based on a measured 9.6 GiB peak, leaving about 1.4 GiB of
+headroom. Review the retained storage report when dependencies or build steps
+change; adjust the reservation rather than bypassing the utilization gate.
+For deployment without a source build, follow [the TrueNAS guide](truenas.md)
+using [compose.truenas.yaml](../compose.truenas.yaml).
 
 ## Validation
 
