@@ -81,7 +81,24 @@ jobs:
       BUILDKIT_TLS_CLIENT_KEY: /run/buildkit/tls/client.key
     steps:
       - name: Start BuildKit storage collection
-        run: ci-storage-efficiency start
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4; do
+            rm -f "$RUNNER_TEMP/ci-storage-usage-start.json"
+            if ci-storage-efficiency start; then exit 0; fi
+            node -e '
+              const fs = require("node:fs");
+              const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              const policy = report.efficiency_policy;
+              if (policy?.mode !== "pending" || policy.reason !== "job-context-pending" ||
+                  !report.client_validation?.error?.startsWith("storage policy decision remained pending"))
+                process.exit(1);
+            ' "$RUNNER_TEMP/ci-storage-usage-start.json" || exit 1
+            if [ "$attempt" -eq 4 ]; then exit 1; fi
+            echo "Job policy binding is pending; retrying storage start ($attempt/4)."
+            sleep 5
+          done
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
