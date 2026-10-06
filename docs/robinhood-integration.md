@@ -10,6 +10,8 @@ OAuth uses PKCE. Registration and tokens are stored atomically with owner-only p
 
 Account selection requires authenticated eligibility fields and an unambiguous eligible account. A display name alone does not establish eligibility. Keep the account binding and its mode-specific ledger together when migrating an existing installation.
 
+Account inspection uses the dashboard's display reads, so yesterday's held-option quotes do not make authorization appear failed before market open. Trading snapshots and order execution retain their quote freshness checks.
+
 ## Reads and order lifecycle
 
 The normalized adapter exposes `snapshot()`, `quote(contract)`, `review(order)`, `submit(order, before_submit=None)` and `order_status(broker_uuid)`.

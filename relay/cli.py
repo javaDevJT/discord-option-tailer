@@ -281,7 +281,8 @@ async def inspect_broker(args, config):
     config["robinhood"]["enable_live_orders"] = False
     config["mode"] = "shadow"
     async with RobinhoodBroker(config) as broker:
-        snapshot = await broker.snapshot()
+        # Account inspection accepts off-hours quotes; execution checks stay strict.
+        snapshot = await broker.account_overview()
     sanitized = {key: value for key, value in snapshot.items() if key not in {"account_id", "account_number", "positions"}}
     report = {
         "account": {"nickname": account.get("nickname"), "last_four": account["account_number"][-4:], "type": account["type"], "state": account["state"], "option_level": account.get("option_level"), "agentic_allowed": account["agentic_allowed"]},

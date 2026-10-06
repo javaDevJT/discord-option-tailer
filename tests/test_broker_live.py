@@ -1,10 +1,14 @@
 """Offline checks only: every Robinhood response is supplied by a local fake."""
 import copy
+from contextlib import redirect_stdout
+import io
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
 import importlib.util
 from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -152,6 +156,36 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         early = regular_session(datetime(2026, 11, 27, 17, 5, tzinfo=timezone.utc))
         self.assertEqual(early[1], datetime(2026, 11, 27, 18, tzinfo=timezone.utc))
         self.assertIsNone(regular_session(datetime(2026, 11, 26, 15, tzinfo=timezone.utc)))
+
+    async def test_account_inspection_accepts_closed_market_quotes_without_relaxing_trade_checks(self):
+        from relay.cli import inspect_broker
+
+        self.now = datetime(2026, 9, 9, 11, tzinfo=timezone.utc)
+        self.quote["updated_at"] = "2026-09-08T19:59:59+00:00"
+        self.positions = [{"option_id": self.instrument["id"], "quantity": "1",
+                           "type": "long", "trade_value_multiplier": "100", "average_price": "120"}]
+        discovery = AsyncMock()
+        discovery.__aenter__.return_value = discovery
+        discovery.call.return_value = {"structuredContent": {"data": {"accounts": [self.account]}}}
+        config = copy.deepcopy(self.broker.runtime)
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()), \
+                patch("relay.broker.RobinhoodMCP", return_value=discovery), \
+                patch("relay.broker.RobinhoodBroker", return_value=self.broker), \
+                patch.object(type(self.broker), "__aenter__", AsyncMock(return_value=self.broker)), \
+                patch.object(type(self.broker), "__aexit__", AsyncMock(return_value=None)):
+            output = Path(directory) / "capabilities.json"
+            await inspect_broker(SimpleNamespace(bind=None, output=str(output)), config)
+            report = json.loads(output.read_text())
+        self.assertEqual(report["option_position_count"], 1)
+        self.assertEqual(report["snapshot"]["equity"], "1000")
+        self.assertEqual(report["orders_submitted"], 0)
+        self.assertNotIn("positions", report["snapshot"])
+        self.assertNotIn("account_number", report["snapshot"])
+        self.assertEqual(config["mode"], "shadow")
+        self.assertFalse(config["robinhood"]["enable_live_orders"])
+        self.assertFalse(any(name in {"review_option_order", "place_option_order"} for name, _ in self.calls))
+        with self.assertRaisesRegex(BrokerError, "quote.*stale"):
+            await self.broker.snapshot()
 
     async def test_account_overview_projects_negative_short_adjusted_and_stale(self):
         self.positions = [{
