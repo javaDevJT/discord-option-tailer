@@ -56,14 +56,11 @@ jobs:
       - name: Check dashboard JavaScript syntax
         run: node --check relay/static/app.js
 
-      - name: Check BuildKit storage policy
-        run: node --test .github/scripts/check-buildkit-storage.test.mjs
-
       - name: Run synthetic test suite
         run: python -m unittest discover -s tests -v
 
-  publish:
-    name: Publish linux/amd64 image
+  build:
+    name: Build and scan linux/amd64 image
     needs: test
     if: >-
       github.repository == 'javaDevJT/discord-option-tailer' &&
@@ -73,32 +70,17 @@ jobs:
     runs-on: truenas-discord-option-tailer-storage-11g
     permissions:
       contents: read
-      packages: write
+      packages: read
+    outputs:
+      candidate_artifact_id: ${{ steps.candidate.outputs.artifact-id }}
     env:
       BUILDKIT_HOST: tcp://buildkit:1234
       BUILDKIT_TLS_CA_CERT: /run/buildkit/tls/ca.pem
       BUILDKIT_TLS_CLIENT_CERT: /run/buildkit/tls/client.pem
       BUILDKIT_TLS_CLIENT_KEY: /run/buildkit/tls/client.key
     steps:
-      - name: Start BuildKit storage collection
-        timeout-minutes: 3
-        shell: bash
-        run: |
-          for attempt in 1 2 3 4; do
-            rm -f "$RUNNER_TEMP/ci-storage-usage-start.json"
-            if ci-storage-efficiency start; then exit 0; fi
-            node -e '
-              const fs = require("node:fs");
-              const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-              const policy = report.efficiency_policy;
-              if (policy?.mode !== "pending" || policy.reason !== "job-context-pending" ||
-                  !report.client_validation?.error?.startsWith("storage policy decision remained pending"))
-                process.exit(1);
-            ' "$RUNNER_TEMP/ci-storage-usage-start.json" || exit 1
-            if [ "$attempt" -eq 4 ]; then exit 1; fi
-            echo "Job policy binding is pending; retrying storage start ($attempt/4)."
-            sleep 20
-          done
+      # Storage admission, sampling and pressure enforcement belong to the
+      # administrator-installed runner hooks, independent of repository steps.
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -172,28 +154,52 @@ jobs:
           platforms: "linux/amd64"
           report-directory: ${{ runner.temp }}/container-security/build-1
           artifact-name: container-security-${{ github.job }}-${{ strategy.job-index || 0 }}-build-1
-      - name: Finish BuildKit storage collection and enforce capacity
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          ci-storage-efficiency finish > "$RUNNER_TEMP/ci-storage-finish.log" 2>&1
-          result=$?
-          set -e
-          cat "$RUNNER_TEMP/ci-storage-finish.log"
-          node .github/scripts/check-buildkit-storage.mjs "$result" \
-            "$RUNNER_TEMP/ci-storage-finish.log" "$RUNNER_TEMP/ci-storage-usage.json"
-      - name: Upload BuildKit storage usage report
-        if: always()
+
+      - name: Retain scanned candidate for gated publication
+        id: candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: buildkit-storage-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+          name: scanned-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/ci-storage-usage-start.json
-            ${{ runner.temp }}/ci-storage-usage.json
-            ${{ runner.temp }}/ci-storage-finish.log
-          if-no-files-found: warn
-          retention-days: 14
+            ${{ steps.container_security_1.outputs.archive }}
+            ${{ runner.temp }}/container-security/build-1/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish verified linux/amd64 image
+    # The administrator's completion hook must pass before external publication.
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate candidate artifact identity
+        shell: bash
+        env:
+          CANDIDATE_ARTIFACT_ID: ${{ needs.build.outputs.candidate_artifact_id }}
+        run: '[[ "$CANDIDATE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]'
+
+      - name: Download exact scanned candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.candidate_artifact_id }}
+          path: ${{ runner.temp }}/container-security
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install verified OCI publication tool
         shell: bash
         env:
@@ -212,8 +218,21 @@ jobs:
       - name: Publish scanned archive only after all gates pass
         shell: bash
         env:
-          SECURITY_ARCHIVE: ${{ steps.container_security_1.outputs.archive }}
+          SECURITY_ARCHIVE: ${{ runner.temp }}/container-security/build-1.oci.tar
           SECURITY_PLATFORMS: linux/amd64
           ORAS_CMD: ${{ runner.temp }}/oras/oras
           SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/build-1
         run: bash .github/actions/container-security/container-security.sh publish
+
+      - name: Retain image publication receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/container-security/build-1/scanned-archive.sha256
+            ${{ runner.temp }}/container-security/build-1/scanned-image-digest.txt
+            ${{ runner.temp }}/container-security/build-1/release-tags.txt
+            ${{ runner.temp }}/container-security/build-1/published-digests.txt
+          if-no-files-found: warn
+          retention-days: 14

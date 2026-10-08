@@ -6,6 +6,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -231,6 +233,55 @@ class ContainerSecurityTests(unittest.TestCase):
             archive.write(b"changed")
         self.publish(success=False)
         self.assertFalse(self.oras_log.exists())
+
+    def test_downloaded_candidate_preserves_scan_binding(self) -> None:
+        self.scan()
+        for modified in (False, True):
+            with self.subTest(modified=modified):
+                destination = self.root / f"download-{modified}"
+                destination.mkdir()
+                report = destination / "build-1"
+                archive = destination / "build-1.oci.tar"
+                shutil.copytree(self.report, report)
+                shutil.copyfile(self.archive, archive)
+                if modified:
+                    with archive.open("ab") as output:
+                        output.write(b"changed in transit")
+                self.oras_log.unlink(missing_ok=True)
+                env = {**self.env, "SECURITY_REPORT_DIRECTORY": str(report), "SECURITY_ARCHIVE": str(archive)}
+                result = self.run_action("publish", success=not modified, env=env)
+                if modified:
+                    self.assertIn("OCI archive changed after security scanning", result.stderr)
+                    self.assertFalse(self.oras_log.exists())
+                else:
+                    self.assertEqual(len((report / "published-digests.txt").read_text().splitlines()), 2)
+
+    def test_workflow_waits_for_completed_build_before_publication(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci-release.yml").read_text()
+        build, publish = workflow.split("  build:\n", 1)[1].split("  publish:\n", 1)
+        publication_job, publication_steps = publish.split("    steps:\n", 1)
+        self.assertIn("    needs: test\n", build)
+        self.assertIn("    runs-on: truenas-discord-option-tailer-storage-11g\n", build)
+        self.assertIn("      packages: read\n", build)
+        self.assertNotIn("packages: write", build)
+        self.assertIn("    needs: [test, build]\n", publication_job)
+        self.assertIn("    runs-on: ubuntu-latest\n", publication_job)
+        self.assertNotRegex(publication_job, r"(?m)^    (if|continue-on-error):")
+        self.assertNotIn("continue-on-error:", workflow)
+        self.assertNotIn("ci-storage-efficiency", workflow)
+        self.assertNotIn("container-security.sh publish", build)
+        self.assertIn("          push: false\n", build)
+        names = re.findall(r"^      - name: (.+)$", build, re.MULTILINE)
+        self.assertLess(names.index("Build local image archive"), names.index("Generate SBOM and enforce High/Critical vulnerability gate"))
+        self.assertLess(names.index("Generate SBOM and enforce High/Critical vulnerability gate"), names.index("Retain scanned candidate for gated publication"))
+        self.assertEqual(build.count("${{ steps.container_security_1.outputs.archive }}"), 2)
+        self.assertIn("candidate_artifact_id: ${{ steps.candidate.outputs.artifact-id }}", build)
+        self.assertIn("artifact-ids: ${{ needs.build.outputs.candidate_artifact_id }}", publication_steps)
+        self.assertIn("digest-mismatch: error", publication_steps)
+        self.assertIn("SECURITY_ARCHIVE: ${{ runner.temp }}/container-security/build-1.oci.tar", publication_steps)
+        publication = publication_steps.split("      - name: Publish scanned archive only after all gates pass\n", 1)[1].split("      - name:", 1)[0]
+        self.assertNotIn("if:", publication)
+        self.assertIn("container-security.sh publish", publication)
 
     def test_mismatched_remote_digest_stops_remaining_tags(self) -> None:
         self.scan()
