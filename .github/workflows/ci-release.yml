@@ -2,7 +2,7 @@ name: Test and publish image
 
 on:
   schedule:
-    - cron: '5 4 * * *'
+    - cron: '22 0 * * *'
       timezone: America/Detroit
   push:
   pull_request:
