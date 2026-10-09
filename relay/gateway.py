@@ -35,6 +35,10 @@ _DEFAULT_HISTORY_SECONDS = 1.0
 _DISCOVERY_MAX_AUTHORS = 100
 _STATUS_SECONDS = 20.0
 _ACK_MAX_AGE_SECONDS = 90.0
+_CHANNEL_CACHE_ATTEMPTS = 3
+_CHANNEL_FETCH_ATTEMPTS = 3
+_CHANNEL_LOOKUP_TIMEOUT = 15.0
+_CHANNEL_RETRY_SECONDS = 30.0
 
 
 class GatewayLoginRequired(RuntimeError):
@@ -375,6 +379,10 @@ class _GatewayRuntime:
         self.invalidated: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.latest_by_group: dict[str, dict[str, Any]] = {}
         self.history_floor: dict[str, dict[str, Any]] = {}
+        self.channel_lookup_attempts: dict[str, int] = {}
+        self.channel_failures: dict[str, str] = {}
+        self.channel_retry_at = 0.0
+        self.fetched_channels: dict[str, Any] = {}
 
     async def status(self, state: str, detail: str, *, channel_id: str | None = None) -> None:
         if state == "login_required":
@@ -426,6 +434,10 @@ class _GatewayRuntime:
             self.last_gateway_ack = None
             self.healthy = False
             self.initializing = False
+            self.channel_lookup_attempts.clear()
+            self.channel_failures.clear()
+            self.channel_retry_at = 0.0
+            self.fetched_channels.clear()
             detail = "Discord gateway disconnected; waiting for library reconnect."
             await self.status("reconnecting", detail)
             for channel in self.channels[:2]:
@@ -682,10 +694,10 @@ class _GatewayRuntime:
             for channel in getattr(guild, "threads", ()) or ():
                 if str(_value(channel, "id")) == str(channel_id):
                     return channel
-        return None
+        return self.fetched_channels.get(str(channel_id))
 
     def _readable(self, channel: Any) -> bool:
-        if not _is_message_channel(channel):
+        if not _is_message_channel(channel) or not callable(getattr(channel, "history", None)):
             return False
         permissions_for = getattr(channel, "permissions_for", None)
         user = getattr(self.client, "user", None)
@@ -701,9 +713,120 @@ class _GatewayRuntime:
                         return False
         return True
 
+    def _channel_problem(self, config: dict, channel: Any) -> str | None:
+        if channel is None:
+            return "channel_cache_missing"
+        if str(_value(channel, "id")) != str(config.get("id")):
+            return "channel_id_mismatch"
+        guild_id = _value(channel, "guild_id") or _value(_value(channel, "guild"), "id")
+        if config.get("guild_id") and str(guild_id) != str(config["guild_id"]):
+            return "channel_guild_mismatch"
+        if not _is_message_channel(channel) or not callable(getattr(channel, "history", None)):
+            return "channel_type_unsupported"
+        if not self._readable(channel):
+            return "channel_permission_denied"
+        return None
+
+    async def _channel_error(self, channel_id: str, code: str) -> None:
+        self.channel_failures[channel_id] = code
+        state = "reconnecting" if code in {
+            "channel_cache_missing", "channel_lookup_failed", "channel_lookup_timeout", "channel_rate_limited",
+        } else "unavailable"
+        LOG.warning("Discord channel resolution failed channel_id=%s code=%s", channel_id, code)
+        await self.status(state, f"Discord channel {channel_id} unavailable [{code}].", channel_id=channel_id)
+
+    async def _resolve_channels(self, generation: int) -> dict[str, Any]:
+        """Resolve only configured IDs; never trust cache presence as access proof."""
+        resolved = {}
+        LOG.info("Discord resolving configured channels generation=%s guild_cache_count=%s", generation, len(getattr(self.client, "guilds", ()) or ()))
+        for attempt in range(_CHANNEL_CACHE_ATTEMPTS):
+            if generation != self.generation:
+                return {}
+            resolved = {str(c["id"]): channel for c in self.channels[:2]
+                        if (channel := self._find_channel(str(c["id"]))) is not None
+                        and self._channel_problem(c, channel) is None
+                        and self.channel_failures.get(str(c["id"])) not in {"channel_permission_denied", "channel_not_found"}}
+            if len(resolved) == len(self.channels[:2]):
+                break
+            if attempt + 1 < _CHANNEL_CACHE_ATTEMPTS:
+                await asyncio.sleep(discord_delay(1.0))
+        self.channel_retry_at = time.monotonic() + discord_delay(_CHANNEL_RETRY_SECONDS)
+        for config in self.channels[:2]:
+            if generation != self.generation:
+                return {}
+            channel_id = str(config["id"])
+            if channel_id in resolved:
+                self.channel_failures.pop(channel_id, None)
+                continue
+            cached = self._find_channel(channel_id)
+            code = self._channel_problem(config, cached)
+            fetch = getattr(self.client, "fetch_channel", None)
+            # Explicit denial/mismatch is not repaired by repeated HTTP calls.
+            previous = self.channel_failures.get(channel_id)
+            can_fetch = (code == "channel_cache_missing" and callable(fetch)
+                         and previous not in {"channel_permission_denied", "channel_not_found"}
+                         and self.channel_lookup_attempts.get(channel_id, 0) < _CHANNEL_FETCH_ATTEMPTS)
+            if can_fetch:
+                self.channel_lookup_attempts[channel_id] = self.channel_lookup_attempts.get(channel_id, 0) + 1
+                try:
+                    channel = await asyncio.wait_for(fetch(int(channel_id)), timeout=_CHANNEL_LOOKUP_TIMEOUT)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if generation != self.generation:
+                        return {}
+                    status = getattr(exc, "status", None)
+                    challenge = any(marker in type(exc).__name__.lower() for marker in ("captcha", "challenge", "verification"))
+                    if status == 401 or challenge or (status not in {403, 404, 429} and _auth_failure(exc)):
+                        raise GatewayLoginRequired("Discord channel lookup requires reauthentication [channel_auth_required].") from None
+                    if status == 403:
+                        code = "channel_permission_denied"
+                    elif status == 404:
+                        code = "channel_not_found"
+                    elif _rate_limited(exc):
+                        code = "channel_rate_limited"
+                        retry_after = getattr(exc, "retry_after", None)
+                        try:
+                            retry_after = float(retry_after)
+                        except (TypeError, ValueError):
+                            retry_after = _CHANNEL_RETRY_SECONDS
+                        if math.isfinite(retry_after) and retry_after >= 0:
+                            self.channel_retry_at = max(self.channel_retry_at, time.monotonic() + retry_after)
+                    elif isinstance(exc, TimeoutError):
+                        code = "channel_lookup_timeout"
+                    else:
+                        code = "channel_lookup_failed"
+                else:
+                    if generation != self.generation:
+                        return {}
+                    code = self._channel_problem(config, channel)
+                    if code is None:
+                        resolved[channel_id] = channel
+                        self.fetched_channels[channel_id] = channel
+                        self.channel_failures.pop(channel_id, None)
+                        LOG.info("Discord channel resolved channel_id=%s source=fetch", channel_id)
+                        continue
+            elif previous in {"channel_permission_denied", "channel_not_found"}:
+                code = previous
+            elif self.channel_lookup_attempts.get(channel_id, 0) >= _CHANNEL_FETCH_ATTEMPTS:
+                code = "channel_lookup_exhausted"
+            await self._channel_error(channel_id, code or "channel_cache_missing")
+            if code == "channel_rate_limited":
+                # A provider-wide limit can cover both IDs. Stop this pass;
+                # no other lookup may run before the shared Retry-After gate.
+                for pending in self.channels[:2]:
+                    pending_id = str(pending["id"])
+                    if pending_id not in resolved and pending_id not in self.channel_failures:
+                        await self._channel_error(pending_id, "channel_rate_limited")
+                return resolved
+            if can_fetch:
+                await asyncio.sleep(discord_delay(1.0))
+        return resolved
+
     async def _history(self, channel: Any) -> list[Any]:
-        if self.history_limit <= 0:
-            return []
+        # Even zero context needs one bounded read to prove channel access;
+        # its result is discarded rather than delivered as model context.
+        limit = max(1, self.history_limit)
         history = getattr(channel, "history", None)
         if not callable(history):
             return []
@@ -713,19 +836,19 @@ class _GatewayRuntime:
                 # Ask the library for one bounded newest-message page.  The
                 # adapter sorts that page before delivery so durable context
                 # sees it chronologically without walking older history.
-                iterator = history(limit=self.history_limit, oldest_first=False)
+                iterator = history(limit=limit, oldest_first=False)
                 if inspect.isawaitable(iterator):
                     iterator = await iterator
                 values = []
                 if hasattr(iterator, "__aiter__"):
                     async for item in iterator:
                         values.append(item)
-                        if len(values) >= self.history_limit:
+                        if len(values) >= limit:
                             break
                 else:
                     for item in iterator:
                         values.append(item)
-                        if len(values) >= self.history_limit:
+                        if len(values) >= limit:
                             break
                 break
             except asyncio.CancelledError:
@@ -758,12 +881,16 @@ class _GatewayRuntime:
             except ValueError:
                 return 0, identifier
 
-        return sorted(values, key=sort_key)
+        return sorted(values, key=sort_key) if self.history_limit else []
 
-    async def start_session(self) -> None:
+    async def start_session(self, *, recovery: bool = False) -> None:
         async with self.session_lock:
-            if self.fatal.done() or self.auth_rejected:
+            if self.fatal.done() or self.auth_rejected or (recovery and self.healthy):
                 return
+            if not recovery:
+                self.channel_lookup_attempts.clear()
+                self.channel_failures.clear()
+                self.fetched_channels.clear()
             self.healthy = False
             self.initializing = True
             self.generation += 1
@@ -774,24 +901,32 @@ class _GatewayRuntime:
             for channel in self.channels[:2]:
                 await self.status("starting", detail, channel_id=str(channel.get("id", "")))
             try:
-                all_channels_ready = True
+                resolved = await self._resolve_channels(generation) if self.load_history else {}
+                if generation != self.generation:
+                    self.initializing = False
+                    return
+                all_channels_ready = not self.load_history or len(resolved) == len(self.channels[:2])
                 for index, channel_config in enumerate(self.channels[:2] if self.load_history else []):
                     if generation != self.generation:
                         self.initializing = False
                         self.healthy = False
                         return
                     channel_id = str(channel_config.get("id", ""))
-                    channel = self._find_channel(channel_id)
-                    if channel is None or not self._readable(channel):
-                        all_channels_ready = False
-                        await self.status(
-                            "reconnecting",
-                            "Configured Discord channel is not in the gateway cache.",
-                            channel_id=channel_id,
-                        )
+                    channel = resolved.get(channel_id)
+                    if not all_channels_ready:
+                        if channel is not None:
+                            await self.status("reconnecting", "Discord channel resolved; waiting for other configured channels.", channel_id=channel_id)
                         continue
                     if self.load_history:
-                        for item in await self._history(channel):
+                        try:
+                            history = await self._history(channel)
+                        except Exception as exc:
+                            if getattr(exc, "status", None) not in {403, 404}:
+                                raise
+                            all_channels_ready = False
+                            await self._channel_error(channel_id, "channel_permission_denied" if exc.status == 403 else "channel_not_found")
+                            continue
+                        for item in history:
                             if generation != self.generation:
                                 self.initializing = False
                                 self.healthy = False
@@ -813,11 +948,17 @@ class _GatewayRuntime:
                     if current
                     else "Waiting for a current Discord gateway heartbeat acknowledgement."
                     if all_channels_ready
-                    else "Discord gateway is waiting for configured channels in its cache."
+                    else "Discord configured channel resolution failed: " + "; ".join(
+                        f"{channel_id} [{code}]" for channel_id, code in sorted(self.channel_failures.items()))
                 )
+                if not all_channels_ready and any(code not in {
+                    "channel_cache_missing", "channel_lookup_failed", "channel_lookup_timeout", "channel_rate_limited",
+                } for code in self.channel_failures.values()):
+                    state = "unavailable"
                 await self.status(state, detail)
-                for channel in self.channels[:2]:
-                    await self.status(state, detail, channel_id=str(channel.get("id", "")))
+                if all_channels_ready:
+                    for channel in self.channels[:2]:
+                        await self.status(state, detail, channel_id=str(channel.get("id", "")))
             except asyncio.CancelledError:
                 raise
             except BaseException:
@@ -972,6 +1113,9 @@ class _GatewayRuntime:
             state, detail = self.connection_status
             await self.status(state, detail)
             return
+        if (not self.healthy and not self.initializing and not self.session_lock.locked()
+                and self.connection_fresh() and time.monotonic() >= self.channel_retry_at):
+            await self.start_session(recovery=True)
         if self.healthy and not self.initializing:
             if self.connection_fresh():
                 age = int(time.monotonic() - self.last_gateway_ack)

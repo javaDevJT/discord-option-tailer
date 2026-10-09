@@ -13,6 +13,7 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 
 - [Execution failure diagnostics](docs/container.md#execution-failure-diagnostics): inspect named dispatch checks, chained causes, correlation IDs, and persistent credential-safe logs.
 - [Discord updates and message history](docs/container.md#discord-updates-and-message-history): distinguish unchanged notifications, actual edits, and prior evaluations.
+- [Discord connection recovery](docs/container.md#discord-input): bounded channel resolution and explicit access, missing-channel and reauthentication errors.
 
 The [account monitoring guide](docs/container.md#account-balances-and-holdings) explains cached balances, account option holdings, and refresh timing.
 

@@ -414,6 +414,243 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             await runtime.start_session()
         self.assertFalse(runtime.healthy)
 
+    def _cache_recovery_runtime(self):
+        events = []
+        runtime = gateway._GatewayRuntime(_config(), None, None, events.append)
+        runtime.client = _make_client_for_discovery()
+        runtime.client.started.set()
+        runtime.last_gateway_ack = time.monotonic()
+        for channel in runtime.client.channels.values():
+            channel._history_items = []
+        return runtime, events
+
+    async def test_late_channel_cache_recovers_without_reconnect_or_duplicate_history(self):
+        runtime, events = self._cache_recovery_runtime()
+        channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(channel)
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+            self.assertFalse(runtime.healthy)
+            self.assertFalse(any(e["state"] == "connected" for e in events))
+            self.assertEqual(runtime.client.channels[CHANNEL_SIGNALS].history_calls, [])
+            runtime.client.channels[CHANNEL_CONTEXT] = channel
+            runtime.channel_retry_at = 0
+            await runtime.report_health()
+            await runtime.report_health()
+        self.assertTrue(runtime.healthy)
+        self.assertEqual(len(channel.history_calls), 1)
+        self.assertEqual(len(runtime.client.channels[CHANNEL_SIGNALS].history_calls), 1)
+        self.assertEqual(runtime.connection_status[0], "connected")
+
+    async def test_uncached_channel_is_fetched_by_exact_id_and_history_is_baseline(self):
+        runtime, events = self._cache_recovery_runtime()
+        channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(channel)
+        calls = []
+        async def fetch(identifier):
+            calls.append(identifier)
+            return channel
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+        self.assertTrue(runtime.healthy)
+        self.assertEqual(calls, [int(CHANNEL_CONTEXT)])
+        self.assertEqual(len(channel.history_calls), 1)
+        self.assertIs(runtime._find_channel(CHANNEL_CONTEXT), channel)
+        self.assertTrue(any(e["state"] == "connected" for e in events))
+
+    async def test_successful_fetch_is_retained_while_other_channel_recovers(self):
+        runtime, _ = self._cache_recovery_runtime()
+        channels = dict(runtime.client.channels)
+        runtime.client.channels.clear()
+        runtime.client.guilds[0].channels.clear()
+        calls = []
+        async def fetch(identifier):
+            calls.append(str(identifier))
+            if str(identifier) == CHANNEL_CONTEXT and calls.count(CHANNEL_CONTEXT) == 1:
+                raise OSError("private provider response must never appear")
+            return channels[str(identifier)]
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+            self.assertFalse(runtime.healthy)
+            self.assertEqual(channels[CHANNEL_SIGNALS].history_calls, [])
+            runtime.channel_retry_at = 0
+            await runtime.report_health()
+        self.assertTrue(runtime.healthy)
+        self.assertEqual(calls.count(CHANNEL_SIGNALS), 1)
+        self.assertEqual(calls.count(CHANNEL_CONTEXT), 2)
+        self.assertEqual(len(channels[CHANNEL_SIGNALS].history_calls), 1)
+
+    async def test_channel_403_is_permission_denied_not_reauthentication_and_not_retried(self):
+        runtime, events = self._cache_recovery_runtime()
+        channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(channel)
+        class Forbidden(Exception):
+            status = 403
+        calls = []
+        async def fetch(identifier):
+            calls.append(identifier)
+            raise Forbidden("secret token and response 403")
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+            runtime.channel_retry_at = 0
+            await runtime.report_health()
+        self.assertFalse(runtime.healthy)
+        self.assertEqual(calls, [int(CHANNEL_CONTEXT)])
+        self.assertEqual(runtime.channel_failures[CHANNEL_CONTEXT], "channel_permission_denied")
+        self.assertFalse(any(e["state"] == "login_required" for e in events))
+        self.assertNotIn("secret token", str(events))
+        self.assertIn("channel_permission_denied", runtime.connection_status[1])
+
+    async def test_channel_401_stops_resolution_with_safe_reauth_error(self):
+        runtime, _ = self._cache_recovery_runtime()
+        runtime.client.channels.clear()
+        runtime.client.guilds[0].channels.clear()
+        class Unauthorized(Exception):
+            status = 401
+        async def fetch(identifier):
+            raise Unauthorized("secret token and response")
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            with self.assertRaisesRegex(gateway.GatewayLoginRequired, "channel_auth_required") as captured:
+                await runtime.start_session()
+        self.assertNotIn("secret", str(captured.exception))
+        self.assertFalse(runtime.healthy)
+
+    async def test_403_verification_challenge_requires_assistance_not_permission_retry(self):
+        runtime, _ = self._cache_recovery_runtime()
+        runtime.client.channels.clear()
+        runtime.client.guilds[0].channels.clear()
+        class CaptchaRequired(Exception):
+            status = 403
+        async def fetch(identifier):
+            raise CaptchaRequired("private challenge data")
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            with self.assertRaises(gateway.GatewayLoginRequired):
+                await runtime.start_session()
+        self.assertFalse(runtime.healthy)
+
+    async def test_fetched_channel_guild_and_type_must_match_configuration(self):
+        for invalid in ("guild", "type", "id"):
+            with self.subTest(invalid=invalid):
+                runtime, _ = self._cache_recovery_runtime()
+                channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+                runtime.client.guilds[0].channels.remove(channel)
+                if invalid == "guild":
+                    channel.guild_id = "999999999999999999"
+                elif invalid == "type":
+                    channel.type = "voice"
+                else:
+                    channel.id = "999999999999999999"
+                async def fetch(identifier):
+                    return channel
+                runtime.client.fetch_channel = fetch
+                with patch("relay.gateway.discord_delay", return_value=0):
+                    await runtime.start_session()
+                self.assertFalse(runtime.healthy)
+                self.assertEqual(channel.history_calls, [])
+                self.assertIn(runtime.channel_failures[CHANNEL_CONTEXT], {"channel_guild_mismatch", "channel_type_unsupported", "channel_id_mismatch"})
+
+    async def test_disconnect_during_channel_fetch_cannot_restore_health(self):
+        runtime, _ = self._cache_recovery_runtime()
+        channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(channel)
+        runtime.bind_events()
+        async def fetch(identifier):
+            await runtime.client.callbacks["on_disconnect"]()
+            return channel
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+        self.assertFalse(runtime.healthy)
+        self.assertEqual(channel.history_calls, [])
+        self.assertEqual(runtime.connection_status[0], "reconnecting")
+        self.assertEqual(runtime.fetched_channels, {})
+
+    async def test_channel_lookup_retries_are_bounded_and_honor_rate_limit_delay(self):
+        runtime, _ = self._cache_recovery_runtime()
+        runtime.client.channels.clear()
+        runtime.client.guilds[0].channels.clear()
+        class RateLimited(Exception):
+            status = 429
+            retry_after = 120
+        calls = []
+        async def fetch(identifier):
+            calls.append(identifier)
+            raise RateLimited("private body")
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            before = time.monotonic()
+            await runtime.start_session()
+            self.assertGreaterEqual(runtime.channel_retry_at, before + 120)
+            self.assertEqual(calls, [int(CHANNEL_SIGNALS)])
+            await runtime.report_health()
+            self.assertEqual(len(calls), 1)
+            for _ in range(8):
+                runtime.channel_retry_at = 0
+                await runtime.report_health()
+        self.assertEqual(len(calls), 2 * gateway._CHANNEL_FETCH_ATTEMPTS)
+        self.assertFalse(runtime.healthy)
+        self.assertTrue(all(code == "channel_lookup_exhausted" for code in runtime.channel_failures.values()))
+
+    async def test_zero_context_proves_access_without_delivering_probe_messages(self):
+        runtime, _ = self._cache_recovery_runtime()
+        runtime.history_limit = 0
+        for channel in runtime.client.channels.values():
+            channel._history_items = [FakeMessage("500000000000000065", channel)]
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+        self.assertTrue(runtime.healthy)
+        self.assertTrue(runtime.queue.empty())
+        self.assertTrue(all(channel.history_calls == [{"limit": 1, "oldest_first": False}]
+                            for channel in runtime.client.channels.values()))
+
+    async def test_zero_context_permission_probe_denial_never_becomes_healthy(self):
+        runtime, _ = self._cache_recovery_runtime()
+        runtime.history_limit = 0
+        class Forbidden(Exception):
+            status = 403
+        async def history(**kwargs):
+            raise Forbidden("private response")
+        runtime.client.channels[CHANNEL_SIGNALS].history = history
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+        self.assertFalse(runtime.healthy)
+        self.assertEqual(runtime.channel_failures[CHANNEL_SIGNALS], "channel_permission_denied")
+        self.assertTrue(runtime.queue.empty())
+
+    async def test_fetched_channel_still_requires_current_heartbeat_for_execution(self):
+        runtime, events = self._cache_recovery_runtime()
+        runtime.last_gateway_ack = None
+        channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(channel)
+        async def fetch(identifier):
+            return channel
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+        self.assertTrue(runtime.healthy)
+        self.assertFalse(any(e["state"] == "connected" for e in events))
+        self.assertFalse(runtime.connection_fresh())
+
+    async def test_history_403_remains_channel_error_without_reauth_or_repeated_history(self):
+        runtime, events = self._cache_recovery_runtime()
+        class Forbidden(Exception):
+            status = 403
+        async def history(channel):
+            raise Forbidden("private response")
+        with patch("relay.gateway.discord_delay", return_value=0), patch.object(runtime, "_history", side_effect=history) as loader:
+            await runtime.start_session()
+            runtime.channel_retry_at = 0
+            await runtime.report_health()
+        self.assertFalse(runtime.healthy)
+        self.assertEqual(loader.await_count, 1)
+        self.assertEqual(runtime.channel_failures[CHANNEL_SIGNALS], "channel_permission_denied")
+        self.assertFalse(any(e["state"] == "login_required" for e in events))
+
     async def test_full_history_larger_than_queue_is_delivered_without_replay(self):
         delivered = []
         runtime = gateway._GatewayRuntime(_config(), delivered.append, None, None)
@@ -811,6 +1048,30 @@ def _make_client_for_discovery():
 
 
 class InstalledGatewayAPITests(unittest.IsolatedAsyncioTestCase):
+    async def test_pinned_library_fetches_uncached_guild_channel_without_authentication(self):
+        try:
+            import discord
+        except ImportError:
+            self.skipTest("Install the discord extra for the upstream API check")
+        self.assertEqual(discord.__version__, "2.1.0")
+        client = gateway._make_client(discord)
+        calls = []
+        async def lookup(identifier):
+            calls.append(identifier)
+            return {"id": CHANNEL_CONTEXT, "guild_id": GUILD, "type": 0,
+                    "name": "context", "position": 0, "permission_overwrites": []}
+        try:
+            with patch.object(client.http, "get_channel", side_effect=lookup):
+                channel = await client.fetch_channel(int(CHANNEL_CONTEXT))
+            self.assertEqual(calls, [int(CHANNEL_CONTEXT)])
+            self.assertIsNone(client.get_channel(int(CHANNEL_CONTEXT)))
+            runtime = gateway._GatewayRuntime(_config(), None, None, None)
+            runtime.client = client
+            self.assertEqual(str(channel.guild.id), GUILD)
+            self.assertIsNone(runtime._channel_problem(_config()["channels"][1], channel))
+        finally:
+            await client.close()
+
     async def test_pinned_library_constructs_without_bot_intents_or_network(self):
         try:
             import discord
