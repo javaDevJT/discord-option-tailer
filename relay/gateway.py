@@ -379,9 +379,18 @@ class _GatewayRuntime:
         self.invalidated: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.latest_by_group: dict[str, dict[str, Any]] = {}
         self.history_floor: dict[str, dict[str, Any]] = {}
+        # Readiness belongs to a channel within one gateway session.  A
+        # missing sibling must not pause an already bootstrapped channel.
+        self.channel_revisions: dict[str, int] = {}
+        self.channel_ready: dict[str, tuple[int, int]] = {}
+        self.recovery_candidates: set[tuple[str, str]] = set()
         self.channel_lookup_attempts: dict[str, int] = {}
         self.channel_failures: dict[str, str] = {}
+        self.channel_failure_details: dict[str, tuple[str, int | None]] = {}
         self.channel_retry_at = 0.0
+        # Metadata changes may shorten ordinary recovery pacing, never a
+        # provider-wide Retry-After deadline (including across reconnects).
+        self.provider_retry_at = 0.0
         self.fetched_channels: dict[str, Any] = {}
 
     async def status(self, state: str, detail: str, *, channel_id: str | None = None) -> None:
@@ -434,14 +443,82 @@ class _GatewayRuntime:
             self.last_gateway_ack = None
             self.healthy = False
             self.initializing = False
+            self.channel_ready.clear()
+            self.recovery_candidates.clear()
+            self.latest_by_group.clear()
+            self.history_floor.clear()
             self.channel_lookup_attempts.clear()
             self.channel_failures.clear()
+            self.channel_failure_details.clear()
             self.channel_retry_at = 0.0
             self.fetched_channels.clear()
             detail = "Discord gateway disconnected; waiting for library reconnect."
             await self.status("reconnecting", detail)
             for channel in self.channels[:2]:
                 await self.status("reconnecting", detail, channel_id=str(channel.get("id", "")))
+
+        async def on_guild_channel_delete(channel: Any) -> None:
+            channel_id = _identifier(_value(channel, "id"))
+            if self._channel_config(channel_id) is None:
+                return
+            self._clear_channel_readiness(channel_id)
+            self.channel_failures[channel_id] = "channel_not_found"
+            self.channel_failure_details[channel_id] = ("channel_delete", 404)
+            detail = f"Discord channel {channel_id} unavailable [channel_not_found; stage=channel_delete HTTP 404]."
+            await self.status("unavailable", detail, channel_id=channel_id)
+            await self._refresh_connection_status()
+
+        async def on_guild_channel_create(channel: Any) -> None:
+            channel_id = _identifier(_value(channel, "id"))
+            if self._channel_config(channel_id) is None:
+                return
+            # A create event is authoritative evidence that a channel-level
+            # 404 is stale. Permission denials remain terminal until a new
+            # gateway session establishes a fresh access check.
+            if self.channel_failures.get(channel_id) == "channel_not_found":
+                self.channel_failures.pop(channel_id, None)
+                self.channel_failure_details.pop(channel_id, None)
+                self.channel_retry_at = 0.0
+                await self.status(
+                    "reconnecting",
+                    "Discord configured channel appeared; refreshing bounded history.",
+                    channel_id=channel_id,
+                )
+
+        async def on_guild_channel_update(before: Any, after: Any) -> None:
+            channel_id = _identifier(_value(after, "id"))
+            if (self._channel_config(channel_id) is None
+                    or self._channel_permission_signature(before) == self._channel_permission_signature(after)):
+                return
+            await self._retry_denied_channels({channel_id})
+
+        async def on_member_update(before: Any, after: Any) -> None:
+            user = getattr(self.client, "user", None)
+            user_id = _identifier(_value(user, "id"))
+            if not user_id or _identifier(_value(after, "id")) != user_id:
+                return
+            if self._member_role_ids(before) == self._member_role_ids(after):
+                return
+            guild_id = _identifier(
+                _value(after, "guild_id") or _value(_value(after, "guild"), "id")
+            )
+            if guild_id:
+                await self._retry_denied_channels(self._denied_channels_for_guild(guild_id))
+
+        async def on_guild_role_update(before: Any, after: Any) -> None:
+            if self._role_access_signature(before) == self._role_access_signature(after):
+                return
+            role_id = _identifier(_value(after, "id"))
+            guild_id = _identifier(
+                _value(after, "guild_id") or _value(_value(after, "guild"), "id")
+            )
+            if not role_id or not guild_id:
+                return
+            affected = {
+                channel_id for channel_id in self._denied_channels_for_guild(guild_id)
+                if self._role_affects_channel(role_id, guild_id, channel_id)
+            }
+            await self._retry_denied_channels(affected)
 
         async def on_message(message: Any) -> None:
             await self._guard(lambda: self.observe(message, kind="live", reason="live"))
@@ -488,6 +565,11 @@ class _GatewayRuntime:
             ("on_ready", on_ready),
             ("on_resumed", on_resumed),
             ("on_disconnect", on_disconnect),
+            ("on_guild_channel_delete", on_guild_channel_delete),
+            ("on_guild_channel_create", on_guild_channel_create),
+            ("on_guild_channel_update", on_guild_channel_update),
+            ("on_member_update", on_member_update),
+            ("on_guild_role_update", on_guild_role_update),
             ("on_message", on_message),
             ("on_socket_raw_receive", on_socket_raw_receive),
             ("on_message_edit", on_message_edit),
@@ -544,6 +626,179 @@ class _GatewayRuntime:
     def _channel_config(self, channel_id: object) -> dict[str, Any] | None:
         return self.channels_by_id.get(str(channel_id))
 
+    def _permission_value(self, value: Any) -> int | str | None:
+        if value is None:
+            return None
+        raw = _value(value, "value", default=value)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return str(raw)
+
+    def _channel_permission_signature(self, channel: Any) -> tuple[Any, ...]:
+        raw = _value(channel, "_overwrites")
+        if raw is None:
+            raw = _value(channel, "overwrites", default=[])
+        rows = []
+        if isinstance(raw, dict):
+            entries = raw.items()
+        else:
+            entries = ((entry, entry) for entry in raw or ())
+        for target, permission in entries:
+            identifier = _identifier(_value(target, "id", default=target))
+            allow = _value(permission, "allow")
+            deny = _value(permission, "deny")
+            pair = _value(permission, "pair")
+            if callable(pair) and (allow is None or deny is None):
+                try:
+                    allow, deny = pair()
+                except Exception:
+                    allow, deny = None, None
+            rows.append((
+                identifier,
+                self._permission_value(allow),
+                self._permission_value(deny),
+                _value(permission, "type"),
+            ))
+        return (
+            _identifier(_value(channel, "category_id")),
+            bool(_value(channel, "permissions_synced", default=False)),
+            tuple(sorted(rows)),
+        )
+
+    def _channel_overwrite_ids(self, channel: Any) -> set[str]:
+        raw = _value(channel, "_overwrites")
+        if raw is None:
+            raw = _value(channel, "overwrites", default=[])
+        targets = raw.keys() if isinstance(raw, dict) else (raw or ())
+        return {
+            identifier for target in targets
+            if (identifier := _identifier(_value(target, "id", default=target)))
+        }
+
+    def _member_role_ids(self, member: Any) -> set[str]:
+        return {
+            identifier for role in (_value(member, "roles", default=[]) or ())
+            if (identifier := _identifier(_value(role, "id", default=role)))
+        }
+
+    def _role_access_signature(self, role: Any) -> tuple[Any, ...]:
+        permissions = _value(role, "permissions")
+        fields = ("administrator", "view_channel", "read_messages", "read_message_history")
+        return tuple(_value(permissions, field) for field in fields)
+
+    def _denied_channels_for_guild(self, guild_id: str) -> set[str]:
+        return {
+            channel_id for channel in self.channels[:2]
+            if str(channel.get("guild_id", "")) == guild_id
+            and self.channel_failures.get(channel_id := str(channel.get("id", "")))
+            == "channel_permission_denied"
+            and not self._channel_is_ready(channel_id)
+        }
+
+    def _role_affects_channel(self, role_id: str, guild_id: str, channel_id: str) -> bool:
+        if role_id == guild_id:
+            return True
+        guild = next(
+            (item for item in getattr(self.client, "guilds", ()) or ()
+             if _identifier(_value(item, "id")) == guild_id),
+            None,
+        )
+        if role_id in self._member_role_ids(_value(guild, "me")):
+            return True
+        channel = self._find_channel(channel_id)
+        return channel is not None and role_id in self._channel_overwrite_ids(channel)
+
+    async def _retry_denied_channels(self, channel_ids: set[str]) -> None:
+        retry_ids = []
+        for channel_id in sorted(channel_ids):
+            if (self.channel_failures.get(channel_id) != "channel_permission_denied"
+                    or self._channel_is_ready(channel_id)):
+                continue
+            self.channel_failures.pop(channel_id, None)
+            self.channel_failure_details.pop(channel_id, None)
+            self.channel_lookup_attempts.pop(channel_id, None)
+            self.channel_retry_at = 0.0
+            retry_ids.append(channel_id)
+            await self.status(
+                "reconnecting",
+                "Discord access metadata changed; verifying bounded channel history access.",
+                channel_id=channel_id,
+            )
+        if not retry_ids:
+            return
+        if self.connection_fresh():
+            await self.start_session(recovery=True, channel_ids=set(retry_ids))
+        else:
+            await self._refresh_connection_status()
+
+    def _channel_is_ready(self, channel_id: object) -> bool:
+        identifier = str(channel_id)
+        return self.channel_ready.get(identifier) == (
+            self.generation,
+            self.channel_revisions.get(identifier, 0),
+        )
+
+    def _all_channels_ready(self) -> bool:
+        return not self.load_history or all(
+            self._channel_is_ready(channel.get("id", ""))
+            for channel in self.channels[:2]
+        )
+
+    def _refresh_health(self) -> None:
+        self.healthy = self._all_channels_ready()
+
+    def _rebuild_group_watermarks(self) -> None:
+        self.latest_by_group.clear()
+        for key, message in self.latest.items():
+            if key not in self.recovery_candidates or key in self.invalidated:
+                continue
+            if message.get("browser_connection_epoch") != self.epoch:
+                continue
+            channel = self._channel_config(message.get("channel_id"))
+            if channel is None or not self._channel_is_ready(channel.get("id", "")):
+                continue
+            group = str(channel.get("source_group", ""))
+            previous = self.latest_by_group.get(group)
+            if previous is None or _newer(message, previous) or _message_key(previous) == key:
+                self.latest_by_group[group] = message
+
+    def _mark_channel_ready(
+        self,
+        channel_id: object,
+        *,
+        bootstrap_keys: set[tuple[str, str]] | None = None,
+    ) -> None:
+        identifier = str(channel_id)
+        revision = self.channel_revisions.get(identifier, 0)
+        self.channel_ready[identifier] = (self.generation, revision)
+        for key in bootstrap_keys or set():
+            message = self.latest.get(key)
+            if (message is not None and key not in self.invalidated
+                    and message.get("browser_connection_epoch") == self.epoch
+                    and message.get("ingestion") in {"baseline", "live"}):
+                self.recovery_candidates.add(key)
+                if message.get("ingestion") == "baseline":
+                    floor = self.history_floor.get(identifier)
+                    if floor is None or _newer(message, floor):
+                        self.history_floor[identifier] = message
+        self._rebuild_group_watermarks()
+        self._refresh_health()
+
+    def _clear_channel_readiness(self, channel_id: object) -> None:
+        identifier = str(channel_id)
+        self.channel_revisions[identifier] = self.channel_revisions.get(identifier, 0) + 1
+        self.channel_ready.pop(identifier, None)
+        self.history_floor.pop(identifier, None)
+        for key in list(self.latest):
+            if key[0] == identifier:
+                self._mark_invalid(key)
+                self.latest.pop(key, None)
+                self.recovery_candidates.discard(key)
+        self.fetched_channels.pop(identifier, None)
+        self._rebuild_group_watermarks()
+        self._refresh_health()
+
     def _allowed(self, message: dict[str, Any], channel: dict[str, Any] | None) -> bool:
         if channel is None:
             return False
@@ -563,15 +818,29 @@ class _GatewayRuntime:
         else:
             self.invalidated.pop(key, None)
 
-        if message.get("ingestion") in {"live", "baseline"}:
+        if invalid:
+            self.recovery_candidates.discard(key)
+        elif (
+            message.get("ingestion") in {"live", "baseline"}
+            and self._channel_is_ready(channel.get("id", ""))
+            and message.get("browser_connection_epoch") == self.epoch
+        ):
+            self.recovery_candidates.add(key)
             group = str(channel.get("source_group", ""))
             previous = self.latest_by_group.get(group)
             if previous is None or _newer(message, previous) or _message_key(previous) == key:
                 self.latest_by_group[group] = message
+            if message.get("ingestion") == "baseline":
+                channel_id = str(channel.get("id", ""))
+                floor = self.history_floor.get(channel_id)
+                if floor is None or _newer(message, floor):
+                    self.history_floor[channel_id] = message
 
     def _mark_invalid(self, key: tuple[str, str]) -> None:
         self.invalidated[key] = None
         self.invalidated.move_to_end(key)
+        self.recovery_candidates.discard(key)
+        self._rebuild_group_watermarks()
         while len(self.invalidated) > self.cache_limit * 2:
             self.invalidated.popitem(last=False)
 
@@ -607,9 +876,10 @@ class _GatewayRuntime:
         if edited and not payload.get("edited_timestamp"):
             normalized = normalize(_message_payload(message, edited=True), str(payload["channel_id"]))
         normalized["browser_connection_epoch"] = self.epoch
+        normalized["gateway_channel_revision"] = self.channel_revisions.get(str(payload["channel_id"]), 0)
 
         floor = self.history_floor.get(str(payload["channel_id"]))
-        if kind == "live" and (not self.healthy or self.initializing or not self.connection_fresh()
+        if kind == "live" and (not self._channel_is_ready(payload["channel_id"]) or not self.connection_fresh()
                                or (floor is not None and not _newer(normalized, floor))):
             kind = "baseline"
             reason = "baseline"
@@ -618,8 +888,6 @@ class _GatewayRuntime:
             reason = "edit"
         normalized["ingestion"] = kind
         normalized["ingestion_reason"] = reason
-        if kind == "baseline" and (floor is None or _newer(normalized, floor)):
-            self.history_floor[str(payload["channel_id"])] = normalized
         self._remember(normalized, channel, invalid=reason == "edit")
         await self.enqueue(normalized)
 
@@ -723,40 +991,61 @@ class _GatewayRuntime:
             return "channel_guild_mismatch"
         if not _is_message_channel(channel) or not callable(getattr(channel, "history", None)):
             return "channel_type_unsupported"
-        if not self._readable(channel):
-            return "channel_permission_denied"
+        # Role/member caches can be incomplete. Only the bounded history read
+        # can authoritatively establish access for these configured IDs.
         return None
 
-    async def _channel_error(self, channel_id: str, code: str) -> None:
+    async def _channel_error(self, channel_id: str, code: str, *, stage: str | None = None,
+                             http_status: int | None = None) -> None:
+        if stage is None:
+            stage, http_status = (self.channel_failure_details.get(channel_id, ("cache", None))
+                                  if self.channel_failures.get(channel_id) == code else ("cache", None))
+        self.channel_failure_details[channel_id] = (stage, http_status)
         self.channel_failures[channel_id] = code
         state = "reconnecting" if code in {
             "channel_cache_missing", "channel_lookup_failed", "channel_lookup_timeout", "channel_rate_limited",
         } else "unavailable"
-        LOG.warning("Discord channel resolution failed channel_id=%s code=%s", channel_id, code)
-        await self.status(state, f"Discord channel {channel_id} unavailable [{code}].", channel_id=channel_id)
+        LOG.warning("Discord channel resolution failed channel_id=%s code=%s stage=%s http_status=%s",
+                    channel_id, code, stage, http_status)
+        status_detail = f" HTTP {http_status}" if http_status is not None else ""
+        await self.status(state, f"Discord channel {channel_id} unavailable [{code}; stage={stage}{status_detail}].", channel_id=channel_id)
 
-    async def _resolve_channels(self, generation: int) -> dict[str, Any]:
+    async def _resolve_channels(
+        self,
+        generation: int,
+        channel_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
         """Resolve only configured IDs; never trust cache presence as access proof."""
+        if time.monotonic() < self.provider_retry_at:
+            return {}
         resolved = {}
         LOG.info("Discord resolving configured channels generation=%s guild_cache_count=%s", generation, len(getattr(self.client, "guilds", ()) or ()))
-        for attempt in range(_CHANNEL_CACHE_ATTEMPTS):
+        configs = [config for config in self.channels[:2]
+                   if channel_ids is None or str(config.get("id", "")) in channel_ids]
+        cache_pending = [config for config in configs
+                         if self.channel_failures.get(str(config.get("id", "")))
+                         not in {"channel_permission_denied", "channel_not_found"}]
+        for attempt in range(_CHANNEL_CACHE_ATTEMPTS if cache_pending else 0):
             if generation != self.generation:
                 return {}
-            resolved = {str(c["id"]): channel for c in self.channels[:2]
+            resolved = {str(c["id"]): channel for c in cache_pending
                         if (channel := self._find_channel(str(c["id"]))) is not None
                         and self._channel_problem(c, channel) is None
                         and self.channel_failures.get(str(c["id"])) not in {"channel_permission_denied", "channel_not_found"}}
-            if len(resolved) == len(self.channels[:2]):
+            if len(resolved) == len(cache_pending):
                 break
             if attempt + 1 < _CHANNEL_CACHE_ATTEMPTS:
                 await asyncio.sleep(discord_delay(1.0))
         self.channel_retry_at = time.monotonic() + discord_delay(_CHANNEL_RETRY_SECONDS)
-        for config in self.channels[:2]:
+        for config in configs:
             if generation != self.generation:
                 return {}
             channel_id = str(config["id"])
             if channel_id in resolved:
                 self.channel_failures.pop(channel_id, None)
+                self.channel_failure_details.pop(channel_id, None)
+                if not self._readable(resolved[channel_id]):
+                    LOG.warning("Discord cached permissions deny channel_id=%s; bounded read will verify access", channel_id)
                 continue
             cached = self._find_channel(channel_id)
             code = self._channel_problem(config, cached)
@@ -766,7 +1055,11 @@ class _GatewayRuntime:
             can_fetch = (code == "channel_cache_missing" and callable(fetch)
                          and previous not in {"channel_permission_denied", "channel_not_found"}
                          and self.channel_lookup_attempts.get(channel_id, 0) < _CHANNEL_FETCH_ATTEMPTS)
+            stage, http_status = None, None
             if can_fetch:
+                if time.monotonic() < self.provider_retry_at:
+                    return resolved
+                stage = "lookup"
                 self.channel_lookup_attempts[channel_id] = self.channel_lookup_attempts.get(channel_id, 0) + 1
                 try:
                     channel = await asyncio.wait_for(fetch(int(channel_id)), timeout=_CHANNEL_LOOKUP_TIMEOUT)
@@ -776,6 +1069,7 @@ class _GatewayRuntime:
                     if generation != self.generation:
                         return {}
                     status = getattr(exc, "status", None)
+                    http_status = status if type(status) is int and 100 <= status <= 599 else None
                     challenge = any(marker in type(exc).__name__.lower() for marker in ("captcha", "challenge", "verification"))
                     if status == 401 or challenge or (status not in {403, 404, 429} and _auth_failure(exc)):
                         raise GatewayLoginRequired("Discord channel lookup requires reauthentication [channel_auth_required].") from None
@@ -791,7 +1085,8 @@ class _GatewayRuntime:
                         except (TypeError, ValueError):
                             retry_after = _CHANNEL_RETRY_SECONDS
                         if math.isfinite(retry_after) and retry_after >= 0:
-                            self.channel_retry_at = max(self.channel_retry_at, time.monotonic() + retry_after)
+                            self.provider_retry_at = max(self.provider_retry_at, time.monotonic() + retry_after)
+                            self.channel_retry_at = max(self.channel_retry_at, self.provider_retry_at)
                     elif isinstance(exc, TimeoutError):
                         code = "channel_lookup_timeout"
                     else:
@@ -804,19 +1099,22 @@ class _GatewayRuntime:
                         resolved[channel_id] = channel
                         self.fetched_channels[channel_id] = channel
                         self.channel_failures.pop(channel_id, None)
+                        self.channel_failure_details.pop(channel_id, None)
                         LOG.info("Discord channel resolved channel_id=%s source=fetch", channel_id)
                         continue
             elif previous in {"channel_permission_denied", "channel_not_found"}:
                 code = previous
             elif self.channel_lookup_attempts.get(channel_id, 0) >= _CHANNEL_FETCH_ATTEMPTS:
                 code = "channel_lookup_exhausted"
-            await self._channel_error(channel_id, code or "channel_cache_missing")
+                stage, http_status = self.channel_failure_details.get(channel_id, ("lookup", None))
+            await self._channel_error(channel_id, code or "channel_cache_missing", stage=stage, http_status=http_status)
             if code == "channel_rate_limited":
                 # A provider-wide limit can cover both IDs. Stop this pass;
                 # no other lookup may run before the shared Retry-After gate.
                 for pending in self.channels[:2]:
                     pending_id = str(pending["id"])
-                    if pending_id not in resolved and pending_id not in self.channel_failures:
+                    if (not self._channel_is_ready(pending_id)
+                            and pending_id not in resolved and pending_id not in self.channel_failures):
                         await self._channel_error(pending_id, "channel_rate_limited")
                 return resolved
             if can_fetch:
@@ -873,7 +1171,8 @@ class _GatewayRuntime:
                     raise
                 # Let the provider's Retry-After control rate-limit waits;
                 # never turn an auth error into a credential hot-retry loop.
-                await asyncio.sleep(retry_after)
+                self.provider_retry_at = max(self.provider_retry_at, time.monotonic() + retry_after)
+                await asyncio.sleep(max(0.0, self.provider_retry_at - time.monotonic()))
         def sort_key(item: Any) -> tuple[int, str]:
             identifier = _identifier(_value(item, "id"))
             try:
@@ -883,87 +1182,172 @@ class _GatewayRuntime:
 
         return sorted(values, key=sort_key) if self.history_limit else []
 
-    async def start_session(self, *, recovery: bool = False) -> None:
+    async def _bootstrap_channel(self, config: dict[str, Any], channel: Any, generation: int) -> None:
+        channel_id = str(config.get("id", ""))
+        if time.monotonic() < self.provider_retry_at:
+            await self._channel_error(channel_id, "channel_rate_limited", stage="history", http_status=429)
+            return
+        channel_revision = self.channel_revisions.get(channel_id, 0)
+        try:
+            history = await self._history(channel)
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status not in {403, 404}:
+                raise
+            await self._channel_error(
+                channel_id,
+                "channel_permission_denied" if status == 403 else "channel_not_found",
+                stage="history",
+                http_status=status,
+            )
+            return
+
+        bootstrap_keys: set[tuple[str, str]] = set()
+        for item in history:
+            if (generation != self.generation
+                    or channel_revision != self.channel_revisions.get(channel_id, 0)):
+                return
+            await self.observe(item, kind="baseline", reason="baseline")
+            payload = _message_payload(item)
+            normalized = normalize(payload, channel_id)
+            key = _message_key(normalized)
+            if key in self.latest and key not in self.invalidated:
+                bootstrap_keys.add(key)
+
+        await self.queue.join()
+        if (generation != self.generation
+                or channel_revision != self.channel_revisions.get(channel_id, 0)):
+            return
+        self.channel_failures.pop(channel_id, None)
+        self.channel_failure_details.pop(channel_id, None)
+        self._mark_channel_ready(channel_id, bootstrap_keys=bootstrap_keys)
+        state, detail = self._channel_ready_status(channel_id)
+        await self.status(state, detail, channel_id=channel_id)
+
+    def _channel_ready_status(self, channel_id: str) -> tuple[str, str]:
+        del channel_id
+        if self.connection_fresh():
+            age = int(time.monotonic() - self.last_gateway_ack)
+            return "connected", f"Discord configured channel is observing messages; heartbeat acknowledged {age}s ago."
+        return "reconnecting", "Waiting for a current Discord gateway heartbeat acknowledgement."
+
+    async def _refresh_connection_status(self) -> None:
+        self._refresh_health()
+        if self.healthy:
+            if self.connection_fresh():
+                state, detail = "connected", "Discord gateway observing configured channels."
+            else:
+                state, detail = "reconnecting", "Waiting for a current Discord gateway heartbeat acknowledgement."
+        else:
+            failures = sorted(self.channel_failures.items())
+            detail = "Discord configured channel resolution is incomplete."
+            if failures:
+                detail = "Discord configured channel resolution failed: " + "; ".join(
+                    f"{channel_id} [{code}]" for channel_id, code in failures
+                )
+            retryable = {
+                "channel_cache_missing", "channel_lookup_failed", "channel_lookup_timeout", "channel_rate_limited",
+                "channel_lookup_exhausted",
+            }
+            state = "reconnecting" if not failures or all(code in retryable for _, code in failures) else "unavailable"
+        await self.status(state, detail)
+
+    async def start_session(
+        self,
+        *,
+        recovery: bool = False,
+        channel_ids: set[str] | None = None,
+    ) -> None:
         async with self.session_lock:
-            if self.fatal.done() or self.auth_rejected or (recovery and self.healthy):
+            if self.fatal.done() or self.auth_rejected or (recovery and self._all_channels_ready()):
                 return
             if not recovery:
                 self.channel_lookup_attempts.clear()
                 self.channel_failures.clear()
+                self.channel_failure_details.clear()
                 self.fetched_channels.clear()
-            self.healthy = False
-            self.initializing = True
-            self.generation += 1
+                self.generation += 1
+                self.epoch = f"gateway:{uuid.uuid4()}"
+                self.channel_ready.clear()
+                self.recovery_candidates.clear()
+                self.latest_by_group.clear()
+                self.history_floor.clear()
+            if time.monotonic() < self.provider_retry_at:
+                return
             generation = self.generation
-            self.epoch = f"gateway:{uuid.uuid4()}"
+            self._refresh_health()
+            self.initializing = True
             detail = "Discord gateway connected; loading bounded channel context."
-            await self.status("starting", detail)
-            for channel in self.channels[:2]:
-                await self.status("starting", detail, channel_id=str(channel.get("id", "")))
+            await self.status("reconnecting" if recovery else "starting", detail)
+            for config in self.channels[:2] if self.load_history else []:
+                channel_id = str(config.get("id", ""))
+                if recovery and self._channel_is_ready(channel_id):
+                    continue
+                if recovery and channel_id in self.channel_failures:
+                    continue
+                await self.status(
+                    "reconnecting" if recovery else "starting",
+                    detail,
+                    channel_id=channel_id,
+                )
             try:
-                resolved = await self._resolve_channels(generation) if self.load_history else {}
-                if generation != self.generation:
-                    self.initializing = False
-                    return
-                all_channels_ready = not self.load_history or len(resolved) == len(self.channels[:2])
-                for index, channel_config in enumerate(self.channels[:2] if self.load_history else []):
-                    if generation != self.generation:
-                        self.initializing = False
-                        self.healthy = False
-                        return
-                    channel_id = str(channel_config.get("id", ""))
-                    channel = resolved.get(channel_id)
-                    if not all_channels_ready:
-                        if channel is not None:
-                            await self.status("reconnecting", "Discord channel resolved; waiting for other configured channels.", channel_id=channel_id)
-                        continue
-                    if self.load_history:
-                        try:
-                            history = await self._history(channel)
-                        except Exception as exc:
-                            if getattr(exc, "status", None) not in {403, 404}:
-                                raise
-                            all_channels_ready = False
-                            await self._channel_error(channel_id, "channel_permission_denied" if exc.status == 403 else "channel_not_found")
-                            continue
-                        for item in history:
+                if self.load_history:
+                    pending = [config for config in self.channels[:2]
+                               if not self._channel_is_ready(config.get("id", ""))
+                               and (channel_ids is None or str(config.get("id", "")) in channel_ids)]
+                    cached_ids = {
+                        str(config.get("id", "")) for config in pending
+                        if self.channel_failures.get(str(config.get("id", "")))
+                        not in {"channel_permission_denied", "channel_not_found"}
+                        and self._channel_problem(
+                            config,
+                            self._find_channel(str(config.get("id", ""))),
+                        ) is None
+                    }
+                    phases = [cached_ids] if cached_ids else []
+                    unresolved = {str(config.get("id", "")) for config in pending} - cached_ids
+                    if unresolved:
+                        phases.append(unresolved)
+                    history_attempted = False
+                    for phase_ids in phases:
+                        resolved = await self._resolve_channels(generation, phase_ids)
+                        if generation != self.generation:
+                            self.initializing = False
+                            return
+                        for config in pending:
+                            channel_id = str(config.get("id", ""))
+                            channel = resolved.get(channel_id)
+                            if channel_id not in phase_ids or channel is None:
+                                continue
+                            if history_attempted and self.history_spacing:
+                                await asyncio.sleep(discord_delay(self.history_spacing))
+                            history_attempted = True
+                            await self._bootstrap_channel(config, channel, generation)
                             if generation != self.generation:
                                 self.initializing = False
-                                self.healthy = False
                                 return
-                            await self.observe(item, kind="baseline", reason="baseline")
-                    if self.load_history and index + 1 < min(2, len(self.channels)) and self.history_spacing:
-                        await asyncio.sleep(discord_delay(self.history_spacing))
                 await self.queue.join()
                 if generation != self.generation:
                     self.initializing = False
-                    self.healthy = False
                     return
                 self.initializing = False
-                self.healthy = all_channels_ready
-                current = all_channels_ready and self.connection_fresh()
-                state = "connected" if current else "reconnecting"
-                detail = (
-                    "Discord gateway observing configured channels."
-                    if current
-                    else "Waiting for a current Discord gateway heartbeat acknowledgement."
-                    if all_channels_ready
-                    else "Discord configured channel resolution failed: " + "; ".join(
-                        f"{channel_id} [{code}]" for channel_id, code in sorted(self.channel_failures.items()))
-                )
-                if not all_channels_ready and any(code not in {
-                    "channel_cache_missing", "channel_lookup_failed", "channel_lookup_timeout", "channel_rate_limited",
-                } for code in self.channel_failures.values()):
-                    state = "unavailable"
-                await self.status(state, detail)
-                if all_channels_ready:
-                    for channel in self.channels[:2]:
-                        await self.status(state, detail, channel_id=str(channel.get("id", "")))
+                await self._refresh_connection_status()
+                for config in self.channels[:2] if self.load_history else []:
+                    channel_id = str(config.get("id", ""))
+                    if self._channel_is_ready(channel_id):
+                        state, detail = self._channel_ready_status(channel_id)
+                        await self.status(state, detail, channel_id=channel_id)
+                    elif channel_id not in self.channel_status:
+                        await self.status(
+                            "reconnecting",
+                            "Discord configured channel is waiting for bounded history access.",
+                            channel_id=channel_id,
+                        )
             except asyncio.CancelledError:
                 raise
             except BaseException:
                 self.initializing = False
-                self.healthy = False
+                self._refresh_health()
                 raise
 
     def _author_rows(self, channel: Any, guild: Any) -> list[dict[str, str]]:
@@ -1054,7 +1438,7 @@ class _GatewayRuntime:
         recovery: bool = False,
         latest_id: object | None = None,
     ) -> bool:
-        if not self.healthy or not self.epoch or not isinstance(message, dict):
+        if not self.epoch or not isinstance(message, dict):
             return False
         if not self.connection_fresh():
             return False
@@ -1071,13 +1455,19 @@ class _GatewayRuntime:
         if not recovery and str(message.get("browser_connection_epoch", "")) != self.epoch:
             return False
         channel = self._channel_config(message.get("channel_id"))
-        if not self._allowed(message, channel):
+        if (not self._allowed(message, channel)
+                or not self._channel_is_ready(channel.get("id", ""))):
             return False
         key = _message_key(message)
-        if key in self.invalidated:
+        if key in self.invalidated or key not in self.recovery_candidates:
             return False
         current = self.latest.get(key)
-        if current is None or current.get("revision") != message.get("revision"):
+        if (current is None or current.get("revision") != message.get("revision")
+                or current.get("ingestion") != message.get("ingestion")
+                or current.get("browser_connection_epoch") != self.epoch
+                or current.get("gateway_channel_revision") != self.channel_revisions.get(key[0], 0)):
+            return False
+        if not recovery and message.get("gateway_channel_revision") != current.get("gateway_channel_revision"):
             return False
         if recovery:
             if (
@@ -1104,7 +1494,7 @@ class _GatewayRuntime:
         return True
 
     def connection_fresh(self) -> bool:
-        return bool(not self.auth_rejected and self.client is not None and self.client.is_ready() and not self.client.is_closed()
+        return bool(not self.fatal.done() and not self.auth_rejected and self.client is not None and self.client.is_ready() and not self.client.is_closed()
                     and self.last_gateway_ack is not None
                     and 0 <= time.monotonic() - self.last_gateway_ack <= _ACK_MAX_AGE_SECONDS)
 
@@ -1114,7 +1504,7 @@ class _GatewayRuntime:
             await self.status(state, detail)
             return
         if (not self.healthy and not self.initializing and not self.session_lock.locked()
-                and self.connection_fresh() and time.monotonic() >= self.channel_retry_at):
+                and self.connection_fresh() and time.monotonic() >= max(self.channel_retry_at, self.provider_retry_at)):
             await self.start_session(recovery=True)
         if self.healthy and not self.initializing:
             if self.connection_fresh():
@@ -1126,12 +1516,20 @@ class _GatewayRuntime:
                 detail = "Waiting for a current Discord gateway heartbeat acknowledgement."
             await self.status(state, detail)
             for channel in self.channels[:2] if self.load_history else []:
-                await self.status(state, detail, channel_id=str(channel["id"]))
+                channel_id = str(channel["id"])
+                channel_state, channel_detail = self._channel_ready_status(channel_id)
+                await self.status(channel_state, channel_detail, channel_id=channel_id)
         else:
             state, detail = self.connection_status
             await self.status(state, detail)
-            for channel_id, (state, detail) in list(self.channel_status.items()):
-                await self.status(state, detail, channel_id=channel_id)
+            for channel in self.channels[:2] if self.load_history else []:
+                channel_id = str(channel["id"])
+                if self._channel_is_ready(channel_id):
+                    channel_state, channel_detail = self._channel_ready_status(channel_id)
+                    await self.status(channel_state, channel_detail, channel_id=channel_id)
+                elif channel_id in self.channel_status:
+                    channel_state, channel_detail = self.channel_status[channel_id]
+                    await self.status(channel_state, channel_detail, channel_id=channel_id)
 
     async def health_loop(self) -> None:
         while True:

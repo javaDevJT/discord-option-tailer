@@ -56,10 +56,24 @@ class RuntimeStatus:
             if state == "connected":
                 row["last_seen_at"] = timestamp()
             states = [rows.get(key, {}).get("state", "starting") for key in self.channel_ids]
-            aggregate = next((candidate for candidate in ("login_required", "needs_attention", "reconnecting", "starting")
-                              if candidate in states), "connected")
-            affected = next((row for row in rows.values() if row.get("state") == aggregate), {})
-            self.value[component].update(state=aggregate, detail=affected.get("detail", ""), channels=list(rows.values()))
+            auth_state = next((candidate for candidate in ("login_required", "needs_attention") if candidate in states), None)
+            connected = states.count("connected")
+            if auth_state:
+                aggregate = auth_state
+            elif states and connected == len(states):
+                aggregate = "connected"
+            elif connected:
+                aggregate = "degraded"
+            else:
+                aggregate = next((candidate for candidate in ("unavailable", "failed", "disconnected", "reconnecting", "starting")
+                                  if candidate in states), "unknown")
+            affected = next((rows[key] for key in self.channel_ids
+                             if key in rows and rows[key].get("state") == aggregate), {})
+            detail = affected.get("detail", "")
+            if aggregate == "degraded":
+                failed = next((rows[key] for key in self.channel_ids if key in rows and rows[key].get("state") != "connected"), {})
+                detail = f"Monitoring {connected}/{len(states)} configured channels. {failed.get('detail', '')}".strip()
+            self.value[component].update(state=aggregate, detail=detail, channels=list(rows.values()))
         else:
             if (component in {"codex", "broker", "jev"}
                     and str(self.value[component].get("state", "")).lower() in AUTH_REQUIRED_STATES

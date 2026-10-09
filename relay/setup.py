@@ -659,7 +659,7 @@ class SetupManager:
         if (not self._public_channels(raw)[1]
                 or not evaluator_ready
                 or self._public_robinhood_locked(raw)["state"] != "connected"
-                or self._public_discord(raw)["state"] != "connected"):
+                or self._public_discord(raw)["state"] not in {"connected", "partial"}):
             raise RuntimeError("Connect Discord, the selected evaluator and Robinhood and save both channels before using Live.")
 
     def _evaluation_ready_locked(self, raw: dict) -> bool:
@@ -1140,11 +1140,14 @@ class SetupManager:
             except (OSError, RuntimeError, ValueError, TypeError):
                 credential = False
             source_state = str(runtime_discord.get("state", "not_connected"))
+            if source_state == "degraded" and not any(channel.get("state") == "connected" for channel in runtime_discord.get("channels", [])):
+                source_state = "reconnecting"
             if runtime.get("stale"):
                 source_state = "unavailable"
             mapped = {
                 "connected": "connected",
                 "ready": "connected",
+                "degraded": "partial",
                 "starting": "starting",
                 "connecting": "starting",
                 "reconnecting": "starting",
@@ -1161,7 +1164,7 @@ class SetupManager:
                     "Discord gateway token is not configured [gateway_token_missing]. "
                     "Save a token or select Browser."
                 )
-            elif mapped == "connected":
+            elif mapped in {"connected", "partial"}:
                 detail = self._safe_discord_runtime_detail(runtime_discord.get("detail"), "Discord gateway is connected.")
             elif mapped == "starting":
                 detail = self._safe_discord_runtime_detail(runtime_discord.get("detail"), "Discord gateway worker is reconnecting.")
@@ -1193,11 +1196,14 @@ class SetupManager:
         if not isinstance(section, dict):
             section = {}
         source_state = str(section.get("state", "not_connected"))
+        if source_state == "degraded" and not any(channel.get("state") == "connected" for channel in section.get("channels", [])):
+            source_state = "reconnecting"
         if runtime["stale"]:
             source_state = "unavailable"
         mapped = {
             "connected": "connected",
             "ready": "connected",
+            "degraded": "partial",
             "starting": "starting",
             "connecting": "starting",
             "reconnecting": "starting",
@@ -1209,6 +1215,7 @@ class SetupManager:
         }.get(source_state, "not_connected")
         details = {
             "connected": "Discord is signed in. You can return to Setup.",
+            "partial": "Discord is signed in; some configured channels are unavailable.",
             "starting": "Discord browser worker is reconnecting.",
             "not_connected": "Complete Discord sign-in and any verification in the browser.",
             "failed": "Discord browser worker needs attention.",

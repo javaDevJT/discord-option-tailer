@@ -872,7 +872,11 @@ function relayReadTimeoutSignal() {
     setText("#runtime-mode", mode.toUpperCase());
     setText("#runtime-mode-detail", `${liveEnabled ? "Live order gate flagged" : "Live order submission disabled"}${killSwitch ? " · kill switch active" : ""}`);
     setText("#runtime-discord", stateLabel(discord));
-    setText("#runtime-discord-detail", firstValue(discord?.detail, `${channelCount} configured channel${channelCount === 1 ? "" : "s"}${stale ? " · runtime stale" : ""}`));
+    const channelDetails = runtimeChannels.map((channel) => {
+      const saved = configured.find((item) => String(item.id) === String(channel.id));
+      return `${safeString(saved?.name, "Channel")}: ${stateLabel(channel)}`;
+    }).join(" · ");
+    setText("#runtime-discord-detail", [firstValue(discord?.detail, `${channelCount} configured channel${channelCount === 1 ? "" : "s"}${stale ? " · runtime stale" : ""}`), channelDetails].filter(Boolean).join(" · "));
     setText("#runtime-codex", stateLabel(codex));
     setText("#runtime-codex-detail", firstValue(codex?.detail, ledgerAvailable ? "Subscription interpreter boundary" : "Ledger unavailable"));
     setText("#runtime-broker", stateLabel(broker));
@@ -2043,6 +2047,7 @@ async function loadAccount() {
       waiting: "Waiting",
       ready: "Ready",
       connected: "Connected",
+      partial: "Partial",
       existing_connected: "Connected",
       failed: "Failed",
       cancelled: "Cancelled",
@@ -2070,7 +2075,7 @@ async function loadAccount() {
     const stateName = setupStateName(value);
     if (["connected", "existing_connected", "configured", "enabled", "sent"].includes(stateName)) return "is-order";
     if (["failed", "error", "unavailable", "needs_attention", "auth_error"].includes(stateName)) return "is-error";
-    if (["starting", "waiting", "paused", "stopped", "pending_reload", "pending"].includes(stateName)) return "is-held";
+    if (["partial", "starting", "waiting", "paused", "stopped", "pending_reload", "pending"].includes(stateName)) return "is-held";
     return "is-context";
   };
   const setupDetail = (part, fallback) => {
@@ -2096,7 +2101,7 @@ async function loadAccount() {
     };
   };
   const setupTradingModeLabel = (mode) => ({ shadow: "Shadow", live: "Live", paper: "Paper" }[mode] || setupText(mode, "Unknown"));
-  const setupLiveReady = (status) => status?.configured === true && setupStatusValue(setupPart(status, "discord")) === "connected";
+  const setupLiveReady = (status) => status?.configured === true && ["connected", "partial"].includes(setupStatusValue(setupPart(status, "discord")));
   const setupTradingExplanation = (mode) => {
     if (mode === "live") return "Live can send real Robinhood orders.";
     if (mode === "shadow") return "Shadow records proposed orders and never sends them.";
@@ -2406,7 +2411,7 @@ async function loadAccount() {
   };
   const setupMaybeAutoDiscover = (status) => {
     const discordState = setupStatusValue(setupPart(status, "discord"));
-    if (!["connected", "existing_connected"].includes(discordState)) {
+    if (!["connected", "existing_connected", "partial"].includes(discordState)) {
       setupState.discoveryAutoAttempted = false;
       return;
     }

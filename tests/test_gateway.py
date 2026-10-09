@@ -210,11 +210,12 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         normalizer_patch.start()
         self.addCleanup(normalizer_patch.stop)
         runtime = gateway._GatewayRuntime(_config(), None, None, None)
-        runtime.healthy = True
         runtime.epoch = "gateway:fixture"
         runtime.client = FakeClient()
         runtime.client.started.set()
         runtime.last_gateway_ack = time.monotonic()
+        runtime._mark_channel_ready(CHANNEL_SIGNALS)
+        runtime.healthy = True
         return runtime
 
     def _signal_message(self, identifier, description, *, edited_at=None, attachments=None):
@@ -381,6 +382,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         runtime.client = FakeClient()
         runtime.client.started.set()
         runtime.last_gateway_ack = time.monotonic()
+        runtime._mark_channel_ready(CHANNEL_SIGNALS)
         channel = FakeChannel(CHANNEL_SIGNALS)
         await runtime.observe(FakeMessage("500000000000000041", channel))
         original = await runtime.queue.get()
@@ -431,8 +433,11 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         with patch("relay.gateway.discord_delay", return_value=0):
             await runtime.start_session()
             self.assertFalse(runtime.healthy)
-            self.assertFalse(any(e["state"] == "connected" for e in events))
-            self.assertEqual(runtime.client.channels[CHANNEL_SIGNALS].history_calls, [])
+            self.assertTrue(any(e["state"] == "connected" and e.get("channel_id") == CHANNEL_SIGNALS
+                                for e in events))
+            self.assertFalse(any(e["state"] == "connected" and e.get("channel_id") == CHANNEL_CONTEXT
+                                 for e in events))
+            self.assertEqual(len(runtime.client.channels[CHANNEL_SIGNALS].history_calls), 1)
             runtime.client.channels[CHANNEL_CONTEXT] = channel
             runtime.channel_retry_at = 0
             await runtime.report_health()
@@ -441,6 +446,330 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(channel.history_calls), 1)
         self.assertEqual(len(runtime.client.channels[CHANNEL_SIGNALS].history_calls), 1)
         self.assertEqual(runtime.connection_status[0], "connected")
+
+    async def test_cached_sibling_bootstraps_before_slow_missing_channel_lookup(self):
+        runtime, _events = self._cache_recovery_runtime()
+        context_channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(context_channel)
+        lookup_started = asyncio.Event()
+        release_lookup = asyncio.Event()
+
+        async def fetch(identifier):
+            self.assertEqual(identifier, int(CHANNEL_CONTEXT))
+            lookup_started.set()
+            await release_lookup.wait()
+            return context_channel
+
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            start = asyncio.create_task(runtime.start_session())
+            try:
+                await asyncio.wait_for(lookup_started.wait(), timeout=1)
+                self.assertEqual(len(runtime.client.channels[CHANNEL_SIGNALS].history_calls), 1)
+                self.assertTrue(runtime._channel_is_ready(CHANNEL_SIGNALS))
+                self.assertFalse(runtime._channel_is_ready(CHANNEL_CONTEXT))
+            finally:
+                release_lookup.set()
+            await asyncio.wait_for(start, timeout=1)
+        self.assertTrue(runtime.healthy)
+
+    async def test_relevant_channel_permission_update_rechecks_only_blocked_channel(self):
+        runtime, _events = self._cache_recovery_runtime()
+        runtime.bind_events()
+        calls = {CHANNEL_SIGNALS: 0, CHANNEL_CONTEXT: 0}
+
+        class Forbidden(Exception):
+            status = 403
+
+        async def history(channel):
+            channel_id = str(channel.id)
+            calls[channel_id] += 1
+            if channel_id == CHANNEL_CONTEXT and calls[channel_id] == 1:
+                raise Forbidden("private provider response")
+            return []
+
+        role_id = "400000000000000099"
+        before = SimpleNamespace(
+            id=CHANNEL_CONTEXT,
+            category_id=None,
+            permissions_synced=False,
+            _overwrites=[SimpleNamespace(id=role_id, allow=0, deny=1, type=0)],
+        )
+        irrelevant = SimpleNamespace(
+            id=CHANNEL_CONTEXT,
+            category_id=None,
+            permissions_synced=False,
+            _overwrites=[SimpleNamespace(id=role_id, allow=0, deny=1, type=0)],
+        )
+        changed = SimpleNamespace(
+            id=CHANNEL_CONTEXT,
+            category_id=None,
+            permissions_synced=False,
+            _overwrites=[SimpleNamespace(id=role_id, allow=1, deny=0, type=0)],
+        )
+        with patch("relay.gateway.discord_delay", return_value=0), patch.object(runtime, "_history", side_effect=history):
+            await runtime.start_session()
+            epoch, generation = runtime.epoch, runtime.generation
+            signal_history_calls = len(runtime.client.channels[CHANNEL_SIGNALS].history_calls)
+            await runtime.client.callbacks["on_guild_channel_update"](before, irrelevant)
+            self.assertFalse(runtime._channel_is_ready(CHANNEL_CONTEXT))
+            self.assertEqual(calls[CHANNEL_CONTEXT], 1)
+            await runtime.client.callbacks["on_guild_channel_update"](before, changed)
+
+        self.assertTrue(runtime._channel_is_ready(CHANNEL_CONTEXT))
+        self.assertEqual(runtime.epoch, epoch)
+        self.assertEqual(runtime.generation, generation)
+        self.assertEqual(calls[CHANNEL_CONTEXT], 2)
+        self.assertEqual(len(runtime.client.channels[CHANNEL_SIGNALS].history_calls), signal_history_calls)
+
+        live = FakeMessage("500000000000000210", runtime.client.channels[CHANNEL_CONTEXT])
+        await runtime.observe(live)
+        row = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(row["ingestion"], "live")
+        self.assertTrue(await runtime.verify(row))
+
+    async def test_self_member_role_change_or_relevant_guild_role_update_rechecks_403(self):
+        for trigger in ("member", "role"):
+            with self.subTest(trigger=trigger):
+                runtime, _events = self._cache_recovery_runtime()
+                runtime.bind_events()
+                role_id = "400000000000000098"
+                context_channel = runtime.client.channels[CHANNEL_CONTEXT]
+                context_channel._overwrites = [
+                    SimpleNamespace(id=role_id, allow=0, deny=1, type=0)
+                ]
+                runtime.client.user = SimpleNamespace(id=AUTHOR)
+                runtime.client.guilds[0].me = SimpleNamespace(roles=[SimpleNamespace(id=role_id)])
+                calls = {CHANNEL_SIGNALS: 0, CHANNEL_CONTEXT: 0}
+
+                class Forbidden(Exception):
+                    status = 403
+
+                async def history(channel):
+                    channel_id = str(channel.id)
+                    calls[channel_id] += 1
+                    if channel_id == CHANNEL_CONTEXT and calls[channel_id] == 1:
+                        raise Forbidden("private provider response")
+                    return []
+
+                with patch("relay.gateway.discord_delay", return_value=0), patch.object(runtime, "_history", side_effect=history):
+                    await runtime.start_session()
+                    epoch, generation = runtime.epoch, runtime.generation
+                    if trigger == "member":
+                        before = SimpleNamespace(id=AUTHOR, guild_id=GUILD, roles=[])
+                        after = SimpleNamespace(
+                            id=AUTHOR,
+                            guild_id=GUILD,
+                            roles=[SimpleNamespace(id=role_id)],
+                        )
+                        await runtime.client.callbacks["on_member_update"](before, after)
+                    else:
+                        guild = SimpleNamespace(id=GUILD)
+                        before = SimpleNamespace(
+                            id=role_id,
+                            guild=guild,
+                            permissions=SimpleNamespace(
+                                administrator=False, view_channel=False,
+                                read_messages=False, read_message_history=False,
+                            ),
+                        )
+                        after = SimpleNamespace(
+                            id=role_id,
+                            guild=guild,
+                            permissions=SimpleNamespace(
+                                administrator=False, view_channel=True,
+                                read_messages=True, read_message_history=False,
+                            ),
+                        )
+                        await runtime.client.callbacks["on_guild_role_update"](before, after)
+
+                self.assertTrue(runtime._channel_is_ready(CHANNEL_SIGNALS))
+                self.assertTrue(runtime._channel_is_ready(CHANNEL_CONTEXT))
+                self.assertEqual(runtime.epoch, epoch)
+                self.assertEqual(runtime.generation, generation)
+                self.assertEqual(calls[CHANNEL_SIGNALS], 1)
+                self.assertEqual(calls[CHANNEL_CONTEXT], 2)
+
+    async def test_history_denial_keeps_readable_sibling_live_and_excludes_unready_watermark(self):
+        runtime, _events = self._cache_recovery_runtime()
+
+        class Forbidden(Exception):
+            status = 403
+
+        async def history(channel):
+            if str(channel.id) == CHANNEL_CONTEXT:
+                raise Forbidden("private provider response")
+            return []
+
+        with patch("relay.gateway.discord_delay", return_value=0), patch.object(runtime, "_history", side_effect=history):
+            await runtime.start_session()
+
+        self.assertFalse(runtime.healthy)
+        self.assertTrue(runtime._channel_is_ready(CHANNEL_SIGNALS))
+        self.assertFalse(runtime._channel_is_ready(CHANNEL_CONTEXT))
+        live_channel = runtime.client.channels[CHANNEL_SIGNALS]
+        live = FakeMessage("500000000000000100", live_channel)
+        await runtime.observe(live)
+        live_row = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(live_row["ingestion"], "live")
+        self.assertTrue(await runtime.verify(live_row))
+
+        denied = FakeMessage("500000000000000999", runtime.client.channels[CHANNEL_CONTEXT])
+        await runtime.observe(denied)
+        denied_row = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(denied_row["ingestion"], "baseline")
+        self.assertFalse(await runtime.verify(denied_row))
+        self.assertEqual(runtime.latest_by_group["primary"]["channel_id"], CHANNEL_SIGNALS)
+        self.assertEqual(runtime.channel_failure_details[CHANNEL_CONTEXT], ("history", 403))
+
+    async def test_partial_retries_preserve_epoch_generation_and_ready_channel_history(self):
+        runtime, _events = self._cache_recovery_runtime()
+
+        class Forbidden(Exception):
+            status = 403
+
+        async def history(channel):
+            if str(channel.id) == CHANNEL_CONTEXT:
+                raise Forbidden("private provider response")
+            return []
+
+        with patch("relay.gateway.discord_delay", return_value=0), patch.object(runtime, "_history", side_effect=history):
+            await runtime.start_session()
+            epoch, generation = runtime.epoch, runtime.generation
+            signal_channel = runtime.client.channels[CHANNEL_SIGNALS]
+            signal_history_calls = len(signal_channel.history_calls)
+            for index in range(2):
+                runtime.channel_retry_at = 0
+                await runtime.report_health()
+                self.assertEqual(runtime.epoch, epoch)
+                self.assertEqual(runtime.generation, generation)
+                self.assertEqual(len(signal_channel.history_calls), signal_history_calls)
+                live = FakeMessage(f"50000000000000010{index}", signal_channel)
+                await runtime.observe(live)
+                row = await runtime.queue.get()
+                runtime.queue.task_done()
+                self.assertEqual(row["ingestion"], "live")
+                self.assertTrue(await runtime.verify(row))
+
+    async def test_late_channel_recovery_delivers_context_baseline_then_verifies_new_live(self):
+        runtime, _events = self._cache_recovery_runtime()
+        context_channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(context_channel)
+        baseline = FakeMessage("500000000000000200", context_channel, content="old context")
+        context_channel._history_items = [baseline]
+        delivered = []
+        runtime.on_message = delivered.append
+        delivery = asyncio.create_task(runtime.delivery_loop())
+        try:
+            with patch("relay.gateway.discord_delay", return_value=0):
+                await runtime.start_session()
+                self.assertTrue(runtime._channel_is_ready(CHANNEL_SIGNALS))
+                signal_history_calls = len(runtime.client.channels[CHANNEL_SIGNALS].history_calls)
+                runtime.client.channels[CHANNEL_CONTEXT] = context_channel
+                runtime.channel_retry_at = 0
+                await runtime.report_health()
+            self.assertTrue(runtime._channel_is_ready(CHANNEL_CONTEXT))
+            self.assertEqual(len(runtime.client.channels[CHANNEL_SIGNALS].history_calls), signal_history_calls)
+            self.assertEqual(delivered[0]["channel_id"], CHANNEL_CONTEXT)
+            self.assertEqual(delivered[0]["ingestion"], "baseline")
+            self.assertFalse(await runtime.verify(delivered[0]))
+
+            live = FakeMessage("500000000000000201", context_channel, content="new context")
+            await runtime.observe(live)
+            await runtime.queue.join()
+            self.assertEqual(delivered[-1]["ingestion"], "live")
+            self.assertTrue(await runtime.verify(delivered[-1]))
+        finally:
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+
+    async def test_channel_delete_invalidates_only_that_channels_readiness(self):
+        runtime, _events = self._cache_recovery_runtime()
+        runtime.channels_by_id[CHANNEL_SIGNALS]["source_group"] = "signals"
+        runtime.channels_by_id[CHANNEL_CONTEXT]["source_group"] = "context"
+        runtime.bind_events()
+        await runtime.start_session()
+        signal = FakeMessage("500000000000000302", runtime.client.channels[CHANNEL_SIGNALS])
+        await runtime.observe(signal)
+        signal_row = await runtime.queue.get()
+        runtime.queue.task_done()
+        context = FakeMessage("500000000000000301", runtime.client.channels[CHANNEL_CONTEXT])
+        await runtime.observe(context)
+        context_row = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertTrue(await runtime.verify(signal_row))
+        self.assertTrue(await runtime.verify(context_row))
+
+        await runtime.client.callbacks["on_guild_channel_delete"](runtime.client.channels[CHANNEL_CONTEXT])
+        self.assertTrue(runtime._channel_is_ready(CHANNEL_SIGNALS))
+        self.assertFalse(runtime._channel_is_ready(CHANNEL_CONTEXT))
+        self.assertFalse(runtime.healthy)
+        self.assertFalse(await runtime.verify(context_row))
+        self.assertTrue(await runtime.verify(signal_row))
+
+        # Same-ID redelivery after restoration must not revive an old queued
+        # observation from the earlier channel-readiness revision.
+        epoch = runtime.epoch
+        await runtime.client.callbacks["on_guild_channel_create"](runtime.client.channels[CHANNEL_CONTEXT])
+        await runtime.start_session(recovery=True)
+        await runtime.observe(context)
+        restored_row = await runtime.queue.get()
+        runtime.queue.task_done()
+        self.assertEqual(runtime.epoch, epoch)
+        self.assertTrue(await runtime.verify(restored_row))
+        self.assertFalse(await runtime.verify(context_row))
+        self.assertTrue(await runtime.verify(signal_row))
+
+    async def test_fatal_completion_immediately_blocks_ready_source_verification(self):
+        runtime = self._ready_runtime()
+        row = await self._live_signal(runtime, FakeMessage("500000000000000320", FakeChannel(CHANNEL_SIGNALS)))
+        runtime.fatal.set_result(None)
+        self.assertFalse(runtime.connection_fresh())
+        self.assertFalse(await runtime.verify(row))
+
+    async def test_access_metadata_and_reconnect_preserve_provider_retry_after(self):
+        runtime, _events = self._cache_recovery_runtime()
+        runtime.channels_by_id[CHANNEL_SIGNALS]["source_group"] = "signals"
+        runtime.channels_by_id[CHANNEL_CONTEXT]["source_group"] = "context"
+        runtime.bind_events()
+        await runtime.start_session()
+        signal_row = await self._live_signal(runtime, FakeMessage("500000000000000321", runtime.client.channels[CHANNEL_SIGNALS]))
+        runtime._clear_channel_readiness(CHANNEL_CONTEXT)
+        await runtime._channel_error(CHANNEL_CONTEXT, "channel_permission_denied", stage="history", http_status=403)
+        deadline = runtime.provider_retry_at = time.monotonic() + 120
+        calls = sum(len(channel.history_calls) for channel in runtime.client.channels.values())
+        before = SimpleNamespace(id=CHANNEL_CONTEXT, category_id=None, permissions_synced=False, _overwrites=[])
+        after = SimpleNamespace(id=CHANNEL_CONTEXT, category_id="changed", permissions_synced=False, _overwrites=[])
+        await runtime.client.callbacks["on_guild_channel_update"](before, after)
+        runtime.channel_failures[CHANNEL_CONTEXT] = "channel_not_found"
+        await runtime.client.callbacks["on_guild_channel_create"](runtime.client.channels[CHANNEL_CONTEXT])
+        await runtime.report_health()
+        await runtime.start_session(recovery=True)
+        self.assertEqual(runtime.provider_retry_at, deadline)
+        self.assertEqual(sum(len(channel.history_calls) for channel in runtime.client.channels.values()), calls)
+        self.assertTrue(await runtime.verify(signal_row))
+        epoch = runtime.epoch
+        await runtime.client.callbacks["on_disconnect"]()
+        await runtime.start_session()
+        self.assertNotEqual(runtime.epoch, epoch)
+        self.assertEqual(runtime.provider_retry_at, deadline)
+        self.assertEqual(sum(len(channel.history_calls) for channel in runtime.client.channels.values()), calls)
+        runtime.provider_retry_at = 0  # Simulate provider deadline expiry.
+        await runtime.start_session()
+        self.assertTrue(runtime.healthy)
+
+    async def test_disconnect_clears_all_channel_readiness(self):
+        runtime, _events = self._cache_recovery_runtime()
+        runtime.bind_events()
+        await runtime.start_session()
+        self.assertTrue(runtime._channel_is_ready(CHANNEL_SIGNALS))
+        self.assertTrue(runtime._channel_is_ready(CHANNEL_CONTEXT))
+        await runtime.client.callbacks["on_disconnect"]()
+        self.assertFalse(runtime._channel_is_ready(CHANNEL_SIGNALS))
+        self.assertFalse(runtime._channel_is_ready(CHANNEL_CONTEXT))
 
     async def test_uncached_channel_is_fetched_by_exact_id_and_history_is_baseline(self):
         runtime, events = self._cache_recovery_runtime()
@@ -474,7 +803,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         with patch("relay.gateway.discord_delay", return_value=0):
             await runtime.start_session()
             self.assertFalse(runtime.healthy)
-            self.assertEqual(channels[CHANNEL_SIGNALS].history_calls, [])
+            self.assertEqual(len(channels[CHANNEL_SIGNALS].history_calls), 1)
             runtime.channel_retry_at = 0
             await runtime.report_health()
         self.assertTrue(runtime.healthy)
@@ -503,6 +832,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(e["state"] == "login_required" for e in events))
         self.assertNotIn("secret token", str(events))
         self.assertIn("channel_permission_denied", runtime.connection_status[1])
+        self.assertEqual(runtime.channel_failure_details[CHANNEL_CONTEXT], ("lookup", 403))
+        self.assertIn("stage=lookup HTTP 403", runtime.channel_status[CHANNEL_CONTEXT][1])
 
     async def test_channel_401_stops_resolution_with_safe_reauth_error(self):
         runtime, _ = self._cache_recovery_runtime()
@@ -589,8 +920,12 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, [int(CHANNEL_SIGNALS)])
             await runtime.report_health()
             self.assertEqual(len(calls), 1)
+            runtime.channel_retry_at = 0
+            await runtime.report_health()
+            self.assertEqual(len(calls), 1)
             for _ in range(8):
                 runtime.channel_retry_at = 0
+                runtime.provider_retry_at = 0  # Simulate elapsed Retry-After.
                 await runtime.report_health()
         self.assertEqual(len(calls), 2 * gateway._CHANNEL_FETCH_ATTEMPTS)
         self.assertFalse(runtime.healthy)
@@ -647,9 +982,75 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             runtime.channel_retry_at = 0
             await runtime.report_health()
         self.assertFalse(runtime.healthy)
-        self.assertEqual(loader.await_count, 1)
+        self.assertEqual(loader.await_count, 2)
         self.assertEqual(runtime.channel_failures[CHANNEL_SIGNALS], "channel_permission_denied")
         self.assertFalse(any(e["state"] == "login_required" for e in events))
+        self.assertEqual(runtime.channel_failure_details[CHANNEL_SIGNALS], ("history", 403))
+        self.assertIn("stage=history HTTP 403", runtime.channel_status[CHANNEL_SIGNALS][1])
+
+    async def test_cached_permission_denial_is_not_authoritative_when_read_succeeds(self):
+        runtime, events = self._cache_recovery_runtime()
+        runtime.client.user = SimpleNamespace(id=AUTHOR)
+        for channel in runtime.client.channels.values():
+            channel.guild = SimpleNamespace(id=GUILD, me=SimpleNamespace(id=AUTHOR))
+            channel.permissions_for = lambda member: SimpleNamespace(view_channel=False, read_messages=False)
+            self.assertFalse(runtime._readable(channel))
+            self.assertIsNone(runtime._channel_problem(_config()["channels"][0 if channel.id == CHANNEL_SIGNALS else 1], channel))
+        with patch("relay.gateway.discord_delay", return_value=0), self.assertLogs("relay.gateway", level="WARNING") as logs:
+            await runtime.start_session()
+        self.assertTrue(runtime.healthy)
+        self.assertTrue(any(e["state"] == "connected" for e in events))
+        self.assertTrue(all(len(c.history_calls) == 1 for c in runtime.client.channels.values()))
+        self.assertIn("cached permissions deny", str(logs.output))
+
+    async def test_exhausted_lookup_retains_last_authoritative_operation_status(self):
+        runtime, _ = self._cache_recovery_runtime()
+        channel = runtime.client.channels.pop(CHANNEL_CONTEXT)
+        runtime.client.guilds[0].channels.remove(channel)
+        class ServerError(Exception):
+            status = 500
+        calls = []
+        async def fetch(identifier):
+            calls.append(identifier)
+            raise ServerError("private provider response")
+        runtime.client.fetch_channel = fetch
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+            for _ in range(3):
+                runtime.channel_retry_at = 0
+                await runtime.report_health()
+        self.assertFalse(runtime.healthy)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(runtime.channel_failures[CHANNEL_CONTEXT], "channel_lookup_exhausted")
+        self.assertEqual(runtime.channel_failure_details[CHANNEL_CONTEXT], ("lookup", 500))
+        self.assertIn("stage=lookup HTTP 500", runtime.channel_status[CHANNEL_CONTEXT][1])
+        self.assertNotIn("private provider response", runtime.channel_status[CHANNEL_CONTEXT][1])
+
+    async def test_cached_denial_still_blocks_when_authoritative_read_returns_403(self):
+        runtime, events = self._cache_recovery_runtime()
+        runtime.client.user = SimpleNamespace(id=AUTHOR)
+        channel = runtime.client.channels[CHANNEL_SIGNALS]
+        channel.guild = SimpleNamespace(id=GUILD, me=SimpleNamespace(id=AUTHOR))
+        channel.permissions_for = lambda member: SimpleNamespace(view_channel=False, read_messages=False)
+        class Forbidden(Exception):
+            status = 403
+        calls = []
+        def denied_history(**kwargs):
+            calls.append(kwargs)
+            raise Forbidden("private response and credential")
+        channel.history = denied_history
+        with patch("relay.gateway.discord_delay", return_value=0):
+            await runtime.start_session()
+            runtime.channel_retry_at = 0
+            await runtime.report_health()
+        self.assertFalse(runtime.healthy)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runtime.channel_failure_details[CHANNEL_SIGNALS], ("history", 403))
+        self.assertFalse(any(e["state"] == "login_required" for e in events))
+        self.assertTrue(any(e["state"] == "connected" and e.get("channel_id") == CHANNEL_CONTEXT
+                            for e in events))
+        self.assertNotIn("private response", str(events))
+        self.assertIn("stage=history HTTP 403", runtime.channel_status[CHANNEL_SIGNALS][1])
 
     async def test_full_history_larger_than_queue_is_delivered_without_replay(self):
         delivered = []
@@ -706,6 +1107,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             runtime.client = FakeClient()
             runtime.client.started.set()
             runtime.healthy, runtime.epoch = True, "gateway:fixture"
+            runtime.last_gateway_ack = time.monotonic()
+            runtime._mark_channel_ready(CHANNEL_SIGNALS)
+            runtime._mark_channel_ready(CHANNEL_CONTEXT)
             runtime.bind_events()
             with patch("relay.service.timestamp", return_value="2020-01-01T00:00:00+00:00"):
                 status.write()
@@ -755,6 +1159,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         runtime.client.started.set()
         runtime.last_gateway_ack = time.monotonic()
         channel = FakeChannel(CHANNEL_SIGNALS)
+        runtime._mark_channel_ready(CHANNEL_SIGNALS)
+        runtime._mark_channel_ready(CHANNEL_CONTEXT)
         await runtime.observe(FakeMessage("500000000000000002", channel), kind="baseline", reason="baseline")
         runtime.healthy = True
         for identifier in ("500000000000000001", "500000000000000002"):
@@ -778,6 +1184,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             runtime.client.started.set()
             runtime.last_gateway_ack = time.monotonic()
             channel = FakeChannel(CHANNEL_SIGNALS)
+            runtime._mark_channel_ready(CHANNEL_SIGNALS)
             await runtime.observe(FakeMessage(identifier, channel), kind="baseline", reason="baseline")
             row = await runtime.queue.get()
             runtime.queue.task_done()

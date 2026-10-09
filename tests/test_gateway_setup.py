@@ -83,6 +83,41 @@ class GatewaySetupTests(unittest.TestCase):
         self.manager.save_discord({"transport": "gateway", "token": "   "})
         self.assertEqual(token_path.read_bytes(), before)
 
+    def test_partial_channel_monitoring_is_not_reported_as_missing_login(self) -> None:
+        from relay.service import RuntimeStatus
+        self.manager.save_discord({"transport": "gateway", "token": "synthetic-token"})
+        channels = json.loads(self.config.read_text())["channels"]
+        runtime = RuntimeStatus(self.root / "state/runtime-status.json", channels)
+        runtime.ready = True
+        runtime.event({"component": "discord", "channel_id": channels[0]["id"], "state": "unavailable",
+                       "detail": "Channel is unavailable [stage=history HTTP 403]."})
+        runtime.event({"component": "discord", "channel_id": channels[1]["id"], "state": "connected"})
+        result = self.manager.status()["discord"]
+        self.assertEqual(result["state"], "partial")
+        self.assertTrue(result["credential_configured"])
+        self.assertIn("Monitoring 1/2", result["detail"])
+        self.assertIn("HTTP 403", result["detail"])
+        self.assertNotIn("synthetic-token", json.dumps(result))
+        raw = json.loads(self.config.read_text())
+        with patch.object(self.manager, "_public_channels", return_value=([], True, "")), \
+                patch.object(self.manager, "_evaluation_ready_locked", return_value=True), \
+                patch.object(self.manager, "_public_robinhood_locked", return_value={"state": "connected"}):
+            self.manager._require_live_ready_locked(raw)
+
+    def test_degraded_status_without_a_connected_channel_cannot_enable_live(self) -> None:
+        self.manager.save_discord({"transport": "gateway", "token": "synthetic-token"})
+        from relay.service import RuntimeStatus
+        raw = json.loads(self.config.read_text())
+        runtime = RuntimeStatus(self.root / "state/runtime-status.json", raw["channels"])
+        runtime.value["discord"]["state"] = "degraded"
+        runtime.write()
+        self.assertEqual(self.manager.status()["discord"]["state"], "starting")
+        with patch.object(self.manager, "_public_channels", return_value=([], True, "")), \
+                patch.object(self.manager, "_evaluation_ready_locked", return_value=True), \
+                patch.object(self.manager, "_public_robinhood_locked", return_value={"state": "connected"}):
+            with self.assertRaises(RuntimeError):
+                self.manager._require_live_ready_locked(raw)
+
     def test_gateway_post_is_csrf_and_same_origin_protected(self) -> None:
         app = DashboardApp(self.config, enable_setup=True)
         try:

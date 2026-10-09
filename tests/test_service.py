@@ -47,6 +47,21 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Hold):
             load_config(path, allow_unbound=True)
 
+    def test_unavailable_channel_is_visible_without_hiding_connected_channel(self):
+        self.status.ready = True
+        first, second = self.config["channels"]
+        self.status.event({"component": "discord", "channel_id": first["id"], "state": "unavailable",
+                           "detail": "Channel read failed [stage=history HTTP 403]."})
+        self.status.event({"component": "discord", "channel_id": second["id"], "state": "connected"})
+        snapshot = json.loads(self.status.path.read_text())
+        self.assertEqual(snapshot["discord"]["state"], "degraded")
+        self.assertIn("Monitoring 1/2", snapshot["discord"]["detail"])
+        self.assertIn("HTTP 403", snapshot["discord"]["detail"])
+        self.assertEqual({row["id"]: row["state"] for row in snapshot["discord"]["channels"]},
+                         {first["id"]: "unavailable", second["id"]: "connected"})
+        self.status.event({"component": "discord", "channel_id": second["id"], "state": "unavailable"})
+        self.assertEqual(self.status.value["discord"]["state"], "unavailable")
+
     def test_session_classification_and_private_status(self):
         channel = self.config["channels"][0]
         url = f"https://discord.com/channels/{channel['guild_id']}/{channel['id']}"
