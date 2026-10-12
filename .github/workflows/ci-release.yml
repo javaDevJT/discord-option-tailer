@@ -12,6 +12,7 @@ permissions:
   contents: read
 
 env:
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: "1"
   IMAGE_NAME: ghcr.io/javadevjt/discord-option-tailer
 
 jobs:
@@ -242,4 +243,4 @@ jobs:
             ${{ runner.temp }}/container-security/build-1/release-tags.txt
             ${{ runner.temp }}/container-security/build-1/published-digests.txt
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 1
