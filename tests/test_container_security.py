@@ -265,7 +265,7 @@ class ContainerSecurityTests(unittest.TestCase):
         self.assertIn("      packages: read\n", build)
         self.assertNotIn("packages: write", build)
         self.assertIn("    needs: [test, build]\n", publication_job)
-        self.assertIn("    runs-on: ubuntu-latest\n", publication_job)
+        self.assertIn("    runs-on: truenas-discord-option-tailer-storage-11g\n", publication_job)
         self.assertNotRegex(publication_job, r"(?m)^    (if|continue-on-error):")
         self.assertNotIn("continue-on-error:", workflow)
         self.assertNotIn("ci-storage-efficiency", workflow)
@@ -274,7 +274,11 @@ class ContainerSecurityTests(unittest.TestCase):
         names = re.findall(r"^      - name: (.+)$", build, re.MULTILINE)
         self.assertLess(names.index("Build local image archive"), names.index("Generate SBOM and enforce High/Critical vulnerability gate"))
         self.assertLess(names.index("Generate SBOM and enforce High/Critical vulnerability gate"), names.index("Retain scanned candidate for gated publication"))
-        self.assertEqual(build.count("${{ steps.container_security_1.outputs.archive }}"), 2)
+        scan_step = build.split("      - name: Generate SBOM and enforce High/Critical vulnerability gate\n", 1)[1].split("      - name:", 1)[0]
+        candidate_step = build.split("      - name: Retain scanned candidate for gated publication\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("archive: ${{ steps.container_security_1.outputs.archive }}", scan_step)
+        self.assertIn("${{ steps.container_security_1.outputs.archive }}", candidate_step)
+        self.assertLess(names.index("Retain scanned candidate for gated publication"), names.index("Remove local OCI candidate and registry credentials"))
         self.assertIn("candidate_artifact_id: ${{ steps.candidate.outputs.artifact-id }}", build)
         self.assertIn("artifact-ids: ${{ needs.build.outputs.candidate_artifact_id }}", publication_steps)
         self.assertIn("digest-mismatch: error", publication_steps)

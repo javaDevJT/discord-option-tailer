@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from relay.broker import BrokerError, BrokerPreflightHold, RobinhoodMCP
+from relay.broker import BrokerError, BrokerPreflightHold, RobinhoodBroker, RobinhoodMCP
 from relay.core import Engine, Hold, Store
 from relay.status import configure_execution_log, execution_check, execution_failure, log_execution, project_dispatch_checks
 from relay.dashboard import _project_decision
@@ -253,6 +253,85 @@ class ExecutionDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("execution_diagnostic", recovered)
         self.assertNotIn("private provider body", json.dumps(recovered))
+
+    async def test_snapshot_schema_rejection_retains_metadata_and_immutable_private_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker = RobinhoodBroker({"robinhood": {"account_number": "TEST0001", "token_store": str(Path(directory) / "oauth.json")}})
+            tools = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+            tool = tools["get_portfolio"]
+            tool["inputSchema"]["properties"]["account_number"]["type"] = "integer"
+            tool["access_token"] = "private-token"
+            broker.catalog = {"get_portfolio": tool}
+
+            async def incompatible_snapshot():
+                broker._qualified("get_portfolio")
+
+            self.fixture.broker.snapshot = incompatible_snapshot
+            with self.assertLogs("relay.status", level="ERROR"):
+                result = await self.fixture.engine.handle(self.fixture.message())
+            self.assertEqual(result["state"], "error")
+            saved = json.loads(self.fixture.store.db.execute("SELECT decision FROM events ORDER BY id DESC LIMIT 1").fetchone()[0])
+            diagnostic = saved["execution_diagnostic"]
+            digest = broker._schema_digest(tool)
+            self.assertEqual(diagnostic["schema_check"], "catalog")
+            self.assertEqual(diagnostic["schema_reason"], "contract_changed")
+            self.assertEqual(diagnostic["schema_digest"], digest)
+            self.assertEqual(_project_decision(saved)["execution_diagnostic"], diagnostic)
+            self.assertIn("schema_check=catalog", result["reason"])
+            self.assertNotIn("private-token", json.dumps(saved) + result["reason"])
+            self.assertEqual(self.fixture.broker.submissions, [])
+
+            archive = Path(directory) / "robinhood-schema-rejections"
+            retained = archive / f"get_portfolio-{digest}.json"
+            initial = retained.read_bytes()
+            self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o600)
+            metadata = json.loads(initial)
+            self.assertEqual(set(metadata), {"name", "schema_digest", "observed_at", "inputSchema", "outputSchema"})
+            self.assertNotIn("private-token", initial.decode())
+            with self.assertRaises(BrokerError):
+                broker._qualified("get_portfolio")
+            self.assertEqual(retained.read_bytes(), initial)
+            self.assertEqual(len(list(archive.iterdir())), 1)
+
+    def test_schema_diagnostics_discard_untrusted_values(self):
+        projected = _project_decision({"execution_diagnostic": {
+            "schema_check": "private-token", "schema_reason": "provider-body-private",
+            "schema_digest": "Bearer private-token", "schema": {"private": "provider response"},
+        }})
+        self.assertEqual(projected["execution_diagnostic"], {"frames": []})
+
+    def test_rejection_archive_failure_preserves_schema_error(self):
+        broker = RobinhoodBroker({"robinhood": {"account_number": "TEST0001", "token_store": str(Path(self.fixture.temp.name) / "oauth.json")}})
+        tools = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+        tool = tools["get_portfolio"]
+        tool["inputSchema"]["properties"]["account_number"]["type"] = "integer"
+        broker.catalog = {"get_portfolio": tool}
+        with patch("relay.broker.tempfile.mkstemp", side_effect=OSError("private path")), self.assertRaises(BrokerError) as raised:
+            broker._qualified("get_portfolio")
+        self.assertEqual(raised.exception._relay_failure["schema_check"], "catalog")
+        self.assertEqual(raised.exception._relay_failure["schema_reason"], "contract_changed")
+
+    def test_existing_rejection_directory_is_private_and_symlinks_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker = RobinhoodBroker({"robinhood": {"account_number": "TEST0001", "token_store": str(Path(directory) / "oauth.json")}})
+            tools = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+            tool = tools["get_portfolio"]
+            archive = Path(directory) / "robinhood-schema-rejections"
+            archive.mkdir()
+            archive.chmod(0o777)
+            broker._retain_rejected_schema(tool)
+            self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o700)
+            self.assertEqual(len(list(archive.iterdir())), 1)
+
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as target:
+            broker = RobinhoodBroker({"robinhood": {"account_number": "TEST0001", "token_store": str(Path(directory) / "oauth.json")}})
+            archive = Path(directory) / "robinhood-schema-rejections"
+            archive.symlink_to(target, target_is_directory=True)
+            mode = stat.S_IMODE(Path(target).stat().st_mode)
+            broker._retain_rejected_schema(tool)
+            self.assertEqual(list(Path(target).iterdir()), [])
+            self.assertEqual(stat.S_IMODE(Path(target).stat().st_mode), mode)
 
     async def test_logging_failure_does_not_replace_quote_outcome(self):
         fixture = self.fixture

@@ -48,6 +48,8 @@ _FAILURE_CODES = frozenset({
     "internal_error", "broker_error", "schema_incompatible", "dns_failed", "tls_failed", "timeout",
     "browser_profile_busy", "runtime_missing", "local_permission", "network_unavailable",
 })
+_SCHEMA_CHECKS = frozenset({"catalog", "arguments", "response"})
+_SCHEMA_REASONS = frozenset({"missing_tool", "contract_changed", "arguments_invalid", "response_invalid"})
 _EXECUTION_CHECKS = frozenset({
     "dispatch_intent", "signal_freshness", "origin_evidence", "source_consistency",
     "execution_mode", "kill_switch", "entry_window", "prepared_watch", "quote_age",
@@ -219,6 +221,10 @@ def annotate_failure(error, **fields):
         for key, value in fields.items():
             if key in allowed and isinstance(value, str) and value in allowed[key]:
                 details.setdefault(key, value)
+        for key in ("schema_check", "schema_reason", "schema_digest"):
+            projected = project_execution_diagnostic({key: fields.get(key)})
+            if key in projected:
+                details.setdefault(key, projected[key])
         if isinstance(fields.get("context"), dict):
             details["context"] = project_execution_context(fields["context"]) | details.get("context", {})
         error._relay_failure = details
@@ -252,6 +258,11 @@ def project_execution_diagnostic(value):
         code = item.get("code")
         if isinstance(code, str) and (code in _FAILURE_CODES or re.fullmatch(r"http_[45][0-9]{2}", code)):
             result["code"] = code
+        for key, choices in (("schema_check", _SCHEMA_CHECKS), ("schema_reason", _SCHEMA_REASONS)):
+            if isinstance(item.get(key), str) and item[key] in choices:
+                result[key] = item[key]
+        if isinstance(item.get("schema_digest"), str) and re.fullmatch(r"[a-f0-9]{64}", item["schema_digest"]):
+            result["schema_digest"] = item["schema_digest"]
         frames = item.get("frames", [])
         if isinstance(frames, list):
             result["frames"] = [frame for frame in frames[:16] if isinstance(frame, str) and re.fullmatch(
@@ -316,7 +327,7 @@ def execution_failure(error, *, stage="execution", context=None):
     checks = [item.get("check") for item in [diagnostic] + diagnostic.get("causes", []) if item.get("check")]
     if checks:
         diagnostic["check"] = checks[-1]
-    parts = [f"{key}={diagnostic[key]}" for key in ("id", "stage", "check", "exception", "code", "broker_operation", "tool") if key in diagnostic]
+    parts = [f"{key}={diagnostic[key]}" for key in ("id", "stage", "check", "exception", "code", "broker_operation", "tool", "schema_check", "schema_reason", "schema_digest") if key in diagnostic]
     if diagnostic.get("frames"):
         parts.append("at=" + diagnostic["frames"][-1])
     log_execution("failure", context=context, diagnostic=diagnostic)

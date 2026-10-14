@@ -60,7 +60,10 @@ def _differences(expected, actual, path, *, output=False):
             left, right = expected.get(key, []), actual.get(key, [])
             if isinstance(left, list) and isinstance(right, list) and all(isinstance(item, str) for item in left + right):
                 for name in sorted(set(right) - set(left)):
-                    problems.append(location + " added " + name)
+                    # Additional output presence does not remove any consumed
+                    # field. Validate that stronger promise against each reply.
+                    if not output:
+                        problems.append(location + " added " + name)
                 for name in sorted(set(left) - set(right)):
                     problems.append(location + " removed " + name)
                 continue
@@ -72,7 +75,13 @@ def _differences(expected, actual, path, *, output=False):
             for name in sorted(expected[key].keys() | actual[key].keys()):
                 field = location + "." + name
                 if name not in expected[key]:
-                    if not (output and key == "properties"):
+                    required = actual.get("required", [])
+                    optional_input = (isinstance(required, list)
+                                      and all(isinstance(item, str) for item in required)
+                                      and name not in required)
+                    # Calls remain generated from known fields. New optional
+                    # parameters can be omitted; new required inputs cannot.
+                    if not (key == "properties" and (output or optional_input)):
                         problems.append(field + " added")
                 elif name not in actual[key]:
                     problems.append(field + " removed")

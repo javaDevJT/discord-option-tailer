@@ -2,6 +2,7 @@
 import copy
 import json
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -16,6 +17,28 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
         self.fixtures = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas.json").read_text())
         self.broker = RobinhoodBroker({"robinhood": {"account_number": "TEST0001"}})
         self.broker.catalog = {name: item["tool"] for name, item in self.fixtures.items()}
+
+    @classmethod
+    def _minimal_instance(cls, schema):
+        """Build a minimal synthetic value for the simple object schemas in these fixtures."""
+        schema_type = schema.get("type")
+        if isinstance(schema_type, list):
+            schema_type = "object" if "object" in schema_type else next(
+                (item for item in schema_type if item != "null"), "null")
+        if schema_type == "object":
+            properties = schema.get("properties", {})
+            return {name: cls._minimal_instance(properties[name]) for name in schema.get("required", [])}
+        if schema_type == "array":
+            return []
+        if schema_type == "string":
+            return "synthetic"
+        if schema_type == "integer" or schema_type == "number":
+            return 0
+        if schema_type == "boolean":
+            return False
+        if schema_type == "null":
+            return None
+        raise AssertionError(f"Unsupported fixture schema type: {schema_type!r}")
 
     @staticmethod
     def _compatible_schema_drift(tool):
@@ -78,14 +101,13 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
     def test_schema_changes_are_rejected_and_name_the_incompatible_field(self):
         account = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
         cases = [
-            ("input property named description", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"].update({"description": {"type": "string"}}), "description"),
             ("changed type", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"type": "integer"}), "account_number"),
             ("changed enum", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"enum": ["TEST0001"]}), "account_number"),
             ("changed default", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"default": "TEST0001"}), "account_number"),
             ("changed constraint", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"]["account_number"].update({"minLength": 2}), "account_number"),
             ("removed request field", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["properties"].pop("account_number"), "account_number"),
             ("removed response field", "get_portfolio", account["get_portfolio"], lambda t: t["outputSchema"]["properties"]["data"]["properties"].pop("equity_value"), "equity_value"),
-            ("added required response field", "get_accounts", account["get_accounts"], lambda t: t["outputSchema"]["properties"]["data"]["properties"]["accounts"]["items"]["required"].append("nickname"), "nickname"),
+            ("added required request field", "get_portfolio", account["get_portfolio"], lambda t: (t["inputSchema"]["properties"].update({"agent_initiated": {"type": "boolean"}}), t["inputSchema"]["required"].append("agent_initiated")), "agent_initiated"),
             ("removed required request field", "get_portfolio", account["get_portfolio"], lambda t: t["inputSchema"]["required"].remove("account_number"), "account_number"),
             ("removed required response field", "get_accounts", account["get_accounts"], lambda t: t["outputSchema"]["required"].remove("guide"), "guide"),
             ("changed response type", "get_accounts", account["get_accounts"], lambda t: t["outputSchema"]["properties"]["data"]["properties"]["accounts"]["items"]["properties"]["account_number"].update({"type": "integer"}), "account_number"),
@@ -103,6 +125,20 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
         self.broker.catalog["experimental_tool"] = unknown
         with self.assertRaisesRegex(BrokerError, "qualified catalog"):
             self.broker._qualified("experimental_tool")
+
+    def test_optional_input_and_additional_required_output_fields_are_accepted(self):
+        account = json.loads((Path(__file__).parent / "fixtures/robinhood-account-schemas-20260923.json").read_text())
+        optional_input = copy.deepcopy(account["get_portfolio"])
+        optional_input["inputSchema"]["properties"]["description"] = {"type": "string"}
+        self.broker.catalog["get_portfolio"] = optional_input
+        self.assertIs(self.broker._qualified("get_portfolio"), optional_input)
+
+        additional_output = copy.deepcopy(account["get_accounts"])
+        item_schema = additional_output["outputSchema"]["properties"]["data"]["properties"]["accounts"]["items"]
+        item_schema["properties"]["nickname"] = {"type": "string"}
+        item_schema["required"].append("nickname")
+        self.broker.catalog["get_accounts"] = additional_output
+        self.assertIs(self.broker._qualified("get_accounts"), additional_output)
 
     def test_option_pagination_schema_preserves_known_modes_and_rejects_unknown(self):
         options = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20260924.json").read_text())
@@ -164,6 +200,121 @@ class SchemaQualificationChecks(unittest.IsolatedAsyncioTestCase):
                 result.structuredContent["data"]["accounts"] = "invalid account list"
                 with self.assertRaisesRegex(BrokerError, "response does not match"):
                     await self.broker._data("get_accounts", {})
+
+    async def test_20261014_option_schemas_qualify_and_validate_additions(self):
+        schemas = json.loads((Path(__file__).parent / "fixtures/robinhood-option-schemas-20261014.json").read_text())
+        self.broker.catalog.update(copy.deepcopy(schemas))
+        self.broker.session = object()
+
+        for name, tool in schemas.items():
+            with self.subTest(tool=name):
+                self.assertIs(self.broker._qualified(name), self.broker.catalog[name])
+                arguments = self._minimal_instance(tool["inputSchema"])
+                if name == "get_option_orders":
+                    self.assertNotIn("agent_initiated", arguments)
+
+                content = self._minimal_instance(tool["outputSchema"])
+                if name == "get_option_orders":
+                    orders_schema = tool["outputSchema"]["properties"]["data"]["properties"]["orders"]
+                    content["data"]["orders"] = [self._minimal_instance(orders_schema["items"])]
+                    content["data"]["orders"][0].update({"agent_initiated": True, "placed_agent": "user"})
+                    invalid_type = "false"
+                elif name == "place_option_order":
+                    data_properties = tool["outputSchema"]["properties"]["data"]["properties"]
+                    content["data"]["order"] = self._minimal_instance(data_properties["order"])
+                    invalid_type = "false"
+                else:
+                    data_properties = tool["outputSchema"]["properties"]["data"]["properties"]
+                    content["data"]["fees"] = self._minimal_instance(data_properties["fees"])
+                    content["data"]["collateral"] = self._minimal_instance(data_properties["collateral"])
+                    invalid_type = "0.65"
+
+                result = SimpleNamespace(isError=False, structuredContent=copy.deepcopy(content))
+                self.broker._call_tool = AsyncMock(return_value=result)
+                self.assertEqual(await self.broker._data(name, arguments), content["data"])
+                self.broker._call_tool.assert_awaited_once_with(name, arguments)
+
+                if name == "review_option_order":
+                    review = copy.deepcopy(content["data"])
+                    review_args = {
+                        "account_number": "TEST0001",
+                        "legs": [{"option_id": "synthetic", "side": "buy", "position_effect": "open", "ratio_quantity": 1}],
+                        "quantity": "1",
+                        "type": "limit",
+                        "price": "1.00",
+                        "time_in_force": "gfd",
+                        "market_hours": "regular_hours",
+                    }
+                    review.update({
+                        "account_number": "TEST0001",
+                        "type": "limit",
+                        "direction": "debit",
+                        "quantity": "1",
+                        "price": "1.00",
+                        "time_in_force": "gfd",
+                        "market_hours": "regular_hours",
+                        "legs": copy.deepcopy(review_args["legs"]),
+                        "order_checks": {},
+                    })
+                    review.pop("stop_price", None)
+                    review["fees"]["total_fee"] = "0.65"
+                    review["fees"]["pro_trader_fee"] = {"fee_rate": "0.65", "fee": "0.65"}
+                    review["collateral"]["account_number"] = "TEST0001"
+                    review["collateral"]["cash"].update({"infinite": False, "amount": "1000"})
+                    _, fee = await self.broker._review_args(review_args, {}, review=review)
+                    self.assertEqual(fee, Decimal("0.65"))
+
+                for invalid in ("missing", "wrong type"):
+                    changed = copy.deepcopy(content)
+                    if name == "get_option_orders":
+                        orders = changed["data"]["orders"]
+                        if invalid == "missing":
+                            orders[0].pop("agent_initiated")
+                        else:
+                            orders[0]["agent_initiated"] = invalid_type
+                    elif name == "place_option_order":
+                        order = changed["data"]["order"]
+                        if invalid == "missing":
+                            order.pop("agent_initiated")
+                        else:
+                            order["agent_initiated"] = invalid_type
+                    else:
+                        fee = changed["data"]["fees"]["pro_trader_fee"]
+                        if invalid == "missing":
+                            changed["data"]["fees"].pop("pro_trader_fee")
+                        else:
+                            fee["fee"] = 0.65
+                    self.broker._call_tool = AsyncMock(return_value=SimpleNamespace(
+                        isError=False, structuredContent=changed))
+                    with self.subTest(tool=name, invalid=invalid):
+                        with self.assertRaisesRegex(BrokerError, "response does not match"):
+                            await self.broker._data(name, arguments)
+
+    def test_agent_initiated_flag_does_not_identify_this_agent(self):
+        expected = {
+            "quantity": "1",
+            "option_id": "synthetic-option",
+            "side": "buy",
+            "position_effect": "open",
+            "type": "limit",
+            "price": "1.00",
+            "time_in_force": "gfd",
+            "market_hours": "regular_hours",
+        }
+        row = {
+            "agent_initiated": True,
+            "placed_agent": "agentic",
+            "quantity": "1",
+            "legs": [{"option_id": "synthetic-option", "side": "buy", "position_effect": "open", "ratio_quantity": 1}],
+            "type": "limit",
+            "trigger": "immediate",
+            "price": "1.00",
+            "time_in_force": "gfd",
+            "market_hours": "regular_hours",
+        }
+        self.assertTrue(self.broker._order_matches_expected(row, expected))
+        row["placed_agent"] = "user"
+        self.assertFalse(self.broker._order_matches_expected(row, expected))
 
 
 

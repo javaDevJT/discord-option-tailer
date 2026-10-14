@@ -18,6 +18,7 @@ import hashlib
 import os
 import random
 import re
+import stat
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import stat
@@ -957,6 +958,59 @@ class RobinhoodMCP:
                 except OSError:
                     pass
 
+    def _retain_rejected_schema(self, tool):
+        """Keep immutable metadata for later diagnosis, never broker responses."""
+        temporary = None
+        try:
+            name = tool.get("name")
+            if name not in SCHEMA_PINS:
+                return
+            digest = self._schema_digest(tool)
+            directory = Path(self.config.get("token_store", "state/robinhood-oauth.json")).expanduser().parent / "robinhood-schema-rejections"
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(directory_fd)
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                    return
+                os.fchmod(directory_fd, 0o700)
+            finally:
+                os.close(directory_fd)
+            target = directory / f"{name}-{digest}.json"
+            if target.exists():
+                return
+            fd, temporary = tempfile.mkstemp(prefix=".schema-", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump({"name": name, "schema_digest": digest,
+                           "observed_at": datetime.now(timezone.utc).isoformat(),
+                           **{key: tool.get(key) for key in ("inputSchema", "outputSchema")}}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                pass
+        except Exception:
+            pass  # Metadata retention must never replace the broker failure.
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    def _schema_failure(self, error, name, tool, *, check, reason):
+        fields = {"tool": name, "code": "schema_incompatible", "schema_check": check, "schema_reason": reason}
+        if isinstance(tool, dict):
+            try:
+                fields["schema_digest"] = self._schema_digest(tool)
+                if check == "catalog":
+                    self._retain_rejected_schema(tool)
+            except Exception:
+                pass
+        _annotate_failure_safely(error, **fields)
+
     async def discover(self):
         if self.session is None:
             raise BrokerError("Open RobinhoodMCP using async with before discovery")
@@ -979,6 +1033,9 @@ class RobinhoodMCP:
         self._schema_incompatible_tools = tuple(incompatible)
         self._schema_incompatible = bool(incompatible)
         if incompatible:
+            for name in incompatible:
+                if isinstance(self.catalog.get(name), dict):
+                    self._retain_rejected_schema(self.catalog[name])
             publish_status(self.on_status, "broker", "schema_incompatible",
                            detail="Incompatible broker schemas: " + "; ".join(
                                f"{name}: {problem}" for name, problem in incompatible.items()))
@@ -1420,12 +1477,12 @@ class RobinhoodBroker(RobinhoodMCP):
         tool = self.catalog.get(name)
         if not tool or name not in SCHEMA_PINS:
             error = BrokerError(f"Required broker tool {name} missing from qualified catalog")
-            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            self._schema_failure(error, name, tool, check="catalog", reason="missing_tool")
             raise error
         problem = self._schema_problem(tool)
         if problem:
             error = BrokerError(f"schema changed for {name}: {problem}; compatibility review required")
-            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            self._schema_failure(error, name, tool, check="catalog", reason="contract_changed")
             raise error
         return tool
 
@@ -1438,7 +1495,7 @@ class RobinhoodBroker(RobinhoodMCP):
             jsonschema.validate(args, tool["inputSchema"])
         except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
             error = BrokerError("Normalized broker arguments do not match the qualified schema")
-            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            self._schema_failure(error, name, tool, check="arguments", reason="arguments_invalid")
             raise error from exc
         result = await self._call_tool(name, args)
         if result.isError or not isinstance(result.structuredContent, dict):
@@ -1447,7 +1504,7 @@ class RobinhoodBroker(RobinhoodMCP):
             jsonschema.validate(result.structuredContent, tool["outputSchema"])
         except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
             error = BrokerError("Robinhood response does not match the qualified schema")
-            _annotate_failure_safely(error, tool=name, code="schema_incompatible")
+            self._schema_failure(error, name, tool, check="response", reason="response_invalid")
             raise error from exc
         return result.structuredContent["data"]
 

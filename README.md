@@ -20,7 +20,7 @@ The [account monitoring guide](docs/container.md#account-balances-and-holdings) 
 - [Container setup and dashboard](docs/container.md): start the service and complete Discord, Codex, Robinhood, notification, and trading-mode setup in the frontend.
 - [TrueNAS deployment](docs/truenas.md): deploy the published image with persistent private storage.
 - [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.
-- [Broker integration](docs/robinhood-integration.md): authorization, account inspection, and execution checks.
+- [Broker integration](docs/robinhood-integration.md): authorization, account inspection, schema compatibility and failure diagnostics, and execution checks.
 - [Prepared-entry diagnostics](docs/robinhood-integration.md#prepared-entry-diagnostics): watch-cache fallback reasons and expiration lookup evidence.
 - [Exit intent and profit-taking](docs/container.md#exit-intent-and-profit-taking): distinguish status updates from authorized trims and preserve whole-contract rounding.
 - [Agent-directed stops](docs/container.md#agent-directed-stop-losses): compound trims, breakeven protection, cancellation and restart behavior.
