@@ -34,6 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 
 # Keep filesystem steps few: the isolated builder copies snapshots slowly.
+# Startup uses supervisord; discard the unused Pebble server from the base.
 RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,readonly \
     --mount=type=cache,target=/root/.cache/pip \
     apt-get update \
@@ -75,6 +76,7 @@ RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,reado
     && /opt/venv/bin/pip install --timeout 120 --constraint /tmp/relay-constraints.txt -r /tmp/relay-requirements.txt \
     && rm -f /tmp/relay-constraints.txt /tmp/relay-requirements.txt \
     && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/bin/pebble \
     && install -d -o relay -g relay -m 0700 /data
 
 RUN --mount=type=bind,source=.,target=/src,readonly \
