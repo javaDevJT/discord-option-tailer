@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import math
+import os
 from pathlib import Path
 import re
 import secrets
@@ -25,6 +26,15 @@ MAX_QUERY_TEXT = 200
 MAX_OFFSET = 100_000
 RUNTIME_STALE_SECONDS = 30
 IMAGE_PREVIEW_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _health_source_commit():
+    source_commit = os.environ.get("QB_SOURCE_COMMIT", "")
+    if not re.fullmatch(r"[a-fA-F0-9]{40}", source_commit):
+        return "unknown"
+    return source_commit.lower()
+
+
 MESSAGE_STATES = frozenset({
     "observed", "evaluating", "evaluated", "context", "ignore", "wait", "open", "reduce", "close", "update_stop",
     "shadow_order", "paper_order", "broker_order", "held", "unknown", "error", "duplicate",
@@ -1758,9 +1768,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "not found"}, head=head)
                 return
             if path == "/healthz":
-                if parsed.query:
-                    raise QueryError("healthz does not accept query parameters")
-                self._json(200, {"ok": True}, head=head)
+                self._json(200, {"ok": True, "sourceCommit": _health_source_commit()}, head=head)
                 return
             if path == "/api/status":
                 if parsed.query:

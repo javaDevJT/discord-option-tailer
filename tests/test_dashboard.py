@@ -8,11 +8,21 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
-from relay.dashboard import DashboardApp, DashboardHTTPServer
+from relay.dashboard import DashboardApp, DashboardHTTPServer, _health_source_commit
 
 
 UTC = timezone.utc
+
+
+class HealthSourceCommitTests(unittest.TestCase):
+    def test_health_commit_requires_exactly_40_hex_characters(self):
+        with patch.dict("os.environ", {"QB_SOURCE_COMMIT": "A" * 40}):
+            self.assertEqual(_health_source_commit(), "a" * 40)
+        for invalid in ("", "not-a-commit", "a" * 39, "a" * 41):
+            with self.subTest(invalid=invalid), patch.dict("os.environ", {"QB_SOURCE_COMMIT": invalid}):
+                self.assertEqual(_health_source_commit(), "unknown")
 
 
 class DashboardTests(unittest.TestCase):
@@ -142,6 +152,17 @@ class DashboardTests(unittest.TestCase):
         except json.JSONDecodeError:
             payload = body.decode("utf-8")
         return response.status, headers, payload
+
+    def test_healthz_reports_only_a_valid_baked_source_commit(self):
+        with patch.dict("os.environ", {"QB_SOURCE_COMMIT": "A" * 40}):
+            status, _, payload = self.request("/healthz?quarterback_probe=1729000000")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "sourceCommit": "a" * 40})
+
+        with patch.dict("os.environ", {"QB_SOURCE_COMMIT": "not-a-commit"}):
+            status, _, payload = self.request("/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "sourceCommit": "unknown"})
 
     def test_account_endpoint_is_cached_read_only_and_rejects_refresh_parameters(self):
         status, headers, account = self.request("/api/account")

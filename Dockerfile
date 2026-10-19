@@ -92,8 +92,9 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     && chmod 0644 /etc/nginx/nginx.conf /etc/supervisor/conf.d/relay.conf \
     && chown -R root:root /app /opt/relay-docker
 
-ARG SOURCE_REVISION=unknown
-ENV RELAY_SOURCE_REVISION=${SOURCE_REVISION}
+ARG QB_SOURCE_COMMIT=unknown
+ENV QB_SOURCE_COMMIT=${QB_SOURCE_COMMIT} \
+    RELAY_SOURCE_REVISION=${QB_SOURCE_COMMIT}
 
 ENV HOME=/home/relay \
     CODEX_HOME=/data/codex \
@@ -101,5 +102,7 @@ ENV HOME=/home/relay \
     BROWSER=/usr/local/bin/relay-browser
 
 EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:8080/healthz >/dev/null || exit 1
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/opt/relay-docker/entrypoint.sh"]
