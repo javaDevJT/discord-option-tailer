@@ -258,15 +258,31 @@ class ContainerSecurityTests(unittest.TestCase):
 
     def test_workflow_waits_for_completed_build_before_publication(self) -> None:
         workflow = (ROOT / ".github/workflows/ci-release.yml").read_text()
-        build, publish = workflow.split("  build:\n", 1)[1].split("  publish:\n", 1)
+        triggers = workflow.split("on:\n", 1)[1].split("\npermissions:\n", 1)[0]
+        test = workflow.split("  test:\n", 1)[1].split("  build:\n", 1)[0]
+        build = workflow.split("  build:\n", 1)[1].split("  publish:\n", 1)[0]
+        publish = workflow.split("  publish:\n", 1)[1]
         publication_job, publication_steps = publish.split("    steps:\n", 1)
+        self.assertIn("  pull_request_target:\n", triggers)
+        self.assertNotRegex(triggers, r"(?m)^  pull_request:\s*$")
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", test)
+        self.assertIn("github.actor == 'javaDevJT'", test)
+        self.assertIn("github.actor == 'quarterback-ci[bot]' && github.event.pull_request.user.id == 341165314", test)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", test)
         self.assertIn("    needs: test\n", build)
+        self.assertIn("github.repository == 'javaDevJT/discord-option-tailer'", build)
+        self.assertIn("github.ref == 'refs/heads/main'", build)
+        self.assertIn("github.event_name != 'pull_request_target'", build)
         self.assertIn("    runs-on: truenas-discord-option-tailer-storage-11g\n", build)
         self.assertIn("      packages: read\n", build)
         self.assertNotIn("packages: write", build)
         self.assertIn("    needs: [test, build]\n", publication_job)
+        self.assertIn("github.repository == 'javaDevJT/discord-option-tailer'", publication_job)
+        self.assertIn("github.ref == 'refs/heads/main'", publication_job)
+        self.assertIn("github.event_name != 'pull_request_target'", publication_job)
         self.assertIn("    runs-on: truenas-discord-option-tailer-storage-11g\n", publication_job)
-        self.assertNotRegex(publication_job, r"(?m)^    (if|continue-on-error):")
+        self.assertNotRegex(publication_job, r"(?:always|failure|cancelled)\s*\(")
+        self.assertNotIn("continue-on-error:", publication_job)
         self.assertNotIn("continue-on-error:", workflow)
         self.assertNotIn("ci-storage-efficiency", workflow)
         self.assertNotIn("container-security.sh publish", build)

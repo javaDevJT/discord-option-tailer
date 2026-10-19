@@ -1,0 +1,69 @@
+name: Publish Quarterback build receipt
+
+on:
+  workflow_run:
+    # Replace with the exact trusted CI workflow name in this repository.
+    workflows: ["Test and publish image"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful default-branch source workflow run ID
+        required: true
+        type: string
+      source_run_attempt:
+        description: Source run attempt number
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      vars.QB_RECEIPT_PUBLISHING_ENABLED == 'true'
+      && ((github.event_name == 'workflow_dispatch'
+           && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          || (github.event.workflow_run.conclusion == 'success'
+              && contains(fromJSON(vars.QB_SOURCE_EVENTS_JSON || '["push","schedule","workflow_dispatch","workflow_run"]'),
+                          github.event.workflow_run.event)
+              && github.event.workflow_run.head_repository.id == github.event.repository.id
+              && github.event.workflow_run.head_branch == github.event.repository.default_branch))
+    runs-on: ${{ vars.QB_PRIVATE_RUNNER_LABEL }}
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    steps:
+      - name: Check out the helper from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Require Node.js 20 or newer
+        run: node -e "if (Number(process.versions.node.split('.')[0]) < 20) process.exit(1)"
+
+      - name: Verify, sign, and submit receipts for the exact successful publisher jobs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          QB_SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
+          QB_SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.source_run_attempt }}
+          QB_TRUSTED_WORKFLOW_ID: ${{ vars.QB_TRUSTED_WORKFLOW_ID }}
+          QB_TRUSTED_WORKFLOW_PATH: ${{ vars.QB_TRUSTED_WORKFLOW_PATH }}
+          QB_REPOSITORY_ID: ${{ vars.QB_REPOSITORY_ID }}
+          QB_PUBLISHER_IDENTITY: ${{ vars.QB_PUBLISHER_IDENTITY }}
+          QB_IMAGE_TARGETS_JSON: ${{ vars.QB_IMAGE_TARGETS_JSON }}
+          QB_SECURITY_CHECK_NAMES: ${{ vars.QB_SECURITY_CHECK_NAMES }}
+          QB_INSTANCE_URL: ${{ vars.QB_INSTANCE_URL }}
+          QB_BUILD_SIGNING_KEY: ${{ secrets.QB_BUILD_SIGNING_KEY }}
+          QB_BUILD_RECEIPT_TOKEN: ${{ secrets.QB_BUILD_RECEIPT_TOKEN }}
+        run: node scripts/portable-build-receipt.mjs
