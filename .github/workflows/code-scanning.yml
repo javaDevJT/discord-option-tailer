@@ -1,0 +1,144 @@
+name: Semgrep code scanning
+
+on:
+  schedule:
+    - cron: '22 0 * * *'
+      timezone: America/Detroit
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Dependabot scans with contents: read and never receives SARIF upload permission.
+  scan-readonly:
+    name: Semgrep audit (Dependabot, read-only)
+    if: >-
+      github.repository == 'javaDevJT/discord-option-tailer' &&
+      github.actor == 'dependabot[bot]' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'main'
+    runs-on: truenas-discord-option-tailer-storage-8g
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      SEMGREP_SEND_METRICS: off
+      PIP_NO_CACHE_DIR: '1'
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python for Semgrep
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Install the pinned Semgrep CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-cache-dir semgrep==1.179.0
+
+      - name: Scan with the existing Quarterback security policy
+        id: semgrep
+        run: |
+          set -euo pipefail
+          umask 077
+          scan_dir="$(mktemp -d "$GITHUB_WORKSPACE/.code-scanning.XXXXXXXX")"
+          sarif_file="$scan_dir/semgrep.sarif"
+          scan_dir_relative="${scan_dir#"$GITHUB_WORKSPACE"/}"
+          printf 'scan_dir=%s\n' "$scan_dir" >> "$GITHUB_OUTPUT"
+          printf 'sarif_file=%s\n' "$scan_dir_relative/semgrep.sarif" >> "$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan \
+            --config p/security-audit --metrics=off --sarif \
+            --output "$sarif_file" .
+          chmod 600 "$sarif_file"
+
+      - name: Remove full SARIF and temporary scanner files
+        if: always()
+        env:
+          SCAN_DIRECTORY: ${{ steps.semgrep.outputs.scan_dir }}
+        run: |
+          if [[ -n "${SCAN_DIRECTORY:-}" ]]; then
+            rm -rf -- "$SCAN_DIRECTORY"
+          fi
+          rm -rf -- "$RUNNER_TEMP/semgrep-venv"
+
+  scan-and-upload:
+    name: Semgrep audit and SARIF upload
+    if: >-
+      github.repository == 'javaDevJT/discord-option-tailer' &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.base.ref == 'main')) &&
+      (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
+    runs-on: truenas-discord-option-tailer-storage-8g
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      SEMGREP_SEND_METRICS: off
+      PIP_NO_CACHE_DIR: '1'
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python for Semgrep
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Install the pinned Semgrep CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-cache-dir semgrep==1.179.0
+
+      - name: Scan with the existing Quarterback security policy
+        id: semgrep
+        run: |
+          set -euo pipefail
+          umask 077
+          scan_dir="$(mktemp -d "$GITHUB_WORKSPACE/.code-scanning.XXXXXXXX")"
+          sarif_file="$scan_dir/semgrep.sarif"
+          scan_dir_relative="${scan_dir#"$GITHUB_WORKSPACE"/}"
+          printf 'scan_dir=%s\n' "$scan_dir" >> "$GITHUB_OUTPUT"
+          printf 'sarif_file=%s\n' "$scan_dir_relative/semgrep.sarif" >> "$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan \
+            --config p/security-audit --metrics=off --sarif \
+            --output "$sarif_file" .
+          chmod 600 "$sarif_file"
+
+      - name: Upload SARIF to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ steps.semgrep.outputs.sarif_file }}
+          checkout_path: ${{ github.workspace }}
+          category: semgrep-security-audit
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+
+      - name: Remove full SARIF and temporary scanner files
+        if: always()
+        env:
+          SCAN_DIRECTORY: ${{ steps.semgrep.outputs.scan_dir }}
+        run: |
+          if [[ -n "${SCAN_DIRECTORY:-}" ]]; then
+            rm -rf -- "$SCAN_DIRECTORY"
+          fi
+          rm -rf -- "$RUNNER_TEMP/semgrep-venv"
