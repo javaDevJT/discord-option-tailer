@@ -66,7 +66,12 @@ class ProviderDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             elif len(steps) == 123:
                 page.closed = True
 
-        with tempfile.TemporaryDirectory() as directory, patch("relay.browser._playwright", return_value=Playwright), patch("relay.browser.asyncio.sleep", advance):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("relay.browser._playwright", return_value=Playwright),
+            patch("relay.browser.asyncio.sleep", advance),
+            patch("relay.browser.discord_delay", side_effect=lambda seconds: seconds),
+        ):
             await login(directory, keep_open=True, on_status=events.append)
         self.assertEqual(navigation, [{"wait_until": "domcontentloaded", "timeout": 60000}])
         self.assertGreater(sum(steps), 360)

@@ -17,6 +17,7 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/i;
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const MARKER_RE = /^QB_BUILD_RECEIPT_V1 source_sha=([a-f0-9]{40}) run_id=([1-9][0-9]*) run_attempt=([1-9][0-9]*) digest=(sha256:[a-f0-9]{64})$/i;
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const GITHUB_LOG_LINE_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z) (.*)$/;
 const DEFAULT_FETCH = globalThis.fetch;
 
 export class ReceiptEvidenceError extends Error {}
@@ -324,18 +325,57 @@ function validateImageTargets(value, sourceRepository) {
   });
 }
 
+function validGitHubLogTimestamp(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, fraction = ''] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const milliseconds = fraction ? Number(fraction.padEnd(3, '0').slice(0, 3)) : 0;
+  const timestamp = new Date(0);
+  timestamp.setUTCFullYear(year, month - 1, day);
+  timestamp.setUTCHours(hour, minute, second, milliseconds);
+  return timestamp.getUTCFullYear() === year && timestamp.getUTCMonth() === month - 1 &&
+    timestamp.getUTCDate() === day && timestamp.getUTCHours() === hour &&
+    timestamp.getUTCMinutes() === minute && timestamp.getUTCSeconds() === second;
+}
+
 function markerFromText(text, found, sourceCommit, runId, runAttempt) {
-  for (const line of text.replace(ANSI_RE, '').split(/\r?\n/)) {
-    const markerAt = line.indexOf('QB_BUILD_RECEIPT_V1');
-    if (markerAt < 0) continue;
-    const candidate = line.slice(markerAt).trim();
-    const match = MARKER_RE.exec(candidate);
-    if (!match) fail('Publisher job log contains a malformed build receipt marker.');
-    if (match[1].toLowerCase() !== sourceCommit.toLowerCase() || Number(match[2]) !== runId || Number(match[3]) !== runAttempt) {
-      fail('Publisher job log marker does not match the verified source run identity.');
+  const groupStack = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(ANSI_RE, '');
+    if (!line) continue;
+    const framed = GITHUB_LOG_LINE_RE.exec(line);
+    if (!framed) {
+      if (line.includes('QB_BUILD_RECEIPT_V1') || /^##\[(?:group|endgroup)\]/.test(line)) {
+        fail('Publisher job log marker or group is missing valid GitHub timestamp framing.');
+      }
+      continue;
     }
-    if (!DIGEST_RE.test(match[4])) fail('Publisher job log marker contains an invalid image digest.');
-    found.push(match[4].toLowerCase());
+    const [, timestamp, body] = framed;
+    if (!validGitHubLogTimestamp(timestamp)) {
+      if (body.includes('QB_BUILD_RECEIPT_V1') || /^##\[(?:group|endgroup)\]/.test(body)) {
+        fail('Publisher job log marker or group has an invalid GitHub timestamp.');
+      }
+      continue;
+    }
+    const groupStart = /^##\[group\](.*)$/.exec(body);
+    if (groupStart) groupStack.push(/^Run(?:\s|$)/.test(groupStart[1]));
+    if (body.includes('QB_BUILD_RECEIPT_V1') && !groupStack.includes(true)) {
+      const match = MARKER_RE.exec(body);
+      if (!match) fail('Publisher job log contains a malformed build receipt marker.');
+      if (match[1].toLowerCase() !== sourceCommit.toLowerCase() || Number(match[2]) !== runId || Number(match[3]) !== runAttempt) {
+        fail('Publisher job log marker does not match the verified source run identity.');
+      }
+      if (!DIGEST_RE.test(match[4])) fail('Publisher job log marker contains an invalid image digest.');
+      found.push(match[4].toLowerCase());
+    }
+    if (/^##\[endgroup\]/.test(body) && groupStack.length) groupStack.pop();
   }
 }
 
