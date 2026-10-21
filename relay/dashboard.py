@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import tempfile
 from .account import AUTH_ERROR, CACHE_KEY, REFRESH_ERROR, REFRESH_SECONDS
+from .telemetry import http_request, mark_error
 from .status import project_dispatch_checks, project_execution_diagnostic
 from .images import collect_images, download_images, ImageTransportError, MAX_IMAGES
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1625,12 +1626,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return self.server.app
 
     def do_GET(self):
-        self._handle(False)
+        with http_request(self):
+            self._handle(False)
 
     def do_HEAD(self):
-        self._handle(True)
+        with http_request(self):
+            self._handle(True)
 
     def do_POST(self):
+        with http_request(self):
+            self._post()
+
+    def send_response(self, code, message=None):
+        span = getattr(self, "_telemetry_request_span", None)
+        if span is not None:
+            span.set_attribute("http.response.status_code", int(code))
+            if code >= 500:
+                mark_error(span, "HTTPServerError")
+        return super().send_response(code, message)
+
+    def _post(self):
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         routes = {
@@ -1769,6 +1784,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/healthz":
                 self._json(200, {"ok": True, "sourceCommit": _health_source_commit()}, head=head)
+                return
+            if path == "/api/telemetry":
+                if parsed.query:
+                    raise QueryError("telemetry does not accept query parameters")
+                from .telemetry import status as telemetry_status
+                self._json(200, telemetry_status(), api=True, head=head)
                 return
             if path == "/api/status":
                 if parsed.query:

@@ -1,0 +1,155 @@
+# Private same-container receiver. Only this exporter reads the app credential.
+extensions:
+  bearertokenauth/openwoof:
+    scheme: Bearer
+    filename: ${env:OPENWOOF_INGEST_KEY_FILE}
+  file_storage:
+    directory: /data/telemetry/collector-checkpoints
+    create_directory: true
+  health_check:
+    endpoint: 127.0.0.1:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+        max_request_body_size: 2097152
+  filelog/processes:
+    include: [/var/log/relay-telemetry/process-output.jsonl, /var/log/relay-telemetry/process-output.jsonl.1]
+    start_at: beginning
+    storage: file_storage
+    max_log_size: 1MiB
+    operators:
+      - type: json_parser
+        parse_to: attributes.relay
+        timestamp:
+          parse_from: attributes.relay.timestamp
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+        severity:
+          parse_from: attributes.relay.severity
+      - type: move
+        from: attributes.relay.service_name
+        to: resource['service.name']
+      - type: move
+        from: attributes.relay.service_version
+        to: resource['service.version']
+      - type: move
+        from: attributes.relay.service_instance
+        to: resource['service.instance.id']
+      - type: add
+        field: resource['service.namespace']
+        value: trading
+      - type: add
+        field: resource['deployment.environment.name']
+        value: production
+      - type: move
+        from: attributes.relay.body
+        to: body
+      - type: move
+        from: attributes.relay.attributes
+        to: attributes.original
+  filelog/supervisor:
+    include: [/var/log/supervisor/relay-supervisor.log]
+    start_at: beginning
+    storage: file_storage
+    resource:
+      service.name: discord-option-tailer-runtime
+      service.namespace: trading
+      service.version: ${env:RELAY_SOURCE_REVISION}
+      deployment.environment.name: production
+    attributes:
+      log.logger.name: supervisord
+      log.framing: newline
+      log.time.source: collector_observed
+    operators:
+      - type: regex_parser
+        regex: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) (?P<severity>INFO|WARN|WARNING|ERROR|CRIT|DEBUG) '
+        timestamp:
+          parse_from: attributes.timestamp
+          layout_type: gotime
+          layout: '2006-01-02 15:04:05,000'
+          location: UTC
+        severity:
+          parse_from: attributes.severity
+        on_error: send
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  transform/privacy:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'delete_matching_keys(attributes, "(?i)^http\\.(request|response)\\.header\\.(authorization|cookie|set_cookie)$")'
+          - 'replace_all_patterns(attributes, "value", "(?i)(Bearer|Basic) [A-Za-z0-9._~+/=-]+", "$$1 [REDACTED]")'
+          - 'replace_all_patterns(attributes, "value", "(?i)([?&](token|access_token|refresh_token|key|api_key|code|state|signature|sig|hm|ex|is|account_id|account_number)=)[^&# ]*", "$$1[REDACTED]")'
+          - 'replace_all_patterns(attributes, "value", "(/accounts?/)[^/?# ]+", "$$1[REDACTED]")'
+          - 'replace_all_patterns(attributes, "value", "(/api/webhooks/)[^/?# ]+/[^/?# ]+", "$$1[REDACTED]/[REDACTED]")'
+      - context: spanevent
+        statements:
+          - 'replace_all_patterns(attributes, "value", "(?i)(Bearer|Basic) [A-Za-z0-9._~+/=-]+", "$$1 [REDACTED]")'
+          - 'replace_all_patterns(attributes, "value", "(?i)([?&](token|access_token|refresh_token|key|api_key|code|state|signature|sig|hm|ex|is|account_id|account_number)=)[^&# ]*", "$$1[REDACTED]")'
+    log_statements:
+      - context: log
+        statements:
+          - 'merge_maps(attributes, attributes["original"], "upsert") where attributes["original"] != nil'
+          - 'delete_key(attributes, "original")'
+          - 'delete_key(attributes, "relay")'
+          - 'set(attributes["log.time.source"], "original_supervisor_timestamp") where attributes["log.logger.name"] == "supervisord" and attributes["timestamp"] != nil'
+          - 'replace_pattern(body, "(?i)(Bearer|Basic) [A-Za-z0-9._~+/=-]+", "$$1 [REDACTED]") where IsString(body)'
+          - 'replace_all_patterns(attributes, "value", "(?i)(Bearer|Basic) [A-Za-z0-9._~+/=-]+", "$$1 [REDACTED]")'
+  batch:
+    timeout: 1s
+    send_batch_size: 64
+    send_batch_max_size: 128
+
+exporters:
+  otlp_http/openwoof:
+    endpoint: https://openwoof.javadevjt.tech
+    encoding: proto
+    auth:
+      authenticator: bearertokenauth/openwoof
+    tls:
+      insecure: false
+      insecure_skip_verify: false
+    timeout: 5s
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      queue_size: 8
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 30s
+
+service:
+  extensions: [bearertokenauth/openwoof, file_storage, health_check]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/privacy, batch]
+      exporters: [otlp_http/openwoof]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/openwoof]
+    logs:
+      receivers: [filelog/processes, filelog/supervisor]
+      processors: [memory_limiter, transform/privacy, batch]
+      exporters: [otlp_http/openwoof]

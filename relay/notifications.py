@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .status import AUTH_REQUIRED_STATES
+from .telemetry import traced
 from .pacing import discord_delay
 
 
@@ -711,6 +712,7 @@ class NotificationWorker:
         except Exception:
             return _timestamp()
 
+    @traced("relay.notify")
     def send(self, payload):
         """Send one already-sanitized payload without following redirects."""
 

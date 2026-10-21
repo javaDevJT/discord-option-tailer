@@ -894,7 +894,11 @@ class RobinhoodMCP:
             self.session = await self.stack.enter_async_context(ClientSession(
                 read, write, read_timeout_seconds=timedelta(seconds=360 if self.interactive else self.timeout)
             ))
-            await self.session.initialize()
+            from .telemetry import operation
+            with operation("robinhood.initialize", kind="client", attributes={
+                "rpc.system": "mcp", "rpc.method": "initialize",
+            }):
+                await self.session.initialize()
             await self.discover()
             return self
         except BaseException as exc:
@@ -1016,7 +1020,12 @@ class RobinhoodMCP:
             raise BrokerError("Open RobinhoodMCP using async with before discovery")
         tools, cursor, seen = [], None, set()
         while True:
-            result = await self.session.list_tools(cursor=cursor)
+            from .telemetry import operation
+            with operation("robinhood.discover", kind="client", attributes={
+                "rpc.system": "mcp", "rpc.method": "tools/list",
+            }) as span:
+                result = await self.session.list_tools(cursor=cursor)
+                span.set_attribute("rpc.response.tool_count", len(result.tools))
             tools.extend(tool.model_dump(mode="json", exclude_none=True) for tool in result.tools)
             cursor = result.nextCursor
             if not cursor:
@@ -1089,7 +1098,14 @@ class RobinhoodMCP:
         if not read and callable(getattr(self, "_invalidate_watch_market", None)):
             self._invalidate_watch_market()
         try:
-            result = await self.session.call_tool(name, arguments=args)
+            from .telemetry import operation, mark_error
+            with operation("robinhood.tool", kind="client", attributes={
+                "rpc.system": "mcp", "rpc.method": name if name in SCHEMA_PINS else "other",
+            }) as span:
+                result = await self.session.call_tool(name, arguments=args)
+                span.set_attribute("rpc.response.error", bool(result.isError))
+                if result.isError:
+                    mark_error(span, "MCPToolError")
         except Exception as exc:
             if _rate_limited(exc):
                 await budget.rate_limited(exc)

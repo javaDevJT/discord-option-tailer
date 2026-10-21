@@ -8,6 +8,7 @@ import json
 import logging
 
 from .broker import is_auth_required
+from .telemetry import operation
 
 REFRESH_SECONDS = 600
 CACHE_KEY = "account_overview"
@@ -53,7 +54,8 @@ class AccountCache:
         self.save()
         try:
             async with getattr(self.broker, "background_reads", nullcontext)():
-                overview = await asyncio.wait_for(self.broker.account_overview(), timeout=60)
+                with operation("relay.account.refresh"):
+                    overview = await asyncio.wait_for(self.broker.account_overview(), timeout=60)
         except Exception as exc:
             self.value["error"] = AUTH_ERROR if is_auth_required(exc) else REFRESH_ERROR
         else:

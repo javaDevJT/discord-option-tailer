@@ -19,6 +19,7 @@ config*.local.json
 auth.json
 *oauth*.json
 *.pem
+!ops/truenas-ca.pem
 *.key
 *.sqlite3*
 *.db

@@ -17,6 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .broker import BrokerPreflightHold
+from .telemetry import traced
 from .interpreter import InterpretationError, safe_interpretation_reason
 from .status import annotate_failure, execution_check, execution_failure, failure_stage, log_execution
 
@@ -924,6 +925,7 @@ class Engine:
         return decision | {"contract": resolved, "reason": (decision["reason"][:3800] +
             f" Default expiry: {resolved['expiry']}, nearest listed to the original {source_day} New York message date.")}
 
+    @traced("relay.message", kind="consumer")
     async def handle(self, message, *, analyze_history=False, _observed=None):
         # Model work is concurrent; account execution remains serialized.
         message = dict(message)

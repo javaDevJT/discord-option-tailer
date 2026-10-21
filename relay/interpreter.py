@@ -20,6 +20,7 @@ import tomllib
 from zoneinfo import ZoneInfo
 
 from .status import publish_status
+from .telemetry import traced
 from .monitor_contract import project_monitor_facts, validate_monitor_plan
 from .images import (
     IMAGE_DIAGNOSTIC_DETAILS,
@@ -1231,6 +1232,7 @@ class CodexInterpreter:
         env["CODEX_HOME"] = str(runtime_home)
         return env
 
+    @traced("codex.process", kind="client")
     def _run_process(self, args, env, cwd, input_bytes=None):
         try:
             process = subprocess.Popen(
@@ -1304,6 +1306,7 @@ class CodexInterpreter:
             raise InterpretationError("The user's configured Codex model is invalid")
         return model
 
+    @traced("relay.evaluate")
     async def interpret(self, message: dict, context: list[dict], positions: list[dict]) -> dict:
         evaluation_started_monotonic = time.monotonic()
         self.last_timing = None

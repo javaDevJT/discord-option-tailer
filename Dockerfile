@@ -1,3 +1,5 @@
+FROM ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849 AS otel-collector
+
 FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS codex-runtime
 ARG CODEX_VERSION=0.153.4
 RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}"
@@ -14,6 +16,7 @@ RUN apt-get update \
         > /novnc/usr/share/novnc/package-provenance.txt
 
 FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 AS runtime
+COPY --from=otel-collector /otelcol-contrib /usr/local/bin/otelcol-contrib
 COPY --from=codex-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex-runtime /usr/local/lib/node_modules/@openai /usr/local/lib/node_modules/@openai
 COPY --from=novnc-assets /novnc/usr/share/novnc /usr/share/novnc
@@ -71,7 +74,7 @@ RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,reado
     && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/relay --shell /usr/sbin/nologin relay \
     && mkdir -p /app /opt/relay-docker /run/nginx /var/log/supervisor \
     && chown relay:relay /home/relay \
-    && python3 -c 'import tomllib; p=tomllib.load(open("/tmp/relay-project.toml", "rb"))["project"]; print("\n".join(p.get("dependencies", []) + p["optional-dependencies"]["browser"] + p["optional-dependencies"]["robinhood"] + p["optional-dependencies"]["discord"]))' > /tmp/relay-requirements.txt \
+    && python3 -c 'import tomllib; p=tomllib.load(open("/tmp/relay-project.toml", "rb"))["project"]; print("\n".join(p.get("dependencies", []) + p["optional-dependencies"]["browser"] + p["optional-dependencies"]["robinhood"] + p["optional-dependencies"]["discord"] + p["optional-dependencies"]["telemetry"]))' > /tmp/relay-requirements.txt \
     && printf 'playwright==%s\n' "${PLAYWRIGHT_VERSION}" > /tmp/relay-constraints.txt \
     && /opt/venv/bin/pip install --timeout 120 --constraint /tmp/relay-constraints.txt -r /tmp/relay-requirements.txt \
     && rm -f /tmp/relay-constraints.txt /tmp/relay-requirements.txt \
@@ -90,6 +93,11 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     && chmod 0755 /opt/relay-docker/*.sh /opt/relay-docker/*.py \
     && chmod 0755 /usr/local/bin/relay-browser \
     && chmod 0644 /etc/nginx/nginx.conf /etc/supervisor/conf.d/relay.conf \
+    && printf '%s\n' 'build-validation-not-a-key' > /tmp/collector-validation-key \
+    && chmod 0600 /tmp/collector-validation-key \
+    && OPENWOOF_INGEST_KEY_FILE=/tmp/collector-validation-key RELAY_SOURCE_REVISION=build-validation \
+       /usr/local/bin/otelcol-contrib validate --config=/opt/relay-docker/otelcol.yaml \
+    && rm -f /tmp/collector-validation-key \
     && chown -R root:root /app /opt/relay-docker
 
 ARG QB_SOURCE_COMMIT=unknown

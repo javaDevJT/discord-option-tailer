@@ -6,6 +6,7 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 
 ## Project index
 
+- [OpenWoof telemetry](docs/observability.md): original process logs, real dependency spans, typed metrics, private Collector, secure Mac/TrueNAS key custody and deployed verification boundaries.
 - [Image security gate](docs/container.md#build-and-published-image-path): local archive scanning, dependency refresh, runner-owned storage protection, and verified publication.
 - [Active watch polling](docs/container.md#active-watch-polling): ten-minute market refresh windows, broker request budgets, and fresh deterministic-entry snapshot reuse.
 
@@ -123,7 +124,7 @@ For offline work without Docker, use Python 3.11 or newer:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[browser,robinhood,discord]'
+python -m pip install -e '.[browser,robinhood,discord,telemetry,telemetry-test]'
 python -m playwright install chromium
 python -m relay doctor
 python -m relay demo

@@ -23,6 +23,7 @@ from typing import Any
 from .core import channel_allows_author
 from .ingest import normalize
 from .pacing import discord_delay
+from .telemetry import traced
 
 
 LOG = logging.getLogger(__name__)
@@ -520,6 +521,7 @@ class _GatewayRuntime:
             }
             await self._retry_denied_channels(affected)
 
+        @traced("discord.receive", kind="consumer", attributes={"messaging.system": "discord", "messaging.operation.type": "receive"})
         async def on_message(message: Any) -> None:
             await self._guard(lambda: self.observe(message, kind="live", reason="live"))
 

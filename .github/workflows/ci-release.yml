@@ -62,10 +62,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: python -m pip install -e '.[browser,robinhood,discord]'
+        run: python -m pip install -e '.[browser,robinhood,discord,telemetry,telemetry-test]'
 
       - name: Check dashboard JavaScript syntax
         run: node --check relay/static/app.js
+
+      - name: Test app-scoped OpenWoof deployment guards
+        run: node --test ops/test-deploy-openwoof.mjs
 
       - name: Test unprivileged Chromium dependency staging
         run: node --test .github/scripts/test-install-browser-deps.mjs
