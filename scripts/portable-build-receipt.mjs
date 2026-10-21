@@ -6,6 +6,8 @@ import { resolve } from 'node:path';
 
 const API_VERSION = '2022-11-28';
 const FETCH_TIMEOUT_MS = 30_000;
+const RECEIPT_UPLOAD_MAX_ATTEMPTS = 3;
+const RECEIPT_UPLOAD_MAX_WAIT_MS = 15 * 60_000;
 const SUPPORTED_SOURCE_EVENTS = new Set(['push', 'schedule', 'workflow_dispatch', 'workflow_run']);
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_ZIP_BYTES = 32 * 1024 * 1024;
@@ -584,24 +586,76 @@ function signedReceipt(unsigned, privateKey) {
   };
 }
 
-async function postReceipt(endpoint, token, receipt, fetchImpl, imageRepository) {
-  let response;
-  try {
-    response = await fetchImpl(endpoint, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify(receipt),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      redirect: 'manual',
-    });
-  } catch {
-    fail(`Quarterback receipt submission failed for ${imageRepository}.`);
+function rateLimitRetryDelay(response, bodyBytes) {
+  let body;
+  try { body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bodyBytes)); }
+  catch { return undefined; }
+  if (!isRecord(body) || body.code !== 'github_rate_limited') return undefined;
+  const retryAfter = response.headers.get('retry-after')?.trim();
+  if (!retryAfter || !/^\d+$/.test(retryAfter)) return undefined;
+  const seconds = Number(retryAfter);
+  if (!Number.isFinite(seconds) || !Number.isSafeInteger(seconds)) return Number.MAX_SAFE_INTEGER;
+  if (seconds <= 0) return undefined;
+  return seconds * 1000;
+}
+
+function retryDelayDescription(milliseconds) {
+  const seconds = Math.ceil(milliseconds / 1000);
+  const maximumReportedSeconds = RECEIPT_UPLOAD_MAX_WAIT_MS / 1000;
+  return seconds > maximumReportedSeconds ? `at least ${maximumReportedSeconds + 1}s` : `${seconds}s`;
+}
+
+function createReceiptUploadBudget(targetCount, timing = {}) {
+  const now = timing.now ?? Date.now;
+  const sleep = timing.sleep ?? ((milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)));
+  return {
+    now,
+    sleep,
+    deadline: now() + RECEIPT_UPLOAD_MAX_WAIT_MS + targetCount * RECEIPT_UPLOAD_MAX_ATTEMPTS * FETCH_TIMEOUT_MS + 1_000,
+    totalWait: 0,
+  };
+}
+
+async function postReceipt(endpoint, token, receipt, fetchImpl, imageRepository, budget) {
+  // Serialize once so every retry sends the exact same signed bytes.
+  const body = JSON.stringify(receipt);
+
+  for (let attempt = 1; attempt <= RECEIPT_UPLOAD_MAX_ATTEMPTS; attempt++) {
+    const remainingDeadlineMs = budget.deadline - budget.now();
+    if (remainingDeadlineMs <= 0) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
+    let response;
+    try {
+      response = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json' },
+        body,
+        signal: AbortSignal.timeout(Math.min(FETCH_TIMEOUT_MS, Math.ceil(remainingDeadlineMs))),
+        redirect: 'manual',
+      });
+    } catch {
+      if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
+      fail(`Quarterback receipt submission failed for ${imageRepository}.`);
+    }
+    if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
+    const responseBytes = await readLimited(response, MAX_JSON_BYTES, 'Quarterback receipt submission');
+    if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
+    if (response.status === 200 || response.status === 201) return;
+    if (response.status !== 503) fail(`Quarterback receipt submission returned HTTP ${response.status} for ${imageRepository}.`);
+
+    const retryDelay = rateLimitRetryDelay(response, responseBytes);
+    if (retryDelay === undefined) fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}.`);
+    if (attempt >= RECEIPT_UPLOAD_MAX_ATTEMPTS) {
+      fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} was received, but the retry attempt limit of ${RECEIPT_UPLOAD_MAX_ATTEMPTS} was reached.`);
+    }
+    if (retryDelay > RECEIPT_UPLOAD_MAX_WAIT_MS - budget.totalWait) {
+      fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} would exceed the 15 minute cumulative retry wait cap.`);
+    }
+    if (retryDelay > budget.deadline - budget.now()) {
+      fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} exceeds the retry deadline.`);
+    }
+    budget.totalWait += retryDelay;
+    await budget.sleep(retryDelay);
   }
-  if (response.status !== 200 && response.status !== 201) {
-    await readLimited(response, MAX_JSON_BYTES, 'Quarterback receipt submission');
-    fail(`Quarterback receipt submission returned HTTP ${response.status} for ${imageRepository}.`);
-  }
-  await readLimited(response, MAX_JSON_BYTES, 'Quarterback receipt submission');
 }
 
 function securityResults(checks, names, sourceCommit) {
@@ -617,6 +671,7 @@ function securityResults(checks, names, sourceCommit) {
 export async function produceBuildReceipts(options) {
   const config = verifyReceiptConfiguration(options);
   const targets = validateImageTargets(options.imageTargets, options.repository);
+  const uploadBudget = createReceiptUploadBudget(targets.length, options);
   const evidence = await verifyGitHubRun(options);
   const checksForSecurity = securityResults(evidence.checks, options.securityCheckNames ?? [], evidence.sourceCommit);
   const receipts = [];
@@ -644,7 +699,7 @@ export async function produceBuildReceipts(options) {
       securityResults: checksForSecurity,
     };
     const receipt = signedReceipt(unsigned, config.key);
-    await postReceipt(config.endpoint, config.receiptToken, receipt, evidence.fetchImpl, target.imageRepository);
+    await postReceipt(config.endpoint, config.receiptToken, receipt, evidence.fetchImpl, target.imageRepository, uploadBudget);
     receipts.push(receipt);
   }
   return receipts;
