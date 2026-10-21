@@ -98,6 +98,28 @@ class InertInstrumentationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeploymentWiringTests(unittest.TestCase):
+    def test_collector_diagnostics_suppress_http_spans_and_restore_context(self):
+        try:
+            from opentelemetry.instrumentation.utils import is_http_instrumentation_enabled
+        except ImportError:
+            self.skipTest("optional telemetry dependencies are unavailable")
+        observed = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+        def request(url, **_kwargs):
+            observed.append(is_http_instrumentation_enabled())
+            return Response(b"otelcol_exporter_sent_spans_total 7\n")
+
+        self.assertTrue(is_http_instrumentation_enabled())
+        with patch.dict("os.environ", {"RELAY_OTEL_ENABLED": "true"}), patch("urllib.request.urlopen", side_effect=request):
+            result = telemetry.status()
+        self.assertEqual(observed, [False, False])
+        self.assertTrue(is_http_instrumentation_enabled())
+        self.assertTrue(result["collector_healthy"])
+        self.assertEqual(result["collector_metrics"]["otelcol_exporter_sent_spans_total"], 7)
+
     def test_all_original_program_console_destinations_are_retained(self):
         import configparser
         p = configparser.RawConfigParser(); p.read(Path(__file__).parents[1] / "docker/supervisord.conf")

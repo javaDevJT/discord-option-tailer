@@ -301,10 +301,14 @@ def status():
     if not result["enabled"]:
         return result
     try:
-        with urllib.request.urlopen("http://127.0.0.1:13133/", timeout=0.5) as response:
-            result["collector_healthy"] = response.status == 200
-        with urllib.request.urlopen("http://127.0.0.1:8888/metrics", timeout=0.5) as response:
-            text = response.read(1024 * 1024).decode("utf-8")
+        from opentelemetry.instrumentation.utils import suppress_http_instrumentation
+        # The diagnostics reader must not manufacture telemetry about reading
+        # telemetry, including when another span is active in this request.
+        with suppress_http_instrumentation():
+            with urllib.request.urlopen("http://127.0.0.1:13133/", timeout=0.5) as response:
+                result["collector_healthy"] = response.status == 200
+            with urllib.request.urlopen("http://127.0.0.1:8888/metrics", timeout=0.5) as response:
+                text = response.read(1024 * 1024).decode("utf-8")
         for line in text.splitlines():
             match = re.fullmatch(r"(otelcol_(?:exporter|receiver|processor)_[a-z_]+)(\{[^\n]*\})? ([0-9.eE+-]+)", line)
             if match:
@@ -312,6 +316,6 @@ def status():
                 # These are raw current-process cumulative counters/gauges, not
                 # invented rates or sums across resets/export observations.
                 result["collector_metrics"][name + (labels or "")] = float(value)
-    except (OSError, ValueError):
+    except (ImportError, OSError, ValueError):
         result["collector_error"] = "collector_unavailable_or_metrics_unreadable"
     return result
