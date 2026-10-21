@@ -75,7 +75,11 @@ private-query and webhook-path filtering in the same Collector. No body-wide
 replacement, literal-message allowlist or generic operation rename is used.
 
 Queues, batch sizes, receiver body size, span attributes and file rotation are
-bounded. SDK export runs off the entry path; export failure cannot turn an
+bounded. Each signal exporter queues at most 64 requests with two consumers,
+a 10-second request timeout and a 30-second retry window; the Collector retains
+its 256 MiB memory limit. This absorbs brief upstream stalls without an unbounded backlog.
+Excluded health/status handlers suppress their dependency spans too.
+SDK export runs off the entry path; export failure cannot turn an
 application return into a failure. The Collector uses a memory limiter and a
 finite retry window. Graceful process exit flushes providers; the output tee
 stops before the Collector. Existing app retry, timeout, cancellation, logging

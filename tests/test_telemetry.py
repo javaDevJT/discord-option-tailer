@@ -98,6 +98,20 @@ class InertInstrumentationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeploymentWiringTests(unittest.TestCase):
+    def test_health_reads_suppress_dependency_operations_and_restore_context(self):
+        try:
+            from opentelemetry.instrumentation.utils import is_instrumentation_enabled
+        except ImportError:
+            self.skipTest("optional telemetry dependencies are unavailable")
+        from types import SimpleNamespace
+        for path in ("/healthz", "/api/status", "/api/telemetry"):
+            with self.subTest(path=path), patch.object(telemetry, "_runtime", {"closed": False}):
+                with telemetry.http_request(SimpleNamespace(path=path)):
+                    self.assertFalse(is_instrumentation_enabled())
+                    with telemetry.operation("sqlite.SELECT") as span:
+                        self.assertIsInstance(span, telemetry.NullSpan)
+                self.assertTrue(is_instrumentation_enabled())
+
     def test_collector_diagnostics_suppress_http_spans_and_restore_context(self):
         try:
             from opentelemetry.instrumentation.utils import is_http_instrumentation_enabled

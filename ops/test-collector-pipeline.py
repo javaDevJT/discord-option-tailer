@@ -41,6 +41,8 @@ def main():
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     directory = args.output.resolve()
     received, lock, reject = [], threading.Lock(), threading.Event()
+    release_traces = threading.Event()
+    release_traces.set()
 
     class Sink(BaseHTTPRequestHandler):
         def log_message(self, *_args): pass
@@ -50,6 +52,8 @@ def main():
                 body = gzip.decompress(body)
             auth = self.headers.get_all("Authorization", [])
             assert auth == ["Bearer fixture-private-ingest"]
+            if self.path == "/v1/traces":
+                release_traces.wait(4)
             with lock: received.append((self.path, body, reject.is_set()))
             self.send_response(503 if reject.is_set() else 200)
             self.send_header("Content-Length", "0"); self.end_headers()
@@ -108,6 +112,19 @@ framer=Framer(RingWriter(os.environ["FIXTURE_DIRECTORY"]))
 framer.feed("service",str(os.getpid()),"stdout",(body+"\n").encode());framer.flush()
 shutdown()
 '''
+    burst_actor = r'''
+import json,os
+from relay.telemetry import initialize,operation,shutdown
+runtime=initialize("service")
+for batch in range(24):
+    for item in range(64):
+        with operation("relay.evaluate"):
+            value=batch*64+item
+            assert value>=0
+    assert runtime["providers"][0].force_flush(timeout_millis=2000)
+shutdown()
+print(json.dumps({"fixture_operations":1536}))
+'''
     log = (directory / "collector.log").open("wb")
     process = subprocess.Popen([args.collector, "--config=" + str(configuration)], env=env, stdout=log, stderr=subprocess.STDOUT)
     try:
@@ -165,6 +182,34 @@ shutdown()
         assert names["relay.operation.duration"].unit == "s"
         assert names["relay.operation.duration"].histogram.aggregation_temporality == 2
         assert names["relay.process.uptime"].HasField("gauge")
+        # Reproduce a brief upstream stall without slowing the application or
+        # generating any production work. Every expected span must arrive.
+        def received_span_count():
+            with lock:
+                batches = list(received)
+            return sum(len(scope.spans) for path, body, failed in batches
+                       if path == "/v1/traces" and not failed
+                       for resource in ExportTraceServiceRequest.FromString(body).resource_spans
+                       for scope in resource.scope_spans)
+        before_burst = received_span_count()
+        release_traces.clear()
+        try:
+            burst = subprocess.run([sys.executable, "-c", burst_actor], env=actor_env,
+                                   cwd=ROOT, capture_output=True, timeout=20)
+            (directory / "burst.stdout").write_bytes(burst.stdout)
+            (directory / "burst.stderr").write_bytes(burst.stderr)
+            assert burst.returncode == 0, "isolated burst actor failed"
+        finally:
+            release_traces.set()
+        deadline = time.monotonic() + 12
+        while received_span_count() < before_burst + 1536 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert received_span_count() == before_burst + 1536, "Collector dropped spans during the controlled upstream stall"
+        with urllib.request.urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=2) as response:
+            counters = response.read().decode()
+        for metric in counters.splitlines():
+            if metric.startswith("otelcol_exporter_enqueue_failed_"):
+                assert float(metric.rsplit(" ", 1)[1]) == 0, "Collector enqueue loss observed"
         reject.set()
         second = subprocess.run([sys.executable, "-c", actor], env=actor_env, cwd=ROOT, capture_output=True, timeout=20)
         (directory / "failure-isolation.stdout").write_bytes(second.stdout)
@@ -178,11 +223,13 @@ shutdown()
             "success_failure_and_dependency_children":True, "original_output_preserved":True,
             "redaction_preserves_nonsecret_detail":True, "untraced_log_retained":True,
             "cumulative_kinds_units_temporality_checked":True, "upstream_failure_does_not_break_application":True}
+        result["controlled_stall_burst_spans_delivered_without_enqueue_loss"] = 1536
         result["metric_metadata"] = [{"name":m.name,"unit":m.unit,"kind":m.WhichOneof("data"),
             "temporality":getattr(getattr(m,m.WhichOneof("data")),"aggregation_temporality",None)} for m in metrics]
         (directory / "result.json").write_text(json.dumps(result,indent=2)+"\n")
         print(json.dumps(result))
     finally:
+        release_traces.set()
         process.terminate()
         try: process.wait(timeout=8)
         except subprocess.TimeoutExpired: process.kill(); process.wait()

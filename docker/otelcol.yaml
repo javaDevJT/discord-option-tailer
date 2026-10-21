@@ -117,11 +117,11 @@ exporters:
     tls:
       insecure: false
       insecure_skip_verify: false
-    timeout: 5s
+    timeout: 10s
     sending_queue:
       enabled: true
-      num_consumers: 1
-      queue_size: 8
+      num_consumers: 2
+      queue_size: 64
     retry_on_failure:
       enabled: true
       initial_interval: 1s

@@ -181,6 +181,10 @@ def operation(name, *, kind="internal", attributes=None, carrier=None):
     if runtime is None or runtime["closed"]:
         yield NullSpan()
         return
+    from opentelemetry.instrumentation.utils import is_instrumentation_enabled
+    if not is_instrumentation_enabled():
+        yield NullSpan()
+        return
     from opentelemetry import trace
     from opentelemetry.propagate import extract
     from opentelemetry.trace import SpanKind, Status, StatusCode
@@ -264,7 +268,12 @@ def http_request(handler):
     path = urlsplit(handler.path).path
     route = path if path in DASHBOARD_ROUTES else "/static/*" if path.startswith("/static/") else "/other"
     if route in {"/healthz", "/api/status", "/api/telemetry"}:
-        yield NullSpan()
+        if _runtime is None:
+            yield NullSpan()
+        else:
+            from opentelemetry.instrumentation.utils import suppress_instrumentation
+            with suppress_instrumentation():
+                yield NullSpan()
         return
     attributes = {"http.request.method": handler.command, "http.route": route,
         "network.protocol.name": "http", "network.protocol.version": "1.1"}
