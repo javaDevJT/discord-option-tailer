@@ -1,5 +1,6 @@
 """Offline stop lifecycle checks; no provider requests or real orders."""
 import copy
+import hashlib
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -56,7 +57,7 @@ class StopChecks(unittest.IsolatedAsyncioTestCase):
         self.engine.broker = self.broker
         message = self.message() | {"source_group": group}
         self.store.observe(message)
-        order = {"client_order_id": "seed-" + group, "contract": CONTRACT, "quantity": quantity,
+        order = {"client_order_id": hashlib.sha256((message["id"] + ":" + message["revision"]).encode()).hexdigest(), "contract": CONTRACT, "quantity": quantity,
                  "side": "buy", "position_effect": "open", "limit_price": "0.80"}
         self.store.reserve(message, {"action": "OPEN"}, order, NOW)
         self.store.apply_result(order["client_order_id"], {"id": "seed-fill-" + group, "status": "filled", "filled_quantity": quantity, "fill_price": "0.80"})

@@ -1,6 +1,6 @@
 # Discord Option Tailer
 
-Discord Option Tailer watches exactly two configured Discord channels through a personal-account Gateway session (`discord.py-self`) or a manually signed-in browser. Complete literal entries use deterministic code without a model call. Other messages use optional JEV with subscription-backed Codex fallback. Existing option risk checks and a mode-bound SQLite ledger govern execution.
+Discord Option Tailer watches exactly two configured Discord channels through a personal-account Gateway session (`discord.py-self`) or a manually signed-in browser. Complete literal entries, bounded status updates, and exact management instructions with verified position attribution use deterministic code without a model call. Other messages use optional JEV with subscription-backed Codex fallback. Existing option risk checks and a mode-bound SQLite ledger govern execution.
 
 Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker data and save proposed orders, but it never submits them. **Live** is an explicit, paused setup action that can submit real Robinhood orders. Missed entries remain review-only; verified missed exits can close existing relay-owned contracts in Live.
 
@@ -9,6 +9,7 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 - [OpenWoof telemetry](docs/observability.md): original process logs, real dependency spans, typed metrics, private Collector, secure Mac/TrueNAS key custody and deployed verification boundaries.
 - [Image security gate](docs/container.md#build-and-published-image-path): local archive scanning, dependency refresh, runner-owned storage protection, and verified publication.
 - [Active watch polling](docs/container.md#active-watch-polling): ten-minute market refresh windows, broker request budgets, and fresh deterministic-entry snapshot reuse.
+- [Deterministic position management](docs/jev-evaluation-design.md#deterministic-management-and-source-episodes): exact half-sales with breakeven protection, full closes, status-only updates, and persistent source attribution.
 
 - [Codex position monitoring](docs/container.md#codex-position-monitoring): bounded broker polling, saved triggers, restart recovery, and Codex reassessment without another Discord post.
 

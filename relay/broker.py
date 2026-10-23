@@ -46,6 +46,9 @@ _PREPARED_ENTRY_TTL_SECONDS = 60.0
 _PREPARED_ENTRY_CACHE_LIMIT = 64
 _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS = 10.0
 _WATCH_ACCOUNT_REFRESH_SECONDS = 6.0
+_WATCH_ACCOUNT_SNAPSHOT_DELAY_SECONDS = 0.0
+_WATCH_MARKET_MAX_CONTRACTS = 8
+_WATCH_QUOTE_REFRESH_DEADLINE_SECONDS = 8.0
 _READ_BUDGET_WINDOW_SECONDS = 60.0
 _READ_BUDGET_TOTAL = 90
 _READ_BUDGET_BACKGROUND = 60
@@ -1474,6 +1477,11 @@ class RobinhoodBroker(RobinhoodMCP):
         self._watch_quotes = {}
         self._watch_generation = 0
         self._watch_refresh_lock = asyncio.Lock()
+        self._watch_quote_locks = {}
+        self._watch_snapshot_task = None
+        self._watch_snapshot_failure = None
+        self._watch_snapshot_retry_at = 0.0
+        self._watch_snapshot_next_refresh_at = 0.0
         self.attempted = set()
         self.account_changed = asyncio.Event()
         self._portfolio_task = None
@@ -2237,50 +2245,238 @@ class RobinhoodBroker(RobinhoodMCP):
         self._watch_generation += 1
         self._watch_snapshot = None
         self._watch_quotes.clear()
+        self._watch_snapshot_failure = None
+        self._watch_snapshot_retry_at = 0.0
+        self._watch_snapshot_next_refresh_at = 0.0
+        task = self._watch_snapshot_task
+        self._watch_snapshot_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def watch_market_batch_limit(self):
+        """Return a conservative quote batch size from the discovered tool schema."""
+        schema = getattr(self, "schemas", {}).get("get_option_quotes")
+        instrument_ids = (schema.get("properties", {}).get("instrument_ids")
+                          if isinstance(schema, dict) else None)
+        value_types = instrument_ids.get("type") if isinstance(instrument_ids, dict) else None
+        if value_types != "array" and not (
+                isinstance(value_types, list) and "array" in value_types):
+            return 1
+        items = instrument_ids.get("items")
+        item_types = items.get("type") if isinstance(items, dict) else None
+        if item_types != "string" and not (
+                isinstance(item_types, list) and "string" in item_types):
+            return 1
+        max_items = instrument_ids.get("maxItems", _WATCH_MARKET_MAX_CONTRACTS)
+        if type(max_items) is not int or max_items < 1:
+            return 1
+        # Large responses can be truncated by the provider; the watch list is
+        # itself capped at eight active candidates.
+        return min(max_items, _WATCH_MARKET_MAX_CONTRACTS)
+
+    async def _raw_watch_quotes(self, option_ids):
+        if not option_ids or len(set(option_ids)) != len(option_ids):
+            raise BrokerError("Watch quote batch requires unique instrument ids")
+        data = await self._data("get_option_quotes", {"instrument_ids": list(option_ids)})
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            raise BrokerError("Watch quote batch results are missing")
+        requested = set(option_ids)
+        quotes = {}
+        for row in results:
+            if row is None:
+                continue
+            if not isinstance(row, dict):
+                raise BrokerError("Watch quote batch contains an invalid result")
+            quote = row.get("quote")
+            if quote is None:
+                continue
+            if not isinstance(quote, dict):
+                raise BrokerError("Watch quote batch contains an invalid quote")
+            instrument_id = quote.get("instrument_id")
+            if not isinstance(instrument_id, str) or instrument_id not in requested:
+                raise BrokerError("Watch quote batch returned an unexpected instrument")
+            if instrument_id in quotes:
+                raise BrokerError("Watch quote batch returned a duplicate instrument")
+            _instant(quote.get("updated_at"))
+            quotes[instrument_id] = quote
+        missing = requested - quotes.keys()
+        if missing:
+            raise BrokerError("Watch quote batch omitted a requested instrument")
+        return quotes
 
     async def refresh_watch_market(self, contract):
-        """Read-only, shared account refresh plus the selected watch's quote."""
-        async with self._watch_refresh_lock, self.background_reads():
-            metadata = self.prepared_entry(contract, Decimal("1"))
-            if metadata is None:
+        """Preserve the single-contract entrypoint for existing broker consumers."""
+        result = await self.refresh_watch_market_batch([contract])
+        return {key: value for key, value in result.items() if key != "quotes"} | result["quotes"][0]
+
+    async def refresh_watch_market_batch(self, contracts):
+        """Refresh several prepared watch quotes in one bounded provider read."""
+        if not isinstance(contracts, (list, tuple)) or not contracts:
+            raise BrokerError("Watch quote batch requires at least one contract")
+        batch_limit = self.watch_market_batch_limit()
+        if len(contracts) > batch_limit:
+            error = BrokerError("Watch quote batch exceeds the discovered schema limit")
+            error._watch_market_diagnostic = {
+                "capacity_state": "shortfall", "batch_size": len(contracts), "batch_limit": batch_limit,
+            }
+            raise error
+
+        targets = [_contract_key(contract) for contract in contracts]
+        if len(set(targets)) != len(targets):
+            raise BrokerError("Watch quote batch contains a duplicate contract")
+        metadata = []
+        for contract, target in zip(contracts, targets):
+            prepared = self.prepared_entry(contract, Decimal("1"))
+            if prepared is None:
                 raise BrokerError("Watch metadata expired; awaiting contract preparation")
+            metadata.append((contract, target, prepared))
+        option_ids = [prepared["option_id"] for _, _, prepared in metadata]
+        if len(set(option_ids)) != len(option_ids):
+            raise BrokerError("Watch quote batch maps multiple contracts to one instrument")
+
+        async with self._watch_refresh_lock:
+            locks = [self._watch_quote_locks.setdefault(target, asyncio.Lock()) for target in targets]
+            while len(self._watch_quote_locks) > _PREPARED_ENTRY_CACHE_LIMIT:
+                oldest = next((key for key, candidate in self._watch_quote_locks.items()
+                               if key not in targets and not candidate.locked()), None)
+                if oldest is None:
+                    break
+                self._watch_quote_locks.pop(oldest, None)
+
+        async with AsyncExitStack() as stack:
+            for lock in (locks[index] for index in sorted(range(len(targets)), key=targets.__getitem__)):
+                await stack.enter_async_context(lock)
             started = time.monotonic()
             generation = self._watch_generation
-            cached = self._watch_snapshot
-            refresh_account = (cached is None or cached[1] != generation or self.account_changed.is_set()
-                               or started - cached[0] >= _WATCH_ACCOUNT_REFRESH_SECONDS)
-            # Background polling must not inherit an entry's execution-read cache.
+            budget = self._request_budget()
+            budget_before = await budget.stats()
             token = self._execution_scope_var.set(None)
-            tasks = []
             try:
-                tasks.append(asyncio.create_task(self._raw_quote(metadata["option_id"])))
-                if refresh_account:
-                    tasks.append(asyncio.create_task(self.snapshot()))
-                results = await asyncio.gather(*tasks)
-                quote = results[0]
-                self._check_quote_age(quote["updated_at"])
-                bid, ask = _decimal(quote["bid_price"], "watch bid"), _decimal(quote["ask_price"], "watch ask")
-                if bid < 0 or ask <= 0 or ask < bid:
-                    raise BrokerError("Watch quote prices are invalid")
+                async with self.background_reads():
+                    # Let the quote request queue before the shared snapshot if
+                    # both become eligible for the same background token.
+                    quote_task = asyncio.create_task(self._raw_watch_quotes(option_ids))
+                    account_state = self._schedule_watch_account_snapshot(generation)
+                    try:
+                        quotes = await asyncio.wait_for(
+                            quote_task, timeout=_WATCH_QUOTE_REFRESH_DEADLINE_SECONDS)
+                    except asyncio.TimeoutError:
+                        budget_after = await budget.stats()
+                        not_admitted = (
+                            budget_after["total_calls"] == budget_before["total_calls"]
+                            and budget_after["background_calls"] == budget_before["background_calls"]
+                        )
+                        error = BrokerError("Watch quote batch exceeded its deadline")
+                        error._watch_market_diagnostic = {
+                            "deadline_seconds": _WATCH_QUOTE_REFRESH_DEADLINE_SECONDS,
+                            "capacity_state": "shortfall" if not_admitted else "admitted_or_concurrent",
+                            "request_budget": budget_after, "batch_size": len(contracts),
+                            "batch_limit": batch_limit,
+                        }
+                        _annotate_failure_safely(
+                            error, stage="watch_market_quote",
+                            code="rate_limited" if not_admitted else "timeout")
+                        raise error from None
+
                 if self._watch_generation != generation:
                     raise BrokerError("Account changed during watch refresh; discarded old data")
-                if refresh_account:
-                    self._watch_snapshot = (started, generation, copy.deepcopy(results[1]))
-                self._watch_quotes[_contract_key(contract)] = (started, generation, copy.deepcopy(quote))
+
+                quote_rows = []
+                staged_quotes = []
+                for (contract, target, prepared), option_id in zip(metadata, option_ids):
+                    quote = quotes[option_id]
+                    self._check_quote_age(quote["updated_at"])
+                    bid = _decimal(quote["bid_price"], "watch bid")
+                    ask = _decimal(quote["ask_price"], "watch ask")
+                    if bid < 0 or ask <= 0 or ask < bid:
+                        raise BrokerError("Watch quote prices are invalid")
+                    staged_quotes.append((target, copy.deepcopy(quote)))
+                    quote_rows.append({
+                        "contract": copy.deepcopy(prepared["contract"]),
+                        "instrument_id": option_id, "quote_timestamp": quote["updated_at"],
+                        "bid": str(bid), "ask": str(ask),
+                    })
+                for target, quote in staged_quotes:
+                    self._watch_quotes[target] = (started, generation, quote)
                 while len(self._watch_quotes) > _PREPARED_ENTRY_CACHE_LIMIT:
                     self._watch_quotes.pop(next(iter(self._watch_quotes)))
+
+                snapshot = self._watch_snapshot
+                if (snapshot is not None and snapshot[1] == generation and not self.account_changed.is_set()
+                        and 0 <= time.monotonic() - snapshot[0] < _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS):
+                    account_state = "cached" if account_state != "refreshing" else "refreshing"
+                elif snapshot is not None and account_state == "refreshing":
+                    account_state = "stale"
                 return {
-                    "account_snapshot": "refreshed" if refresh_account else "cached",
-                    "account_age_seconds": round(time.monotonic() - self._watch_snapshot[0], 3),
-                    "quote_timestamp": quote["updated_at"], "bid": str(bid), "ask": str(ask),
-                    "request_budget": await self._request_budget().stats(),
+                    "quotes": quote_rows, "quote_deadline_seconds": _WATCH_QUOTE_REFRESH_DEADLINE_SECONDS,
+                    "account_snapshot": account_state,
+                    "account_age_seconds": (round(time.monotonic() - snapshot[0], 3)
+                                            if snapshot is not None and snapshot[1] == generation else None),
+                    "account_snapshot_failure": self._watch_snapshot_failure,
+                    "request_budget": await budget.stats(),
+                    "batch_size": len(contracts), "batch_limit": batch_limit,
                 }
             finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
                 self._execution_scope_var.reset(token)
+
+    def _schedule_watch_account_snapshot(self, generation):
+        """Refresh the shared snapshot every six seconds without extending its TTL."""
+        now = time.monotonic()
+        cached = self._watch_snapshot
+        cache_age = now - cached[0] if cached is not None and cached[1] == generation else None
+        changed = self.account_changed.is_set()
+        task = self._watch_snapshot_task
+        if task is not None and not task.done():
+            return "refreshing" if cache_age is not None and 0 <= cache_age < _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS and not changed else "stale"
+        if now < self._watch_snapshot_retry_at:
+            return "failed"
+        if (cache_age is not None and not changed and 0 <= cache_age < _WATCH_ACCOUNT_SNAPSHOT_TTL_SECONDS
+                and now < self._watch_snapshot_next_refresh_at):
+            return "cached"
+        self._watch_snapshot_next_refresh_at = now + _WATCH_ACCOUNT_REFRESH_SECONDS
+        task = asyncio.create_task(self._refresh_watch_account_snapshot(
+            generation, _WATCH_ACCOUNT_SNAPSHOT_DELAY_SECONDS))
+        self._watch_snapshot_task = task
+        task.add_done_callback(self._watch_account_snapshot_done)
+        return "refreshing" if cache_age is None else "stale"
+
+    async def _refresh_watch_account_snapshot(self, generation, delay_seconds):
+        token = self._execution_scope_var.set(None)
+        try:
+            async with self.background_reads():
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+                if self._watch_generation != generation:
+                    return
+                started = time.monotonic()
+                snapshot = await self.snapshot()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if self._watch_generation == generation:
+                _, self._watch_snapshot_failure = execution_failure(error, stage="snapshot")
+                self._watch_snapshot_retry_at = time.monotonic() + _WATCH_ACCOUNT_REFRESH_SECONDS
+            return
+        finally:
+            self._execution_scope_var.reset(token)
+        if self._watch_generation == generation and not self.account_changed.is_set():
+            self._watch_snapshot = (started, generation, copy.deepcopy(snapshot))
+            self._watch_snapshot_failure = None
+            self._watch_snapshot_retry_at = 0.0
+
+    def _watch_account_snapshot_done(self, task):
+        if self._watch_snapshot_task is task:
+            self._watch_snapshot_task = None
+
+    async def close_watch_market(self):
+        """Cancel only watch-owned background work during engine shutdown."""
+        task = self._watch_snapshot_task
+        self._watch_snapshot_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._watch_quote_locks.clear()
 
     def watch_entry_snapshot(self, contract, *, diagnostic=None):
         def miss(reason):

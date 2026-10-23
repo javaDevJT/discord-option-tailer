@@ -9,12 +9,122 @@ import httpx
 
 from relay.broker import (
     BrokerError, RobinhoodMCP, _BrokerBudgetHold, _BrokerReadBudget,
+    _READ_BUDGET_BACKGROUND, _READ_BUDGET_TOTAL, _WATCH_QUOTE_REFRESH_DEADLINE_SECONDS,
     _rate_limited, _retry_after_delay,
+)
+from relay.watch import (
+    WATCH_MARKET_REQUEST_INTERVAL_SECONDS, WATCH_PREPARATION_REFRESH_MAX_SECONDS,
+    WATCH_PREPARATION_REFRESH_MIN_SECONDS,
 )
 from tests import test_watch_broker as watch_fixtures
 
 
 class BudgetChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_four_watch_budget_keeps_quote_and_account_data_inside_ten_seconds(self):
+        now = [0.0]
+
+        async def advance(seconds):
+            now[0] += seconds
+
+        budget = _BrokerReadBudget(clock=lambda: now[0], sleep=advance)
+        events = []
+        quote_index = 0
+        while quote_index * WATCH_MARKET_REQUEST_INTERVAL_SECONDS < 120:
+            due = quote_index * WATCH_MARKET_REQUEST_INTERVAL_SECONDS
+            events.extend(((due, "snapshot_start", None), (due, "quote_batch", quote_index)))
+            events.extend((due, "snapshot", read_index) for read_index in range(4))
+            quote_index += 1
+        for index in range(4):
+            interval = WATCH_PREPARATION_REFRESH_MIN_SECONDS + index / 3 * (
+                WATCH_PREPARATION_REFRESH_MAX_SECONDS - WATCH_PREPARATION_REFRESH_MIN_SECONDS)
+            due = interval
+            while due < 120:
+                events.extend((due, "metadata", index) for _ in range(2))
+                due += interval
+        events.sort(key=lambda event: (event[0], {
+            "snapshot_start": 0, "quote_batch": 1, "snapshot": 2, "metadata": 3,
+        }[event[1]], -1 if event[2] is None else event[2]))
+
+        last_quote = None
+        last_snapshot = None
+        max_quote_gap = 0.0
+        max_snapshot_age_at_quote = 0.0
+        max_quote_admission_wait = 0.0
+        for due, kind, _index in events:
+            now[0] = max(now[0], due)
+            if kind == "snapshot_start":
+                last_snapshot = float(due)
+                continue
+            admitted_at = await budget.acquire(background=True)
+            if kind == "quote_batch":
+                if last_quote is not None:
+                    max_quote_gap = max(max_quote_gap, admitted_at - last_quote)
+                if last_snapshot is not None:
+                    max_snapshot_age_at_quote = max(max_snapshot_age_at_quote, admitted_at - last_snapshot)
+                max_quote_admission_wait = max(max_quote_admission_wait, admitted_at - due)
+                last_quote = admitted_at
+                now[0] += 2.0  # Two-second transport tolerance, counted against the 8s deadline.
+            stats = await budget.stats()
+            self.assertLessEqual(stats["background_calls"], _READ_BUDGET_BACKGROUND)
+            self.assertLessEqual(stats["total_calls"], _READ_BUDGET_TOTAL)
+
+        self.assertLessEqual(max_quote_gap, 10)
+        self.assertLessEqual(max_snapshot_age_at_quote, 10)
+        self.assertLess(max_quote_admission_wait, _WATCH_QUOTE_REFRESH_DEADLINE_SECONDS - 2.0)
+
+    async def test_held_position_load_exposes_capacity_shortfall(self):
+        now = [0.0]
+
+        async def advance(seconds):
+            now[0] += seconds
+
+        budget = _BrokerReadBudget(clock=lambda: now[0], sleep=advance)
+        events = []
+        for due in range(0, 120, int(WATCH_MARKET_REQUEST_INTERVAL_SECONDS)):
+            events.extend(((float(due), "snapshot_start", None), (float(due), "quote_batch", None)))
+            # Four base snapshot reads plus contract and quote reads for one
+            # held position exceed the remaining background request budget.
+            events.extend((float(due), "snapshot", index) for index in range(6))
+        for index in range(4):
+            interval = WATCH_PREPARATION_REFRESH_MIN_SECONDS + index / 3 * (
+                WATCH_PREPARATION_REFRESH_MAX_SECONDS - WATCH_PREPARATION_REFRESH_MIN_SECONDS)
+            due = interval
+            while due < 120:
+                events.extend((due, "metadata", index) for _ in range(2))
+                due += interval
+        events.sort(key=lambda event: (event[0], {
+            "snapshot_start": 0, "quote_batch": 1, "snapshot": 2, "metadata": 3,
+        }[event[1]], -1 if event[2] is None else event[2]))
+
+        last_quote = None
+        last_snapshot = None
+        stale_quotes = stale_snapshots = deadline_shortfalls = 0
+        max_quote_wait = 0.0
+        for due, kind, _index in events:
+            now[0] = max(now[0], due)
+            if kind == "snapshot_start":
+                last_snapshot = float(due)
+                continue
+            admitted_at = await budget.acquire(background=True)
+            if kind == "quote_batch":
+                wait = admitted_at - due
+                max_quote_wait = max(max_quote_wait, wait)
+                if wait + 2.0 > _WATCH_QUOTE_REFRESH_DEADLINE_SECONDS:
+                    deadline_shortfalls += 1
+                if last_quote is not None and admitted_at - last_quote > 10:
+                    stale_quotes += 1
+                if last_snapshot is not None and admitted_at - last_snapshot > 10:
+                    stale_snapshots += 1
+                last_quote = admitted_at
+                now[0] += 2.0
+            stats = await budget.stats()
+            self.assertLessEqual(stats["background_calls"], _READ_BUDGET_BACKGROUND)
+            self.assertLessEqual(stats["total_calls"], _READ_BUDGET_TOTAL)
+
+        self.assertGreater(max_quote_wait, 0)
+        self.assertGreater(stale_quotes + stale_snapshots, 0)
+        self.assertGreater(deadline_shortfalls, 0)
+
     async def test_background_ceiling_preserves_foreground_burst_and_rolls_over(self):
         now = [100.0]
         budget = _BrokerReadBudget(clock=lambda: now[0])
@@ -78,7 +188,11 @@ class WatchMarketChecks(unittest.IsolatedAsyncioTestCase):
 
     async def warm_market(self):
         await self.broker.prewarm_entry(self.contract)
-        return await self.broker.refresh_watch_market(self.contract)
+        result = await self.broker.refresh_watch_market(self.contract)
+        task = self.broker._watch_snapshot_task
+        if task is not None:
+            await task
+        return result
 
     async def test_shared_account_refresh_and_cached_snapshot_reach_submission(self):
         await self.warm_market()
@@ -118,22 +232,23 @@ class WatchMarketChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_inflight_refresh_cannot_publish_after_mutation(self):
         await self.broker.prewarm_entry(self.contract)
-        started, release = asyncio.Event(), asyncio.Event()
-        original = self.broker.snapshot
+        started, cancelled = asyncio.Event(), asyncio.Event()
 
         async def held_snapshot():
-            value = await original()
             started.set()
-            await release.wait()
-            return value
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
 
         self.broker.snapshot = held_snapshot
-        task = asyncio.create_task(self.broker.refresh_watch_market(self.contract))
+        result = await self.broker.refresh_watch_market(self.contract)
+        self.assertTrue(result["quote_timestamp"])
         await started.wait()
+        snapshot_task = self.broker._watch_snapshot_task
         self.broker._invalidate_watch_market()
-        release.set()
-        with self.assertRaisesRegex(BrokerError, "changed during watch refresh"):
-            await task
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+        self.assertTrue(cancelled.is_set())
         self.assertIsNone(self.broker._watch_snapshot)
         self.assertEqual(self.broker._watch_quotes, {})
 

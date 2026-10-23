@@ -20,6 +20,7 @@ import tomllib
 from zoneinfo import ZoneInfo
 
 from .status import publish_status
+from .signal_text import is_gain_status
 from .telemetry import traced
 from .monitor_contract import project_monitor_facts, validate_monitor_plan
 from .images import (
@@ -247,6 +248,12 @@ an explicit full exit into a discretionary profit-only exit. General gains
 bragging, performance recaps, historical action descriptions and unfulfilled
 future price triggers remain IGNORE or WAIT. A current action report is not a
 recap merely because it uses past tense.
+Distinguish performance from sale size. "TOOK MOST HERE 35%" or "30% HERE TOOK
+MOST" reports a gain beside an unquantified partial sale; it does not say to
+sell 35% or 30% of the contracts. For that current partial sale use REDUCE with
+quantity=null and fraction=null, retaining the engine's existing guarded default.
+"Sold 50% of the contracts" and the exact report "took 50% here" do specify the
+sale fraction. Never copy an adjacent performance percentage into exit sizing.
 Never copy an alert author's position size as the user's risk budget. Use null
 for unprovided prices and fields; alert_price is an explicit option premium.
 
@@ -626,6 +633,8 @@ def _decimal(value, field):
 def _profit_update_without_exit_intent(text):
     """Veto status-only exits; the model still resolves intent, contract and size."""
     text = re.sub(r"<[^>]*>|https?://\S+", " ", text.lower())
+    if is_gain_status(re.sub(r"^\s*comment\s*$", "", text, flags=re.M).strip()):
+        return True
     if not re.search(r"\b(?:up|green|paid|winners?|winning|profits?|gains?|targets?|market|session)\b", text):
         return False
     # Session timing and a position 'closing well' are not option-close verbs.

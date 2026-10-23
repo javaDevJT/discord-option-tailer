@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from .broker import BrokerPreflightHold
 from .telemetry import traced
 from .interpreter import InterpretationError, safe_interpretation_reason
+from .episodes import initialize_episodes, record_episode, resolve_episode, episode_diagnostic
 from .status import annotate_failure, execution_check, execution_failure, failure_stage, log_execution
 
 UTC = timezone.utc
@@ -337,6 +338,7 @@ class Store:
         # A crash after dispatch cannot establish whether the broker accepted an order.
         self.db.execute("UPDATE orders SET status='unknown' WHERE status='submitting'")
         self.db.commit()
+        initialize_episodes(self.db)
 
     def close(self):
         self.db.close()
@@ -371,7 +373,8 @@ class Store:
             self.db.execute("INSERT INTO source_generations VALUES (?,1) ON CONFLICT(source_group) DO UPDATE SET generation=generation+1", (message["source_group"],))
             self.db.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?)", (
                 message["id"], message["channel_id"], message["source_group"], message["timestamp"],
-                message["revision"], json.dumps({k: v for k, v in message.items() if k not in {"_received_monotonic", "_evaluation_claim", "_execution_started"}})))
+                message["revision"], json.dumps({k: v for k, v in message.items() if k not in {"_received_monotonic", "_evaluation_claim", "_execution_started", "_position_episode"}})))
+            record_episode(self.db, message)
             event = self.db.execute("INSERT OR IGNORE INTO events(message_id,revision,state,reason,created_at) VALUES (?,?,?,?,?)", (
                 message["id"], message["revision"], "observed", "awaiting interpretation", datetime.now(UTC).isoformat()))
         # History can restore an older revision. Refresh current source state,
@@ -443,6 +446,8 @@ class Store:
                     if isinstance(duration, (int, float)):
                         timing["delayed"] = elapsed > duration + 1
         with self.db:
+            if decision and decision.get("action") == "OPEN":
+                record_episode(self.db, message, force=True)
             self.db.execute("UPDATE events SET state=?,reason=?,decision=? WHERE message_id=? AND revision=?", (
                 state, reason, json.dumps(decision) if decision else None, message["id"], message["revision"]))
         if decision and state not in {"evaluating", "evaluated", "recovery_pending", "recovery_evaluating"}:
@@ -777,6 +782,34 @@ class Engine:
             raise Hold("the original action message was revised")
         return origin
 
+    def guard_position_episode(self, message, decision, episode):
+        """Do not let an unqualified management comment drift to an older holding."""
+        if decision.get("action") not in {"REDUCE", "CLOSE", "UPDATE_STOP"}:
+            return decision
+        from .entry_rules import option_matches, visible_text
+        if option_matches(visible_text(message)):
+            return decision  # An explicit contract still passes ordinary ownership checks.
+        if not episode.get("entry_message") and not message.get("reply_to"):
+            return decision
+        if (episode.get("context_ambiguity")
+                and decision.get("evaluation_timing", {}).get("evaluator") != "rules"):
+            # Unknown prose is for the contextual model; exact unowned/flat
+            # entry episodes below remain a deterministic execution veto.
+            return decision
+        if episode.get("state") == "owned":
+            try:
+                if canonical_contract(decision.get("contract")) == canonical_contract(episode.get("contract")):
+                    return decision
+            except Hold:
+                pass
+        return decision | {
+            "action": "WAIT", "contract": None, "origin_message_id": None,
+            "quantity": None, "fraction": None, "alert_price": None,
+            "stop_price": None, "profit_only": False, "monitor": None,
+            "reason": "Management withheld: " + episode.get("reason", "position episode is uncertain") +
+                      "; an unqualified comment cannot change another position.",
+        }
+
     async def verify_dispatch(self, message, decision, order, snapshot=None, quote=None, *, recovery_guard=None, expiry_guard=None, verify_source=True, source_message=None):
         """Recheck intent after broker review and retain the result of each guard."""
         trace = decision.setdefault("dispatch_checks", [])
@@ -930,6 +963,7 @@ class Engine:
         # Model work is concurrent; account execution remains serialized.
         message = dict(message)
         message.pop("_evaluation_claim", None)
+        message.pop("_position_episode", None)
         channel = self.channels.get(str(message.get("channel_id")))
         if not channel or not channel_allows_author(channel, message.get("author_id", "")):
             return {"message_id": message.get("id"), "state": "untrusted", "reason": "channel or author is not allowlisted"}
@@ -989,6 +1023,27 @@ class Engine:
                     raise Hold("kill switch is present")
                 self.watches.note(message)
             context = self.store.context(message, self.config.get("llm", {}).get("context_messages", 60))
+            episode_started = time.monotonic()
+            episode = resolve_episode(self.store.db, message)
+            entry = episode.get("entry_message")
+            required_context = []
+            if entry and entry["id"] != message["id"]:
+                entry_channel = self.channels.get(str(entry.get("channel_id")))
+                if (not entry_channel or entry_channel.get("role") != "signals"
+                        or entry_channel.get("source_group") != message["source_group"]
+                        or not channel_allows_author(entry_channel, entry.get("author_id", ""))):
+                    episode = episode | {"state": "ambiguous", "reason": "entry source is no longer authorized"}
+                else:
+                    required_context.append(entry)
+            if episode.get("blocking_message"):
+                required_context.append(episode["blocking_message"])
+            if required_context:
+                pins = {item["id"]: item for item in required_context}
+                others = [item for item in context if item["id"] not in pins]
+                context = sorted(others[-(60 - len(pins)):] + list(pins.values()),
+                                 key=lambda item: (instant(item["timestamp"]), int(item["id"])))
+            message["_position_episode"] = episode
+            timing["episode_resolution_seconds"] = round(time.monotonic() - episode_started, 6)
             attempt = self.store.begin_evaluation(message)
             if attempt is None:
                 return {"message_id": message["id"], "state": "duplicate", "reason": "evaluation already claimed"}
@@ -997,6 +1052,9 @@ class Engine:
             self.store.record(message, "evaluating", "Evaluating message", {"evaluation_timing": timing})
             model_started = time.monotonic()
             decision = await self.interpreter.interpret(message, context, self.store.positions())
+            decision = self.guard_position_episode(message, decision, episode)
+            if episode.get("entry_message"):
+                decision["position_episode"] = episode_diagnostic(episode)
             timing.update(decision.get("evaluation_timing", {}))
             # The model's completion is provisional until deterministic execution checks finish.
             for key in ("decision_at", "posted_to_decision_seconds", "delayed"):

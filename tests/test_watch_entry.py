@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from tests import test_core as fixtures
 from relay.core import Engine, Hold, Store
-from relay.watch import watch_candidate
+from relay.watch import WATCH_MARKET_REQUEST_INTERVAL_SECONDS, watch_candidate
 
 
 class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
@@ -101,6 +101,148 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(selected["market_polled_at"], 10)
         self.assertIs(self.engine.watches._next_market_entry(), entries[duplicate["id"]])
         self.assertEqual(self.broker.submissions, [])
+
+    async def test_capacity_shortfall_diagnostic_keeps_last_success_age(self):
+        watch = await self.warm()
+        entry = self.engine.watches.entries[watch["id"]]
+        entry["market_success_at"] = time.monotonic() - 2
+        previous_success = entry["market_success_at"]
+        error = RuntimeError("watch capacity shortfall")
+        error._watch_market_diagnostic = {
+            "deadline_seconds": 8.0, "capacity_state": "shortfall",
+            "request_budget": {"total_calls": 90, "background_calls": 60},
+        }
+        self.broker.refresh_watch_market = AsyncMock(side_effect=error)
+        await self.engine.watches._refresh_market(entry)
+        self.assertEqual(entry["market_diagnostic"]["capacity_state"], "shortfall")
+        self.assertEqual(entry["market_diagnostic"]["schedule"]["poll_interval_seconds"], 6.0)
+        self.assertEqual(entry["market_success_at"], previous_success)
+        self.assertGreater(entry["market_diagnostic"]["duration_seconds"], 0)
+
+    async def test_four_distinct_watches_share_one_bounded_market_batch(self):
+        symbols = ("BAC", "QQQ", "SPY", "IWM")
+        entries = []
+        for symbol in symbols:
+            message = await self.warm(f"On watch {symbol} $63C 9/18")
+            entry = self.engine.watches.entries[message["id"]]
+            entry["contract"] = fixtures.CONTRACT | {"symbol": symbol, "strike": str(60 + len(entries))}
+            entries.append(entry)
+
+        batch_started, completed = asyncio.Event(), asyncio.Event()
+        batches = []
+        release = asyncio.Event()
+
+        async def held_refresh(contracts):
+            batches.append(contracts)
+            batch_started.set()
+            await release.wait()
+            completed.set()
+            return {
+                "quotes": [
+                    {"contract": contract, "quote_timestamp": self.now.isoformat(), "bid": ".95", "ask": "1.00"}
+                    for contract in contracts
+                ],
+                "account_snapshot": "refreshing",
+            }
+
+        self.broker.refresh_watch_market_batch = held_refresh
+        self.broker.watch_market_batch_limit = Mock(return_value=8)
+        started = time.monotonic()
+        runner = asyncio.create_task(self.engine.watches.run())
+        try:
+            await asyncio.wait_for(batch_started.wait(), WATCH_MARKET_REQUEST_INTERVAL_SECONDS + .5)
+            self.assertEqual(len(batches), 1)
+            self.assertEqual(len(batches[0]), 4)
+            self.assertEqual({contract["symbol"] for contract in batches[0]}, set(symbols))
+            await asyncio.sleep(.05)
+            self.assertEqual(len(batches), 1)
+            release.set()
+            await asyncio.wait_for(completed.wait(), .5)
+            for entry in entries:
+                self.assertEqual(entry["market_diagnostic"]["state"], "ready")
+                self.assertEqual(entry["market_diagnostic"]["schedule"]["poll_interval_seconds"], 6.0)
+            self.assertLess(time.monotonic() - started, WATCH_MARKET_REQUEST_INTERVAL_SECONDS)
+        finally:
+            release.set()
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+
+    async def test_slow_expired_metadata_cannot_poison_healthy_market_batch(self):
+        slow_message = await self.warm("On watch BAC $63C 9/18")
+        unprepared_message = await self.warm("On watch IWM $63C 9/18")
+        healthy_message = await self.warm("On watch QQQ $740P 9/18")
+        entries = self.engine.watches.entries
+        slow = entries[slow_message["id"]]
+        unprepared = entries[unprepared_message["id"]]
+        healthy = entries[healthy_message["id"]]
+
+        original_prepared_entry = self.broker.prepared_entry
+        state = {"slow_expired": False}
+
+        def prepared_entry(contract, price, **kwargs):
+            if contract["symbol"] == "IWM" or (
+                    contract["symbol"] == "BAC" and state["slow_expired"]):
+                return None
+            return original_prepared_entry(contract, price, **kwargs)
+
+        self.broker.prepared_entry = prepared_entry
+        self.broker.watch_market_batch_limit = Mock(return_value=1)
+        unprepared["market_polled_at"] = 0
+        healthy["market_polled_at"] = 100
+
+        preparation_started, release_preparation = asyncio.Event(), asyncio.Event()
+        prewarm_calls = []
+
+        async def slow_prewarm(contract):
+            prewarm_calls.append(dict(contract))
+            if contract["symbol"] == "BAC":
+                preparation_started.set()
+                await release_preparation.wait()
+
+        self.broker.prewarm_entry = slow_prewarm
+        slow["refresh_at"] = 0
+        self.engine.watches._schedule(slow)
+
+        batches = []
+
+        async def refresh_batch(contracts):
+            batches.append(copy.deepcopy(contracts))
+            return {"quotes": [
+                {"contract": dict(contract), "bid": ".95", "ask": "1.00"}
+                for contract in contracts
+            ]}
+
+        self.broker.refresh_watch_market_batch = refresh_batch
+        try:
+            await asyncio.wait_for(preparation_started.wait(), .5)
+            self.assertTrue(slow["busy"])
+
+            # While preparation is slow, the prior metadata is still locally
+            # readable. Busy state alone must keep it out of the quote batch.
+            prepared_call_count = len(prewarm_calls)
+            selected = self.engine.watches._next_market_entries()
+            self.assertEqual(selected, [healthy])
+
+            # Simulate the 60-second metadata TTL expiring before preparation
+            # finishes. The expired busy contract and an idle unprepared
+            # contract must not displace or poison the healthy quote.
+            state["slow_expired"] = True
+            selected = self.engine.watches._next_market_entries()
+            self.assertEqual(selected, [healthy])
+            self.assertEqual(len(prewarm_calls), prepared_call_count)
+
+            await self.engine.watches._refresh_market_batch(selected)
+            self.assertEqual(batches, [[healthy["contract"]]])
+            self.assertEqual(healthy["market_diagnostic"]["state"], "ready")
+
+            release_preparation.set()
+            await asyncio.gather(*list(self.engine.watches.tasks))
+            self.assertFalse(slow["busy"])
+            # Once no longer busy, expired local metadata is still filtered.
+            self.assertEqual(self.engine.watches._next_market_entries(), [healthy])
+        finally:
+            release_preparation.set()
+            await asyncio.gather(*list(self.engine.watches.tasks), return_exceptions=True)
 
     async def test_slow_refresh_yields_to_another_contract_before_watch_window_ends(self):
         first = await self.warm("On watch BAC $63C 9/18")

@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from .interpreter import InterpretationError, validate_decision
 from .entry_rules import deterministic_entry
+from .management_rules import deterministic_management
 from .jev import (
     JEVError,
     JEVInterpreter,
@@ -190,6 +191,22 @@ class EvaluationRouter:
                 elapsed = time.monotonic() - started
                 result = _merge_timing(decision, {
                     "evaluator": "rules", "route": "direct", "model": "deterministic-entry-v1",
+                    "rules_duration_seconds": round(elapsed, 6),
+                    "semantic_confidence": decision["confidence"],
+                    "allocation_confidence": decision["confidence"],
+                    "fast_path": True, "eligible": True,
+                }, elapsed)
+                result["evaluation_timing"]["model_duration_seconds"] = 0.0
+                return result
+
+        if mode != "jev_shadow":
+            decision = deterministic_management(message, context, positions,
+                                                episode=message.get("_position_episode"))
+            if decision is not None:
+                decision = validate_decision(decision, message, list(context), positions=list(positions))
+                elapsed = time.monotonic() - started
+                result = _merge_timing(decision, {
+                    "evaluator": "rules", "route": "direct", "model": "deterministic-management-v1",
                     "rules_duration_seconds": round(elapsed, 6),
                     "semantic_confidence": decision["confidence"],
                     "allocation_confidence": decision["confidence"],

@@ -86,6 +86,8 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     cp /src/pyproject.toml /src/README.md /src/config.example.json /app/ \
     && cp -a /src/relay /src/docker /app/ \
     && /opt/venv/bin/pip install --no-cache-dir --no-deps . \
+    && RELAY_OTEL_ENABLED=0 /opt/venv/bin/python -m relay.cli --help >/dev/null \
+    && RELAY_OTEL_ENABLED=0 /opt/venv/bin/python -c 'from relay.episodes import resolve_episode; from relay.management_rules import deterministic_management' \
     && cp -a /app/docker/. /opt/relay-docker/ \
     && cp /app/docker/nginx.conf /etc/nginx/nginx.conf \
     && cp /app/docker/supervisord.conf /etc/supervisor/conf.d/relay.conf \

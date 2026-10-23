@@ -12,9 +12,14 @@ from .entry_rules import _normalize_expiry, _source_date, option_matches, visibl
 from .status import execution_failure
 
 
-WATCH_POLL_SECONDS = 3
+WATCH_POLL_SECONDS = 0.25
 WATCH_POLL_WINDOW_SECONDS = 600
-WATCH_REFRESH_TIMEOUT_SECONDS = 10
+WATCH_MARKET_CONCURRENCY = 1
+WATCH_MARKET_REQUEST_INTERVAL_SECONDS = 6.0
+WATCH_MARKET_MAX_CONTRACTS = 8
+WATCH_PREPARATION_REFRESH_MIN_SECONDS = 45.0
+WATCH_PREPARATION_REFRESH_MAX_SECONDS = 55.0
+WATCH_REFRESH_TIMEOUT_SECONDS = 8.0
 
 
 def watch_candidate(message):
@@ -39,7 +44,8 @@ class WatchEntries:
         self.engine = engine
         self.entries = {}
         self.tasks = set()
-        self.market_task = None
+        self.market_tasks = set()
+        self.market_inflight_contracts = set()
         self.market_refresh_at = 0
 
     def note(self, message):
@@ -62,7 +68,7 @@ class WatchEntries:
                      expires=time.monotonic() + 3600, refresh_at=0, busy=False,
                      hot_until=time.monotonic() + max(0, WATCH_POLL_WINDOW_SECONDS -
                          max(0, (self.engine.clock() - instant(message["timestamp"])).total_seconds())),
-                     market_polled_at=0)
+                     market_polled_at=0, market_success_at=0)
         self.entries.pop(message["id"], None)
         self.entries[message["id"]] = entry
         while len(self.entries) > 8:
@@ -85,6 +91,16 @@ class WatchEntries:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
+    def _preparation_refresh_interval(self, entry):
+        identities = list(self.entries)
+        try:
+            index = identities.index(entry["message"]["id"])
+        except ValueError:
+            index = 0
+        fraction = index / max(1, len(identities) - 1)
+        return WATCH_PREPARATION_REFRESH_MIN_SECONDS + fraction * (
+            WATCH_PREPARATION_REFRESH_MAX_SECONDS - WATCH_PREPARATION_REFRESH_MIN_SECONDS)
+
     async def _prepare(self, entry):
         diagnostic = {"route": "fresh", "reason": "watch_preparing",
                       "watch_message_id": entry["message"]["id"],
@@ -97,12 +113,15 @@ class WatchEntries:
             async with getattr(self.engine.broker, "background_reads", nullcontext)():
                 requested = entry["requested"]
                 if requested["expiry"] == "nearest":
-                    anchored = canonical_contract(requested | {"expiry": entry["day"]})
-                    resolution = diagnostic.setdefault("expiry_resolution", {})
-                    contract = canonical_contract(await self.engine.broker.nearest_expiry(anchored, diagnostic=resolution))
-                    if (any(contract[k] != anchored[k] for k in ("symbol", "strike", "option_type"))
-                            or contract["expiry"] < anchored["expiry"]):
-                        raise Hold("watch expiry resolution changed the intended contract")
+                    if entry["contract"] is not None:
+                        contract = canonical_contract(entry["contract"])
+                    else:
+                        anchored = canonical_contract(requested | {"expiry": entry["day"]})
+                        resolution = diagnostic.setdefault("expiry_resolution", {})
+                        contract = canonical_contract(await self.engine.broker.nearest_expiry(anchored, diagnostic=resolution))
+                        if (any(contract[k] != anchored[k] for k in ("symbol", "strike", "option_type"))
+                                or contract["expiry"] < anchored["expiry"]):
+                            raise Hold("watch expiry resolution changed the intended contract")
                 else:
                     contract = canonical_contract(requested)
                 await self.engine.broker.prewarm_entry(contract)
@@ -117,46 +136,159 @@ class WatchEntries:
             diagnostic["reason"] = "watch_preparation_failed"
             _, diagnostic["failure"] = execution_failure(error, stage="watch_preparation")
         finally:
-            entry["refresh_at"] = time.monotonic() + 30
+            entry["refresh_at"] = time.monotonic() + self._preparation_refresh_interval(entry)
             entry["busy"] = False
 
-    def _next_market_entry(self):
+    def _next_market_entries(self):
         now = time.monotonic()
         # Duplicate notices for the same contract share one slot in the rotation.
         candidates = {}
         for entry in self.entries.values():
-            if not entry["contract"] or now >= entry["hot_until"] or not self._current(entry):
+            # A refresh can still be using the previous contract while its
+            # metadata is being renewed. Do not let that busy, possibly stale
+            # contract enter a batch.
+            if (entry.get("busy") or not entry["contract"]
+                    or now >= entry["hot_until"] or not self._current(entry)):
                 continue
+            # Broker.prepared_entry is a synchronous local-cache check. Use it
+            # when available so an expired/unprepared option cannot make the
+            # broker reject an otherwise healthy quote batch. Keep brokers and
+            # test doubles without this optional cache API compatible.
+            metadata_check = getattr(self.engine.broker, "prepared_entry", None)
+            if callable(metadata_check) and not asyncio.iscoroutinefunction(metadata_check):
+                try:
+                    prepared = metadata_check(entry["contract"], "1")
+                except Exception:
+                    continue
+                if asyncio.iscoroutine(prepared):
+                    prepared.close()
+                elif prepared is None:
+                    continue
             key = tuple(entry["contract"][key] for key in ("symbol", "expiry", "strike", "option_type"))
+            if key in self.market_inflight_contracts:
+                continue
             previous = candidates.get(key)
             if previous is not None:
                 entry["market_polled_at"] = max(entry["market_polled_at"], previous["market_polled_at"])
             candidates[key] = entry
-        return min(candidates.values(), key=lambda entry: entry["market_polled_at"], default=None)
+        batch_method = getattr(self.engine.broker, "refresh_watch_market_batch", None)
+        limit_getter = getattr(self.engine.broker, "watch_market_batch_limit", None)
+        if callable(batch_method) and callable(limit_getter):
+            try:
+                limit = max(1, min(WATCH_MARKET_MAX_CONTRACTS, int(limit_getter())))
+            except (TypeError, ValueError):
+                limit = 1
+        else:
+            limit = 1
+        return sorted(candidates.values(), key=lambda entry: entry["market_polled_at"])[:limit]
+
+    def _next_market_entry(self):
+        return next(iter(self._next_market_entries()), None)
 
     async def _refresh_market(self, entry):
-        started = time.monotonic()
-        remaining = entry["hot_until"] - started
-        if remaining <= 0 or not self._current(entry):
+        await self._refresh_market_batch([entry])
+
+    async def _refresh_market_batch(self, entries):
+        if not entries:
             return
-        diagnostic = {"state": "refreshing", "started_at": self.engine.clock().isoformat()}
-        entry["market_diagnostic"] = diagnostic
+        started = time.monotonic()
+        active = []
+        for entry in entries:
+            contract_key = tuple(entry["contract"][key] for key in ("symbol", "expiry", "strike", "option_type"))
+            remaining = entry["hot_until"] - started
+            if remaining <= 0 or not self._current(entry) or contract_key in self.market_inflight_contracts:
+                continue
+            self.market_inflight_contracts.add(contract_key)
+            active.append((contract_key, entry, min(remaining, WATCH_REFRESH_TIMEOUT_SECONDS)))
+        if not active:
+            return
+
+        timeout = min(deadline for _, _, deadline in active)
+        schedule = {
+            "poll_interval_seconds": WATCH_MARKET_REQUEST_INTERVAL_SECONDS,
+            "concurrency_limit": WATCH_MARKET_CONCURRENCY,
+            "batch_size": len(active),
+            "last_attempt_age_seconds": round(min(
+                max(0, started - entry["market_polled_at"]) for _, entry, _ in active), 6),
+            "last_success_age_seconds": (round(min(
+                max(0, started - entry["market_success_at"]) for _, entry, _ in active
+                if entry["market_success_at"]), 6)
+                if any(entry["market_success_at"] for _, entry, _ in active) else None),
+        }
+        for _, entry, deadline in active:
+            entry["market_diagnostic"] = {
+                "state": "refreshing", "started_at": self.engine.clock().isoformat(),
+                "deadline_seconds": round(deadline, 6), "schedule": copy.deepcopy(schedule),
+            }
+
         try:
             result = await asyncio.wait_for(
-                self.engine.broker.refresh_watch_market(dict(entry["contract"])),
-                timeout=min(remaining, WATCH_REFRESH_TIMEOUT_SECONDS))
-            diagnostic.update(state="ready", completed_at=self.engine.clock().isoformat(), data=result)
+                self._call_watch_market_batch([entry for _, entry, _ in active]), timeout=timeout)
+            quote_rows = result.get("quotes") if isinstance(result, dict) else None
+            quote_by_contract = {}
+            if isinstance(quote_rows, list):
+                for quote in quote_rows:
+                    if not isinstance(quote, dict) or not isinstance(quote.get("contract"), dict):
+                        continue
+                    key = tuple(quote["contract"].get(name)
+                                for name in ("symbol", "expiry", "strike", "option_type"))
+                    if key in quote_by_contract:
+                        raise RuntimeError("Watch quote batch returned a duplicate contract")
+                    quote_by_contract[key] = quote
+
+            completed = time.monotonic()
+            for contract_key, entry, _ in active:
+                quote = quote_by_contract.get(contract_key)
+                if quote is None:
+                    error = RuntimeError("Watch quote batch omitted a prepared contract")
+                    error._watch_market_diagnostic = {
+                        "capacity_state": "shortfall", "batch_size": len(active),
+                    }
+                    self._set_market_failure(entry, error, schedule, started, completed)
+                    continue
+                quote_data = {key: value for key, value in result.items() if key != "quotes"}
+                quote_data["quote"] = copy.deepcopy(quote)
+                entry["market_diagnostic"].update(
+                    state="ready", completed_at=self.engine.clock().isoformat(), data=quote_data,
+                    duration_seconds=round(completed - started, 6))
+                entry["market_success_at"] = completed
         except asyncio.CancelledError:
+            for _, entry, _ in active:
+                entry["market_diagnostic"]["state"] = "cancelled"
             raise
         except Exception as error:
-            diagnostic["state"] = "failed"
-            _, diagnostic["failure"] = execution_failure(error, stage="watch_market_refresh")
+            completed = time.monotonic()
+            for _, entry, _ in active:
+                self._set_market_failure(entry, error, schedule, started, completed)
         finally:
             completed = time.monotonic()
-            diagnostic["duration_seconds"] = round(completed - started, 6)
-            entry["market_polled_at"] = completed
-            # Network and budget waits do not accumulate a catch-up burst.
-            self.market_refresh_at = completed + WATCH_POLL_SECONDS
+            for contract_key, entry, _ in active:
+                entry["market_polled_at"] = completed
+                self.market_inflight_contracts.discard(contract_key)
+
+    async def _call_watch_market_batch(self, entries):
+        method = getattr(self.engine.broker, "refresh_watch_market_batch", None)
+        if callable(method):
+            return await method([dict(entry["contract"]) for entry in entries])
+        method = getattr(self.engine.broker, "refresh_watch_market", None)
+        if not callable(method):
+            raise RuntimeError("Broker does not support watch market refresh")
+        results = await asyncio.gather(*(method(dict(entry["contract"])) for entry in entries))
+        return {"quotes": [
+            {"contract": dict(entry["contract"]), **result}
+            for entry, result in zip(entries, results)
+        ]}
+
+    def _set_market_failure(self, entry, error, schedule, started, completed):
+        diagnostic = entry.setdefault("market_diagnostic", {})
+        diagnostic.update(state="failed", schedule=copy.deepcopy(schedule),
+                          duration_seconds=round(completed - started, 6))
+        _, diagnostic["failure"] = execution_failure(error, stage="watch_market_refresh")
+        details = getattr(error, "_watch_market_diagnostic", None)
+        if isinstance(details, dict):
+            for key in ("deadline_seconds", "capacity_state", "request_budget", "batch_size", "batch_limit"):
+                if key in details:
+                    diagnostic[key] = copy.deepcopy(details[key])
 
     def match(self, message, decision, *, with_source=False, diagnostic=None):
         if decision.get("action") != "OPEN":
@@ -174,6 +306,9 @@ class WatchEntries:
                 if "market_diagnostic" in entry:
                     diagnostic["market_refresh"] = copy.deepcopy(entry["market_diagnostic"])
                     diagnostic["market_poll_age_seconds"] = round(max(0, time.monotonic() - entry["market_polled_at"]), 6)
+                    diagnostic["market_success_age_seconds"] = (
+                        round(max(0, time.monotonic() - entry["market_success_at"]), 6)
+                        if entry["market_success_at"] else None)
                 diagnostic["market_poll_window_remaining_seconds"] = round(max(0, entry["hot_until"] - time.monotonic()), 3)
                 diagnostic.update(route="fresh", watch_message_id=entry["message"]["id"],
                                   watch_age_seconds=max(0, (instant(message["timestamp"]) - instant(entry["message"]["timestamp"])).total_seconds()))
@@ -224,15 +359,23 @@ class WatchEntries:
                         self.entries.pop(identity, None)
                     elif time.monotonic() >= entry["refresh_at"]:
                         self._schedule(entry)
-                if (callable(getattr(self.engine.broker, "refresh_watch_market", None))
-                        and (self.market_task is None or self.market_task.done())
+                self.market_tasks.intersection_update(task for task in self.market_tasks if not task.done())
+                if ((callable(getattr(self.engine.broker, "refresh_watch_market", None))
+                     or callable(getattr(self.engine.broker, "refresh_watch_market_batch", None)))
+                        and len(self.market_tasks) < WATCH_MARKET_CONCURRENCY
                         and time.monotonic() >= self.market_refresh_at):
-                    entry = self._next_market_entry()
-                    if entry is not None:
-                        self.market_task = asyncio.create_task(self._refresh_market(entry))
-                        self.tasks.add(self.market_task)
-                        self.market_task.add_done_callback(self.tasks.discard)
-                await asyncio.sleep(1)
+                    entries = self._next_market_entries()
+                    if entries:
+                        task = asyncio.create_task(self._refresh_market_batch(entries))
+                        self.market_tasks.add(task)
+                        self.tasks.add(task)
+                        task.add_done_callback(self.tasks.discard)
+                        task.add_done_callback(self.market_tasks.discard)
+                        self.market_refresh_at = time.monotonic() + WATCH_MARKET_REQUEST_INTERVAL_SECONDS
+                delay = WATCH_POLL_SECONDS
+                if len(self.market_tasks) < WATCH_MARKET_CONCURRENCY and self.market_refresh_at > time.monotonic():
+                    delay = min(delay, self.market_refresh_at - time.monotonic())
+                await asyncio.sleep(min(1, max(.01, delay)))
         finally:
             await self.close()
 
@@ -242,3 +385,6 @@ class WatchEntries:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        close_market = getattr(self.engine.broker, "close_watch_market", None)
+        if callable(close_market):
+            await close_market()

@@ -413,7 +413,7 @@ class CoreChecks(unittest.IsolatedAsyncioTestCase):
     async def test_optional_trim_defaults_half_and_requires_net_profit(self):
         self.owned(3)
         self.interpreter.decision.update(action="REDUCE", fraction=None, profit_only=True)
-        await self.held(reason="round-trip fee reserve")
+        await self.held(self.message(content="You can trim here if you'd like"), reason="round-trip fee reserve")
         self.broker.quotes.update(bid="1.00", ask="1.03")
         result = await self.engine.handle(self.message(content="You can trim here if you'd like"))
         self.assertEqual(result["state"], "paper_order", result)

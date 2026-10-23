@@ -6,10 +6,11 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
-from relay.broker import BrokerError, BrokerPreflightHold
+from relay.broker import BrokerError, BrokerPreflightHold, _contract_key
 from relay.core import Engine, Store, canonical_contract
 from relay.ingest import normalize
 from relay.recovery import RecoveryEvaluator
@@ -20,6 +21,13 @@ from tests.test_core import Broker, Interpreter
 class WatchBrokerChecks(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         broker_fixtures.LiveBrokerChecks.setUp(self)
+        self.broker._market_open = Mock(return_value=True)
+        self.broker.schemas = {"get_option_quotes": {
+            "type": "object", "properties": {"instrument_ids": {
+                "type": ["null", "array"], "items": {"type": "string"},
+            }}, "required": ["instrument_ids"], "additionalProperties": False,
+        }}
+        self.addAsyncCleanup(self.broker.close_watch_market)
         original = self.broker._data.side_effect
 
         async def data(name, args):
@@ -29,6 +37,87 @@ class WatchBrokerChecks(unittest.IsolatedAsyncioTestCase):
             return result
 
         self.broker._data.side_effect = data
+
+    async def test_watch_quote_is_independent_of_slow_account_snapshot(self):
+        await self.broker.prewarm_entry(self.contract)
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def slow_snapshot():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.broker.snapshot = slow_snapshot
+        with patch("relay.broker._WATCH_ACCOUNT_SNAPSHOT_DELAY_SECONDS", 0):
+            result = await asyncio.wait_for(self.broker.refresh_watch_market(self.contract), .5)
+        await started.wait()
+        self.assertTrue(result["quote_timestamp"])
+        self.assertEqual(result["account_snapshot"], "refreshing")
+        self.assertEqual(next(iter(self.broker._watch_quotes.values()))[2]["instrument_id"], self.instrument["id"])
+        await self.broker.close_watch_market()
+        self.assertTrue(cancelled.is_set())
+
+    async def test_quote_batch_schema_accepts_non_nullable_array_declaration(self):
+        self.broker.schemas["get_option_quotes"]["properties"]["instrument_ids"]["type"] = "array"
+        self.assertEqual(self.broker.watch_market_batch_limit(), 8)
+
+    async def test_quote_batch_validates_every_quote_before_publishing_any(self):
+        await self.broker.prewarm_entry(self.contract)
+        second_contract = self.contract | {"strike": "501"}
+        second_prepared = copy.deepcopy(self.broker.prepared_entry(self.contract, "1"))
+        second_prepared["contract"] = copy.deepcopy(second_contract)
+        second_prepared["option_id"] = "second-instrument"
+        self.broker._prepared_entries[_contract_key(second_contract)] = (time.monotonic(), second_prepared)
+        first = copy.deepcopy(self.quote) | {"instrument_id": self.instrument["id"]}
+        second = copy.deepcopy(self.quote) | {
+            "instrument_id": "second-instrument", "bid_price": "2", "ask_price": "1",
+        }
+
+        async def quotes(option_ids):
+            self.assertEqual(option_ids, [self.instrument["id"], "second-instrument"])
+            return {first["instrument_id"]: first, second["instrument_id"]: second}
+
+        self.broker._raw_watch_quotes = quotes
+        with patch.object(self.broker, "_schedule_watch_account_snapshot", return_value="cached"):
+            with self.assertRaisesRegex(BrokerError, "prices are invalid"):
+                await self.broker.refresh_watch_market_batch([self.contract, second_contract])
+        self.assertEqual(self.broker._watch_quotes, {})
+
+    async def test_watch_quote_deadline_reports_capacity_shortfall(self):
+        await self.broker.prewarm_entry(self.contract)
+
+        async def budget_blocked(_option_ids):
+            await asyncio.Event().wait()
+
+        self.broker._raw_watch_quotes = budget_blocked
+        with patch.object(self.broker, "_schedule_watch_account_snapshot", return_value="cached"):
+            with patch("relay.broker._WATCH_QUOTE_REFRESH_DEADLINE_SECONDS", .01):
+                with self.assertRaisesRegex(BrokerError, "exceeded its deadline") as raised:
+                    await self.broker.refresh_watch_market(self.contract)
+        self.assertEqual(raised.exception._watch_market_diagnostic["capacity_state"], "shortfall")
+        self.assertEqual(self.broker._watch_quotes, {})
+
+    async def test_cancelled_watch_quote_does_not_publish_cache_data(self):
+        await self.broker.prewarm_entry(self.contract)
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def held_quote(_option_ids):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.broker._raw_watch_quotes = held_quote
+        with patch.object(self.broker, "_schedule_watch_account_snapshot", return_value="cached"):
+            task = asyncio.create_task(self.broker.refresh_watch_market_batch([self.contract]))
+            await started.wait()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(self.broker._watch_quotes, {})
 
     def raw_order(self, **changes):
         raw = dict(id="22222222-2222-4222-8222-222222222222", chain_symbol="SPY",
