@@ -443,7 +443,12 @@
           <p class="setup-help setup-help-small">Rule evaluation parses entry intent only; it does not claim profitability, broker acceptance, or fills.</p>
             <div class="setup-field-grid evaluation-codex-fields">
               <label class="field-wide" for="evaluation-model">Codex model <input id="evaluation-model" name="model" type="text" maxlength="128" placeholder="Codex default"></label>
-              <label for="evaluation-effort">Reasoning <select id="evaluation-effort" name="reasoning_effort"><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option></select></label>
+              <label for="evaluation-effort">Reasoning <input id="evaluation-effort" name="reasoning_effort" type="text" maxlength="128" list="evaluation-effort-options" autocomplete="off" placeholder="e.g. high">
+                <datalist id="evaluation-effort-options">
+                  <option value="minimal"></option><option value="low"></option><option value="medium"></option>
+                  <option value="high"></option><option value="xhigh"></option><option value="max"></option><option value="ultra"></option>
+                </datalist>
+              </label>
               <label for="evaluation-tier">Speed <select id="evaluation-tier" name="service_tier"><option value="standard">Standard</option><option value="fast">Fast</option></select></label>
               <label for="evaluation-chase">Maximum chase (%) <input id="evaluation-chase" name="max_chase_percent" type="number" min="0" max="100" step="0.1" required></label>
             </div>

@@ -991,7 +991,7 @@ class CodexInterpreterChecks(unittest.TestCase):
             self.assertTrue(status["authenticated"])
             self.assertTrue(status["isolated_execution_available"])
             self.assertEqual(status["method"], "chatgpt_subscription")
-            self.assertEqual(run.call_args.args[0][1:], ["login", "status"])
+            self.assertEqual(run.call_args.args[0][1:], ["login", "status", "-c", 'cli_auth_credentials_store="file"'])
 
     def test_timeout_kills_child_group_and_redacts_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:

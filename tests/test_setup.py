@@ -81,7 +81,11 @@ class SetupManagerTests(unittest.TestCase):
     def test_evaluation_preferences_require_pause_and_preserve_other_settings(self):
         payload = {"model": "gpt-6-astra", "reasoning_effort": "medium", "service_tier": "fast", "max_chase_fraction": "0.10"}
         for invalid in ({}, payload | {"mode": "live"}, payload | {"model": "bad\nmodel"},
-                        payload | {"reasoning_effort": "invalid"}, payload | {"service_tier": "invalid"},
+                        payload | {"model": "bad model"}, payload | {"model": "bad\x00model"},
+                        payload | {"model": "bad\x7fmodel"}, payload | {"reasoning_effort": "high tier"},
+                        payload | {"reasoning_effort": "high\t"}, payload | {"reasoning_effort": "bad\x00effort"},
+                        payload | {"model": "m" * 129}, payload | {"reasoning_effort": "e" * 129},
+                        payload | {"reasoning_effort": ""}, payload | {"service_tier": "invalid"},
                         payload | {"max_chase_fraction": "1.01"}, payload | {"max_chase_fraction": "NaN"}):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.manager.save_evaluation(invalid)
@@ -116,6 +120,30 @@ class SetupManagerTests(unittest.TestCase):
         saved_preferences = self.manager.status()["evaluation"]
         self.assertEqual({key: saved_preferences[key] for key in payload}, payload)
         self.assertTrue(self.manager.status()["paused"])
+
+    def test_evaluation_preserves_future_model_and_effort_identifiers(self):
+        self.manager.set_paused(True)
+        cases = (
+            ("gpt-6.1-sol", "max"),
+            ("provider/gpt-6.1-sol+preview", "ultra"),
+            ("m" + "x" * 127, "e" + "f" * 127),
+            ("gpt-6.1-sol", "reasoning-vNext_2026"),
+        )
+        for model, effort in cases:
+            with self.subTest(model=model, effort=effort):
+                payload = {"model": model, "reasoning_effort": effort, "service_tier": "fast", "max_chase_fraction": "0.10"}
+                result = self.manager.save_evaluation(payload)["evaluation"]
+                self.assertEqual(result["model"], model)
+                self.assertEqual(result["reasoning_effort"], effort)
+                saved = json.loads(self.path.read_text())
+                self.assertEqual(saved["llm"]["model"], model)
+                self.assertEqual(saved["llm"]["reasoning_effort"], effort)
+
+        self.manager.close()
+        self.manager = SetupManager(self.path)
+        projected = self.manager.status()["evaluation"]
+        self.assertEqual(projected["model"], "gpt-6.1-sol")
+        self.assertEqual(projected["reasoning_effort"], "reasoning-vNext_2026")
 
     def test_same_day_permission_requires_pause_and_worker_reload_preserving_other_settings(self):
         original = self.path.read_bytes()
@@ -626,7 +654,8 @@ class SetupManagerTests(unittest.TestCase):
         class FakeProcess:
             pid = 22222
 
-            def __init__(self):
+            def __init__(self, _args, **kwargs):
+                self.home = Path(kwargs["env"]["CODEX_HOME"])
                 self.stdout = io.StringIO(
                     "secret=do-not-display\n"
                     "Open https://auth.openai.com/codex/device\n"
@@ -637,15 +666,14 @@ class SetupManagerTests(unittest.TestCase):
                 return 0
 
             def wait(self, timeout=None):
-                (Path(os.environ["CODEX_HOME"]) / "auth.json").parent.mkdir(parents=True, exist_ok=True)
-                (Path(os.environ["CODEX_HOME"]) / "auth.json").write_text("{}")
+                (self.home / "auth.json").write_text("{}")
                 return 0
 
             def terminate(self):
                 return None
 
         with patch.object(self.manager, "_codex_executable", return_value="/usr/bin/codex"), patch(
-            "relay.setup.subprocess.Popen", return_value=FakeProcess()
+            "relay.setup.subprocess.Popen", side_effect=FakeProcess
         ), patch("relay.setup.CodexInterpreter") as interpreter:
             interpreter.return_value.subscription_status = AsyncMock(return_value={"authenticated": True, "isolated_execution_available": True})
             self.manager.start_auth("codex")

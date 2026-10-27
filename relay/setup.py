@@ -13,6 +13,7 @@ import copy
 import http.client
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -32,6 +33,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .broker import SCHEMA_PINS, _OAuthStorage, login as broker_login
 from .cli import inspect_broker
+from .codex_config import is_valid_codex_identifier
 from .core import Hold, Store, instant, load_config, money
 from .discord_session import (
     DEFAULT_TOKEN_ENV,
@@ -160,6 +162,8 @@ class _AuthJob:
     schema_catalog: list = field(default_factory=list)
     failure_code: str | None = None
     timed_out: bool = False
+    attempt_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    http_status: int | None = None
 
 
 class SetupManager:
@@ -532,10 +536,10 @@ class SetupManager:
         if not isinstance(payload, dict) or set(payload) not in (fields, fields | {"evaluation"}):
             raise ValueError("Provide model, reasoning_effort, service_tier, and max_chase_fraction")
         model = payload["model"]
-        if model is not None and (not isinstance(model, str) or (model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model))):
+        if model is not None and model != "" and not is_valid_codex_identifier(model):
             raise ValueError("Model must be a model identifier or blank for the Codex default")
-        if payload["reasoning_effort"] not in ("minimal", "low", "medium", "high", "xhigh"):
-            raise ValueError("Unsupported reasoning effort")
+        if not is_valid_codex_identifier(payload["reasoning_effort"]):
+            raise ValueError("Reasoning effort must be a bounded identifier without whitespace or control characters")
         if payload["service_tier"] not in ("standard", "fast"):
             raise ValueError("Service tier must be standard or fast")
         chase = money(payload["max_chase_fraction"])
@@ -832,7 +836,7 @@ class SetupManager:
         if not isinstance(llm, dict):
             llm = {}
         model = llm.get("model")
-        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
+        if not is_valid_codex_identifier(model):
             model = None
         effort = llm.get("reasoning_effort", "medium")
         tier = llm.get("service_tier", "standard")
@@ -862,7 +866,7 @@ class SetupManager:
         jev = {key: value for key, value in settings.items() if key != "api_key_file"}
         jev.update(configured=configured, credential_configured=configured, state=state, detail=detail, status=status)
         return {"model": model,
-                "reasoning_effort": effort if effort in ("minimal", "low", "medium", "high", "xhigh") else "medium",
+                "reasoning_effort": effort if is_valid_codex_identifier(effort) else "medium",
                 "service_tier": tier if tier in ("standard", "fast") else "standard",
                 "max_chase_fraction": risk.get("max_chase_fraction", "0.10"),
                 "direct_entries": settings["direct_entries"],
@@ -944,6 +948,13 @@ class SetupManager:
         return detail if detail and detail != "details withheld" else fallback
 
     def _public_codex_locked(self) -> dict:
+        result = self._current_codex_locked()
+        previous = self._read_codex_failure()
+        if previous is not None:
+            result["last_failure"] = previous
+        return result
+
+    def _current_codex_locked(self) -> dict:
         state = copy.deepcopy(self._auth_state["codex"])
         if state["state"] in {"starting", "waiting", "failed", "cancelled"}:
             return self._safe_auth_projection(state)
@@ -978,7 +989,8 @@ class SetupManager:
             return ready
         try:
             raw = self._read_raw_locked()
-            config = raw | {"llm": dict(raw.get("llm", {}), executable=self._codex_executable(), timeout_seconds=5)}
+            # A model/effort preference must not prevent inspecting a login.
+            config = raw | {"llm": {"executable": self._codex_executable(), "timeout_seconds": 5}}
             status = asyncio.run(CodexInterpreter(config).subscription_status())
             ready = status.get("authenticated") is True and status.get("isolated_execution_available") is True
         except Exception:
@@ -1446,22 +1458,29 @@ class SetupManager:
     def _run_codex_job(self, job: _AuthJob) -> None:
         process: subprocess.Popen[str] | None = None
         timeout_timer: threading.Timer | None = None
+        login_directory = None
         try:
             self._codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
             self._codex_home.chmod(0o700)
             executable = self._codex_executable()
             if not executable:
                 raise FileNotFoundError("Codex executable is unavailable")
+            # Device login clears/revokes existing auth before it starts.
+            # Give it an empty home on the same volume, without an auth link.
+            # Promote only a verified successful login; failure/cancellation
+            # leaves the previous credentials intact.
+            login_directory = tempfile.TemporaryDirectory(prefix=".device-login-", dir=self._codex_home)
+            login_home = Path(login_directory.name)
             environment = os.environ.copy()
-            environment["CODEX_HOME"] = str(self._codex_home)
+            environment["CODEX_HOME"] = str(login_home)
             # Device authentication must not inherit an API key or desktop
             # app control channel into the fixed login command.
             for key in list(environment):
                 if key.startswith("OPENAI_") or key in {"CODEX_APP_TOOLS_PIPE_PATH", "CODEX_SESSION_ID", "CODEX_THREAD_ID"}:
                     environment.pop(key, None)
             process = subprocess.Popen(
-                [executable, "login", "--device-auth"],
-                cwd=str(self.config_path.parent),
+                [executable, "login", "--device-auth", "-c", 'cli_auth_credentials_store="file"'],
+                cwd=str(login_home),
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -1514,24 +1533,24 @@ class SetupManager:
                         "state": "cancelled",
                         "detail": "Codex setup was cancelled.",
                     }
-                elif return_code == 0 and self._codex_ready():
+                elif return_code == 0 and not job.timed_out and self._codex_login_ready(login_home):
                     self._auth_state["codex"] = {
                         "state": "connected",
                         "detail": "Codex ChatGPT login is available locally.",
                     }
                 elif return_code == 0:
-                    code = job.failure_code or "auth_incomplete"
+                    code = "timeout" if job.timed_out else (job.failure_code or "auth_incomplete")
                     self._auth_state["codex"] = {
                         "state": "failed",
                         "detail": self._codex_failure_detail(code, "device login"),
-                        "failure": {"phase": "device_login", "code": code},
+                        "failure": self._codex_failure_metadata(job, code, "device_login", return_code),
                     }
                 else:
                     code = "timeout" if job.timed_out else (job.failure_code or "cli_failed")
                     self._auth_state["codex"] = {
                         "state": "failed",
                         "detail": self._codex_failure_detail(code, "device login"),
-                        "failure": {"phase": "device_login", "code": code},
+                        "failure": self._codex_failure_metadata(job, code, "device_login", return_code),
                     }
         except Exception as exc:
             with self._lock:
@@ -1545,7 +1564,7 @@ class SetupManager:
                     self._auth_state["codex"] = {
                         "state": "failed",
                         "detail": self._codex_failure_detail(code, "initialization"),
-                        "failure": {"phase": "initialization", "code": code},
+                        "failure": self._codex_failure_metadata(job, code, "initialization"),
                     }
         finally:
             if timeout_timer is not None:
@@ -1554,16 +1573,102 @@ class SetupManager:
                 if process is not None and job.process is process:
                     self._terminate_codex_process_locked(job, force=True)
                     job.process = None
-            if process is not None and process.stdout is not None:
-                process.stdout.close()
+            try:
+                if process is not None and process.stdout is not None:
+                    process.stdout.close()
+            finally:
+                if login_directory is not None:
+                    login_directory.cleanup()
+            with self._lock:
+                if self._auth_state["codex"].get("state") == "failed":
+                    self._record_codex_failure(self._auth_state["codex"])
+
+    def _codex_login_ready(self, login_home):
+        """Verify staged ChatGPT auth locally, then atomically install it."""
+        credential = login_home / "auth.json"
+        if credential.is_symlink() or not credential.is_file():
+            return False
+        config = {"llm": {"executable": self._codex_executable(), "timeout_seconds": 5}}
+        interpreter = CodexInterpreter(config, source_home=login_home)
+        status = asyncio.run(interpreter.subscription_status())
+        if status.get("authenticated") is not True or status.get("isolated_execution_available") is not True:
+            return False
+        credential.chmod(0o600)
+        os.replace(credential, self._codex_home / "auth.json")
+        # A just-completed login must not reuse a cached negative inspection.
+        self._codex_check = (None, 0.0, False)
+        return True
+
+    @staticmethod
+    def _codex_failure_metadata(job, code, phase, exit_code=None):
+        result = {"phase": phase, "code": code, "attempt_id": job.attempt_id}
+        if type(exit_code) is int:
+            result["exit_code"] = exit_code
+        if job.http_status is not None:
+            result["http_status"] = job.http_status
+        return result
+
+    def _record_codex_failure(self, state):
+        """Retain safe metadata across dashboard restarts; never CLI output."""
+        metadata = state["failure"]
+        logging.getLogger(__name__).warning("Codex sign-in failure: %s", json.dumps(metadata, sort_keys=True))
+        temporary = None
+        try:
+            directory = self.config_path.parent / "state"
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with tempfile.NamedTemporaryFile(mode="w", prefix=".codex-auth-", dir=directory, delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(metadata, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.chmod(0o600)
+            os.replace(temporary, directory / "codex-auth-diagnostic.json")
+        except OSError:
+            logging.getLogger(__name__).warning("Codex sign-in diagnostic could not be persisted")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _read_codex_failure(self):
+        path = self.config_path.parent / "state" / "codex-auth-diagnostic.json"
+        if path.is_symlink():
+            return None
+        try:
+            if path.stat().st_size > 4096:
+                return None
+            value = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if (not isinstance(value, dict) or not isinstance(value.get("phase"), str)
+                or value["phase"] not in {"device_login", "initialization"}):
+            return None
+        if not isinstance(value.get("code"), str) or value["code"] not in {
+            "runtime_unavailable", "runtime_missing", "local_permission", "tls_failed", "dns_failed",
+            "network_unavailable", "timeout", "auth_rejected", "auth_required", "auth_incomplete",
+            "cli_failed", "device_auth_disabled", "config_invalid",
+        }:
+            return None
+        clean = {key: value[key] for key in ("phase", "code")}
+        if isinstance(value.get("attempt_id"), str) and re.fullmatch(r"[a-f0-9]{32}", value["attempt_id"]):
+            clean["attempt_id"] = value["attempt_id"]
+        if type(value.get("http_status")) is int and 400 <= value["http_status"] <= 599:
+            clean["http_status"] = value["http_status"]
+        if type(value.get("exit_code")) is int and -4096 <= value["exit_code"] <= 255:
+            clean["exit_code"] = value["exit_code"]
+        return {"detail": self._codex_failure_detail(clean["code"], clean["phase"]), "failure": clean}
 
     def _consume_codex_line(self, job: _AuthJob, line: str) -> None:
         if job.cancelled.is_set():
             return
         # Pinned CLI prints ANSI-colored URL/code on separate lines.
         line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        status = re.search(r"\b(?:HTTP(?:/[12](?:\.\d)?)?\s+|status(?: code)?[:=\s]+)([45]\d{2})\b", line, re.I)
+        if status is None:
+            status = re.search(r"\b([45]\d{2})\s+(?:Unauthorized|Forbidden|Bad Request|Not Found|Too Many Requests|Internal Server Error|Service Unavailable)\b", line, re.I)
+        if status is not None:
+            job.http_status = int(status.group(1))
         code = self._codex_line_code(line)
-        if code is not None and code != "auth_required":
+        if code is not None and code != "auth_required" and (code != "cli_failed" or job.failure_code is None):
             job.failure_code = code
         url = self._whitelisted_device_url(line)
         code = self._device_code(line)
@@ -1587,6 +1692,14 @@ class SetupManager:
     @staticmethod
     def _codex_line_code(line: str) -> str | None:
         text = line[:4096].lower()
+        if "device" in text and any(term in text for term in ("not enabled", "disabled", "enable device", "not allowed")):
+            return "device_auth_disabled"
+        if any(term in text for term in ("error loading config", "invalid config", "failed to parse", "unknown variant", "unsupported reasoning", "unexpected argument", "unrecognized option")):
+            return "config_invalid"
+        if any(term in text for term in ("permission denied", "read-only file system", "access is denied")):
+            return "local_permission"
+        if any(term in text for term in ("refresh_token_reused", "refresh_token_invalidated", "invalid_grant")):
+            return "auth_rejected"
         if any(term in text for term in ("certificate verify failed", "certificate_verify_failed", "ssl error", "tls error")):
             return "tls_failed"
         if any(term in text for term in ("name or service not known", "failed to lookup", "dns", "could not resolve")):
@@ -1595,7 +1708,7 @@ class SetupManager:
             return "timeout"
         if any(term in text for term in ("network is unreachable", "connection refused", "connection error", "network error")):
             return "network_unavailable"
-        if any(term in text for term in ("expired", "invalid code", "authorization denied", "access denied", "unauthorized")):
+        if any(term in text for term in ("expired", "invalid code", "authorization denied", "access denied", "unauthorized", "forbidden")):
             return "auth_rejected"
         if any(term in text for term in ("authentication required", "not authenticated", "please log in", "reauth")):
             return "auth_required"
@@ -1618,6 +1731,8 @@ class SetupManager:
     @staticmethod
     def _codex_failure_detail(code: str, phase: str) -> str:
         details = {
+            "device_auth_disabled": ("device code login is disabled for this ChatGPT account or workspace", "Enable device code login in ChatGPT security settings or ask the workspace administrator to enable it, then retry."),
+            "config_invalid": ("the CLI rejected its configuration or command options", "Check the bundled CLI version and configuration; updating the image refreshes the CLI."),
             "runtime_unavailable": ("the Codex CLI is unavailable", "Check the configured Codex executable and install it if needed."),
             "runtime_missing": ("a required executable is missing", "Check the container installation and configured executable."),
             "local_permission": ("Codex could not access a required local file", "Check persistent volume ownership and permissions."),
@@ -2060,7 +2175,7 @@ class SetupManager:
         if isinstance(value.get("failure"), dict):
             result["failure"] = {
                 key: value["failure"][key]
-                for key in ("phase", "type", "code", "action", "source", "line", "http_status")
+                for key in ("phase", "type", "code", "action", "source", "line", "http_status", "exit_code", "attempt_id")
                 if key in value["failure"]
             }
         if value.get("verification_url"):

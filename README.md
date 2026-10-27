@@ -136,7 +136,7 @@ The demo and fixture tests use synthetic messages, quotes, accounts, and browser
 
 ## Container images and deployment notes
 
-GitHub Actions runs the synthetic tests and scans Git history for secrets before publishing `ghcr.io/javadevjt/discord-option-tailer:latest` for Linux `amd64`. Main builds also receive a full commit `sha-...` tag. Use [the TrueNAS guide](docs/truenas.md) and [image-based Compose file](compose.truenas.yaml) to deploy it. For local source builds, use `docker compose up -d --build` with `compose.yaml`.
+GitHub Actions runs the synthetic tests and scans Git history for secrets before publishing `ghcr.io/javadevjt/discord-option-tailer:latest` for Linux `amd64`. Each image build resolves the latest stable Codex CLI, records its installed version, and checks CLI compatibility without network access. Main builds also receive a full commit `sha-...` tag. Use [the TrueNAS guide](docs/truenas.md) and [image-based Compose file](compose.truenas.yaml) to deploy it. For local source builds, use `docker compose up -d --build` with `compose.yaml`.
 
 The container stores configuration, ledgers, the Chromium profile, Codex subscription state, and Robinhood OAuth state in one private Docker volume. The dashboard and browser gateway are password-protected; keep the published ports on a trusted loopback or private network. Runtime recovery can reconnect the browser, but a sleeping host, revoked login, MFA challenge, network outage, or rapidly changing DOM can interrupt observation. No unattended-uptime, execution-quality, or profitability claim is made.
 

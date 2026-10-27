@@ -363,6 +363,7 @@ class InterpretationError(ValueError):
 
 DIAGNOSTIC_DETAILS = {
     "auth_required": "ChatGPT authentication needs attention",
+    "model_unavailable": "Codex model is unavailable for this account or client",
     "quota_exhausted": "subscription usage limit reached",
     "network_unavailable": "network connection unavailable",
     "timeout": "Codex timed out",
@@ -415,6 +416,9 @@ def _diagnostic_code(message):
         "reauth_required", "auth_required", "login_required", "authentication_required",
     )):
         return "auth_required"
+    if (any(term in text for term in ("model_not_found", "unsupported model", "model is not supported"))
+            or re.search(r"\bmodel\b.{0,120}\b(?:not available|not supported|does not exist|not found)\b", text)):
+        return "model_unavailable"
     if any(term in text for term in ("output exceeded", "size limit")):
         return "invalid_output"
     if any(term in text for term in (
@@ -1198,7 +1202,7 @@ class CodexInterpreter:
         "enable `features.code_mode_host` and install `codex-code-mode-host`."
     )
 
-    def __init__(self, config, *, on_status=None):
+    def __init__(self, config, *, on_status=None, source_home=None):
         self.config = config
         self.on_status = on_status
         llm = config.get("llm", {})
@@ -1209,10 +1213,11 @@ class CodexInterpreter:
         if not isinstance(self.executable, str) or not Path(self.executable).is_file():
             raise InterpretationError("Install the Codex app/CLI or set llm.executable to its executable")
         self.model = llm.get("model")
-        if self.model is not None and (not isinstance(self.model, str) or not self.model.strip() or len(self.model) > 128):
+        from .codex_config import is_valid_codex_identifier
+        if self.model is not None and not is_valid_codex_identifier(self.model):
             raise InterpretationError("Invalid Codex model")
         self.reasoning_effort = llm.get("reasoning_effort", "medium")
-        if self.reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+        if not is_valid_codex_identifier(self.reasoning_effort):
             raise InterpretationError("Invalid Codex reasoning_effort")
         self.service_tier = llm.get("service_tier", "standard")
         if self.service_tier not in {"standard", "fast"}:
@@ -1220,7 +1225,7 @@ class CodexInterpreter:
         self.timeout = llm.get("timeout_seconds", 90)
         if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 0 < self.timeout <= 300:
             raise InterpretationError("Codex timeout must be between zero and 300 seconds")
-        self.source_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+        self.source_home = Path(source_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
         self.last_usage = None
         self.last_model = None
         self.last_authentication = None
@@ -1285,17 +1290,27 @@ class CodexInterpreter:
 
     async def subscription_status(self) -> dict:
         """Inspect official login status without invoking a model or reading tokens."""
-        env = self._environment(self.source_home)
-        result = await asyncio.to_thread(
-            self._run_process, [self.executable, "login", "status"], env, tempfile.gettempdir(),
-        )
+        from .codex_auth import isolated_auth_home
+        with isolated_auth_home(self.source_home) as home:
+            env = self._environment(home)
+            result = await asyncio.to_thread(
+                self._run_process,
+                [self.executable, "login", "status", "-c", 'cli_auth_credentials_store="file"'],
+                env, home,
+            )
         status = (result.stdout + result.stderr).decode("utf-8", errors="replace")
         authenticated = result.returncode == 0 and "Logged in using ChatGPT" in status
+        try:
+            model = self._default_model()
+        except InterpretationError:
+            # Authentication does not depend on whether an inference default
+            # parses. The actual evaluation still validates that default.
+            model = None
         return {
             "authenticated": authenticated,
             "method": "chatgpt_subscription" if authenticated else "not_chatgpt_authenticated",
             "executable": self.executable,
-            "model": self._default_model() or "codex_default",
+            "model": model or "codex_default",
             "reasoning_effort": self.reasoning_effort,
             "service_tier": self.service_tier,
             "isolated_execution_available": authenticated and (self.source_home / "auth.json").is_file(),
@@ -1311,7 +1326,8 @@ class CodexInterpreter:
             model = tomllib.loads(config_path.read_text()).get("model")
         except (OSError, ValueError):
             raise InterpretationError("Cannot read the user's default Codex model") from None
-        if model is not None and (not isinstance(model, str) or not model.strip() or len(model) > 128):
+        from .codex_config import is_valid_codex_identifier
+        if model is not None and not is_valid_codex_identifier(model):
             raise InterpretationError("The user's configured Codex model is invalid")
         return model
 
@@ -1560,6 +1576,7 @@ class CodexInterpreter:
             action = ("Use Codex sign-in to renew the ChatGPT subscription session." if last_error.code in {"auth_required", "credentials_missing"}
                       else "Check the ChatGPT usage allowance and wait for its reset before retrying." if last_error.code == "quota_exhausted"
                       else "Check NAS internet access and OpenAI service availability." if last_error.code in {"network_unavailable", "timeout"}
+                      else "Choose a model available to this ChatGPT account and update the Codex CLI if needed." if last_error.code == "model_unavailable"
                       else "Check the configured Codex model, executable, and container runtime." if last_error.code in {"runtime_unavailable", "local_runtime", "config_invalid"}
                       else "Inspect the message and recorded evidence before requesting another evaluation.")
             publish_status(self.on_status, "codex", state, detail=f"{safe_interpretation_reason(last_error)}. {action}")
@@ -1606,6 +1623,7 @@ class CodexInterpreter:
                     args.extend(["--image", str(path)])
             overrides = {
                 "model_provider": "openai", "forced_login_method": "chatgpt", "approval_policy": "never",
+                "cli_auth_credentials_store": "file",
                 "web_search": "disabled", "project_doc_max_bytes": 0, "skills.include_instructions": False,
                 "skills.bundled.enabled": False, "features.skip_host_skill_discovery": True,
                 "model_reasoning_effort": self.reasoning_effort,

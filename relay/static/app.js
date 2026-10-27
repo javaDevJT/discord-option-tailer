@@ -2079,15 +2079,20 @@ async function loadAccount() {
     return "is-context";
   };
   const setupDetail = (part, fallback) => {
-    const failure = part?.failure;
+    const previous = !part?.failure && !["connected", "starting", "waiting"].includes(setupStateName(part?.state))
+      ? part?.last_failure : null;
+    const failure = part?.failure || previous?.failure;
     const diagnostic = failure && typeof failure === "object" ? [
       failure.phase && `Phase: ${setupText(failure.phase)}`,
       failure.code && `Code: ${setupText(failure.code)}`,
       failure.type && `Error: ${setupText(failure.type)}`,
       Number.isInteger(failure.http_status) && `HTTP: ${failure.http_status}`,
+      Number.isInteger(failure.exit_code) && `CLI exit: ${failure.exit_code}`,
+      failure.attempt_id && `Attempt: ${setupText(failure.attempt_id)}`,
       failure.source && `Source: ${setupText(failure.source)}${Number.isInteger(failure.line) ? `:${failure.line}` : ""}`,
     ].filter(Boolean).join(" · ") : "";
-    return [setupText(part?.detail, fallback), diagnostic].filter(Boolean).join(" ");
+    return [setupText(part?.detail, fallback), previous?.detail && `Previous sign-in: ${setupText(previous.detail)}`,
+      diagnostic].filter(Boolean).join(" ");
   };
   const setupTradingStatus = (status) => {
     const trading = status && typeof status.trading === "object" ? status.trading : {};

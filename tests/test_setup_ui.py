@@ -485,7 +485,8 @@ class SetupUITests(unittest.TestCase):
         state = {"status": self.status_payload(
             discord={"state": "starting", "detail": loading},
             codex={"state": "failed", "detail": "Codex device login failed [dns_failed]. Check NAS DNS.",
-                   "failure": {"phase": "device_login", "code": "dns_failed"}},
+                   "failure": {"phase": "device_login", "code": "dns_failed", "exit_code": 1,
+                               "attempt_id": "a" * 32}},
             robinhood={"state": "failed", "detail": "Robinhood token exchange failed [http_503]. Retry when service recovers.",
                        "failure": {"phase": "token_exchange", "type": "HTTPStatusError", "http_status": 503, "source": "broker.py", "line": 42}},
         ), "headers": [], "requests": []}
@@ -498,6 +499,8 @@ class SetupUITests(unittest.TestCase):
             browser, page = self.new_page(playwright, state)
             try:
                 expect(page.locator("#codex-setup-detail")).to_contain_text("Code: dns_failed")
+                expect(page.locator("#codex-setup-detail")).to_contain_text("CLI exit: 1")
+                expect(page.locator("#codex-setup-detail")).to_contain_text("Attempt: " + "a" * 32)
                 expect(page.locator("#robinhood-setup-detail")).to_contain_text("HTTP: 503")
                 expect(page.locator("#robinhood-setup-detail")).to_contain_text("Source: broker.py:42")
                 page.get_by_role("link", name="Open Browser login").click()
@@ -508,6 +511,26 @@ class SetupUITests(unittest.TestCase):
                 expect(page.locator("#runtime-discord-detail")).to_have_text(loading)
                 expect(page.locator("#runtime-codex-detail")).to_contain_text("attempts=2")
                 expect(page.locator("#runtime-broker-detail")).to_contain_text("dns_failed")
+                self.assertEqual(state["requests"], [])
+            finally:
+                browser.close()
+
+    def test_previous_codex_login_diagnostic_is_labelled_after_restart(self):
+        state = {"status": self.status_payload(codex={
+            "state": "auth_required", "detail": "Codex requires sign-in.", "last_failure": {
+                "detail": "Enable device code login in ChatGPT security settings.",
+                "failure": {"phase": "device_login", "code": "device_auth_disabled", "http_status": 403,
+                            "exit_code": 1, "attempt_id": "b" * 32},
+            },
+        }), "headers": [], "requests": []}
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                detail = page.locator("#codex-setup-detail")
+                expect(detail).to_contain_text("Previous sign-in:")
+                expect(detail).to_contain_text("ChatGPT security settings")
+                expect(detail).to_contain_text("HTTP: 403")
+                expect(detail).to_contain_text("CLI exit: 1")
                 self.assertEqual(state["requests"], [])
             finally:
                 browser.close()
@@ -731,7 +754,7 @@ class SetupUITests(unittest.TestCase):
             browser, page = self.new_page(playwright, state)
             try:
                 page.locator("#evaluation-model").fill("gpt-6-astra")
-                page.locator("#evaluation-effort").select_option("medium")
+                page.locator("#evaluation-effort").fill("medium")
                 page.locator("#evaluation-tier").select_option("fast")
                 page.locator("#evaluation-chase").fill("10")
                 save = page.locator("#save-evaluation")
@@ -753,6 +776,39 @@ class SetupUITests(unittest.TestCase):
                 expect(page.locator("#evaluation-tier")).to_have_value("fast")
                 expect(page.locator("#evaluation-chase")).to_have_value("10")
                 expect(page.locator("#save-evaluation")).to_be_enabled()
+            finally:
+                browser.close()
+
+    def test_reasoning_effort_control_preserves_future_values_through_reload(self):
+        model = "provider/gpt-6.1-sol+preview"
+        state = {"status": self.status_payload(configured=True, paused=True,
+            evaluation={"model": model, "reasoning_effort": "reasoning-vNext_2026", "service_tier": "fast", "max_chase_fraction": "0.10"}),
+            "headers": [], "requests": [], "discovery_requests": []}
+        with sync_playwright() as playwright:
+            browser, page = self.new_page(playwright, state)
+            try:
+                effort = page.locator("#evaluation-effort")
+                expect(effort).to_have_attribute("list", "evaluation-effort-options")
+                expect(effort).to_have_value("reasoning-vNext_2026")
+                expect(page.locator("#evaluation-model")).to_have_value(model)
+                suggestions = page.locator("#evaluation-effort-options option").evaluate_all(
+                    "(options) => options.map((option) => option.value)"
+                )
+                self.assertIn("max", suggestions)
+                self.assertIn("ultra", suggestions)
+                for value in ("max", "ultra", "reasoning-vNext_2026"):
+                    effort.fill(value)
+                    page.locator("#save-evaluation").click()
+                    expect(page.locator("#evaluation-feedback")).to_contain_text("Evaluation settings saved")
+                    self.assertEqual(state["requests"][-1], ("/api/setup/evaluation", {
+                        "model": model,
+                        "reasoning_effort": value,
+                        "service_tier": "fast",
+                        "max_chase_fraction": "0.1",
+                    }))
+                    page.reload(wait_until="domcontentloaded")
+                    expect(effort).to_have_value(value)
+                    expect(page.locator("#evaluation-model")).to_have_value(model)
             finally:
                 browser.close()
 

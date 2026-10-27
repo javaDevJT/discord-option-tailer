@@ -1,7 +1,7 @@
 FROM ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849 AS otel-collector
 
 FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS codex-runtime
-ARG CODEX_VERSION=0.153.4
+ARG CODEX_VERSION=latest
 RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}"
 
 FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS novnc-assets
@@ -22,7 +22,7 @@ COPY --from=codex-runtime /usr/local/lib/node_modules/@openai /usr/local/lib/nod
 COPY --from=novnc-assets /novnc/usr/share/novnc /usr/share/novnc
 COPY --from=novnc-assets /novnc/usr/share/doc/novnc /usr/share/doc/novnc
 
-ARG CODEX_VERSION=0.153.4
+ARG CODEX_VERSION=latest
 ARG PLAYWRIGHT_VERSION=1.63.0
 ARG CHROME_VERSION=154.0.8037.97-1
 ARG CHROME_SHA256=a4edbe95e9b01db6c9b97d7a1323121eda18362b5620df06abac1b59bee80053
@@ -69,7 +69,9 @@ RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,reado
     && /opt/venv/bin/python -m pip install --no-cache-dir --upgrade 'setuptools>=68' \
     && ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex \
     && test -x /usr/local/bin/codex \
-    && codex --version \
+    && codex --version > /opt/relay-codex-version \
+    && cat /opt/relay-codex-version \
+    && if [ "${CODEX_VERSION}" != latest ]; then grep -Fx "codex-cli ${CODEX_VERSION}" /opt/relay-codex-version; fi \
     && groupadd --gid 1001 relay \
     && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/relay --shell /usr/sbin/nologin relay \
     && mkdir -p /app /opt/relay-docker /run/nginx /var/log/supervisor \
@@ -103,8 +105,10 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     && chown -R root:root /app /opt/relay-docker
 
 ARG QB_SOURCE_COMMIT=unknown
+RUN --network=none /opt/venv/bin/python /app/docker/check-codex-cli.py
 ENV QB_SOURCE_COMMIT=${QB_SOURCE_COMMIT} \
-    RELAY_SOURCE_REVISION=${QB_SOURCE_COMMIT}
+    RELAY_SOURCE_REVISION=${QB_SOURCE_COMMIT} \
+    RELAY_CODEX_VERSION=${CODEX_VERSION}
 
 ENV HOME=/home/relay \
     CODEX_HOME=/data/codex \

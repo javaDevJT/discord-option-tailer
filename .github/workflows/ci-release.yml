@@ -131,6 +131,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Resolve latest stable Codex CLI version
+        id: codex_cli
+        run: python .github/scripts/resolve_codex_cli.py
+
       - name: Log in to Docker Hub
         if: ${{ github.repository == 'javaDevJT/discord-option-tailer' && (github.event_name != 'pull_request' && github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -195,9 +199,10 @@ jobs:
           context: .
           file: ./Dockerfile
           build-args: |
+            CODEX_VERSION=${{ steps.codex_cli.outputs.version }}
             QB_SOURCE_COMMIT=${{ github.sha }}
           platforms: linux/amd64
-          no-cache-filters: runtime
+          no-cache-filters: runtime,codex-runtime
           pull: true
           push: false
           labels: ${{ steps.meta.outputs.labels }}
