@@ -27,7 +27,7 @@ RUN apt-get update \
     && dpkg-deb --field /tmp/novnc_*.deb Package Version Source \
         > /novnc/usr/share/novnc/package-provenance.txt
 
-FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 AS runtime
+FROM ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944 AS runtime
 COPY --from=otel-collector /otelcol-contrib /usr/local/bin/otelcol-contrib
 COPY --from=codex-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex-runtime /usr/local/lib/node_modules/@openai /usr/local/lib/node_modules/@openai
