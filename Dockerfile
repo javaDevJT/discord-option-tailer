@@ -1,4 +1,16 @@
-FROM ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849 AS otel-collector
+FROM golang:1.27.3-bookworm@sha256:05237276236793ebedaf0b87dab86add9ec9adc66ebef2dbc3107c18254cde1c AS otel-collector
+ENV GOTOOLCHAIN=local GOMAXPROCS=4
+RUN --mount=type=cache,target=/go/pkg/mod,id=relay-collector-modules \
+    --mount=type=cache,target=/root/.cache/go-build,id=relay-collector-build \
+    go install -p=4 go.opentelemetry.io/collector/cmd/builder@v0.163.0
+COPY docker/collector-builder.yaml /tmp/collector-builder.yaml
+RUN --mount=type=cache,target=/go/pkg/mod,id=relay-collector-modules \
+    --mount=type=cache,target=/root/.cache/go-build,id=relay-collector-build \
+    CGO_ENABLED=0 /go/bin/builder --config=/tmp/collector-builder.yaml --skip-compilation \
+    && cd /tmp/relay-collector \
+    && go mod edit -require=github.com/go-jose/go-jose/v4@v4.1.6 \
+    && go mod tidy \
+    && CGO_ENABLED=0 go build -p=4 -buildvcs=false -trimpath -ldflags='-s -w' -o /otelcol-contrib .
 
 FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS codex-runtime
 ARG CODEX_VERSION=latest
@@ -106,6 +118,7 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
 
 ARG QB_SOURCE_COMMIT=unknown
 RUN --network=none /opt/venv/bin/python /app/docker/check-codex-cli.py
+RUN --network=none RELAY_OTEL_ENABLED=0 /opt/venv/bin/python /app/docker/check-collector.py
 ENV QB_SOURCE_COMMIT=${QB_SOURCE_COMMIT} \
     RELAY_SOURCE_REVISION=${QB_SOURCE_COMMIT} \
     RELAY_CODEX_VERSION=${CODEX_VERSION}

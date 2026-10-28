@@ -7,7 +7,7 @@ create an OpenWoof API key.
 
 ## Runtime and data path
 
-The existing container runs an official Collector under Supervisor. Its OTLP
+The existing container runs an app-specific Collector under Supervisor. Its OTLP
 HTTP/protobuf receiver binds to **127.0.0.1:4318 inside that container**, with no
 published receiver port. Python SDKs initialize before application modules and
 send there. The Collector alone reads the ingest key and exports over verified
@@ -15,10 +15,24 @@ HTTPS to `https://openwoof.javadevjt.tech`, appending `/v1/traces`, `/v1/metrics
 and `/v1/logs`. A file-backed bearer authenticator supplies one Authorization
 header; it is not combined with an API-key header or browser credentials.
 
-The Collector is pinned to official release **0.163.2** and its immutable OCI
-index digest. Python SDK/exporter **1.45.1** and instrumentation **0.66b1** are
-pinned in the `telemetry` extra. The final application image passes the existing
-test, secret, SBOM, High/Critical and publication gates as one scanned artifact.
+The Collector uses the enabled components from the official **0.163.2**
+distribution: component modules **0.163.0** and configuration providers **1.69.0**,
+pinned in [the builder manifest](../docker/collector-builder.yaml). The official
+builder **0.163.0** compiles it with checksum-pinned Go **1.27.3**, requiring
+`go-jose/v4` **4.1.6** or later in the generated module graph. This avoids the
+vulnerable **4.1.5** dependency ([advisory](https://github.com/go-jose/go-jose/security/advisories/GHSA-mgcc-cww5-fp2q)) shipped in the full upstream binary without
+removing any component used by this app. All configured receivers, processors,
+extensions and exporters remain enabled, and the image build validates the
+complete production configuration. Python SDK/exporter **1.45.1** and
+instrumentation **0.66b1** remain pinned in the `telemetry` extra. The final image
+passes the existing test, secret, SBOM, High/Critical and publication gates as
+one scanned artifact.
+
+An additional build check runs the actual Collector with networking disabled
+except loopback. Synthetic traces, metrics, process JSONL logs and supervisor
+logs must traverse the configured pipelines to a local fake exporter, with
+bearer authentication and credential redaction verified. It uses no production
+key or provider endpoint.
 
 | Actual hook | Signal and boundary |
 |---|---|
