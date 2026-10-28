@@ -486,7 +486,7 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostic["returned_expiries"], [self.contract["expiry"]])
         self.assertEqual(diagnostic["requested_date_instruments"], 1)
 
-    async def test_nearest_expiry_uses_listed_matching_standard_contracts(self):
+    async def test_nearest_expiry_prefers_requested_date_and_rejects_invalid_targets(self):
         dates = ["2026-09-18", "2026-09-08", "2026-09-11"]
         chain = self.chain | {"expiration_dates": dates}
         rows = [self.instrument | {"expiration_date": expiry, "state": "active", "tradability": "tradable"}
@@ -503,26 +503,54 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         self.broker._pages = AsyncMock(side_effect=pages)
         request = self.contract | {"expiry": "2026-09-08"}
         self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-08")
-        rows[1]["tradability"] = "untradable"
+
+        requested_row = rows.pop(1)
         diagnostic = {}
         self.assertEqual((await self.broker.nearest_expiry(request, diagnostic=diagnostic))["expiry"], "2026-09-11")
         self.assertEqual(diagnostic["requested_expiry"], "2026-09-08")
         self.assertEqual(diagnostic["selected_expiry"], "2026-09-11")
-        self.assertEqual(diagnostic["requested_date_instruments"], 1)
-        self.assertEqual(diagnostic["requested_date_eligible"], 0)
-        self.assertEqual(diagnostic["rejected"], {"untradable": 1})
-        rows[2]["strike_price"] = "501"
-        self.assertEqual((await self.broker.nearest_expiry(request))["expiry"], "2026-09-18")
-        rows[0]["type"] = "put"
-        with self.assertRaisesRegex(BrokerError, "No listed expiration"):
+        self.assertEqual(diagnostic["requested_date_probe"]["status"], "empty")
+
+        rows.insert(1, requested_row)
+        requested_row["tradability"] = "untradable"
+        with self.assertRaisesRegex(BrokerError, "requested-date option is not tradable"):
             await self.broker.nearest_expiry(request)
 
-    async def _configure_requested_date_probe(self, *, include_same_day=False, probe_error=None):
+        requested_row["tradability"] = "tradable"
+        requested_row["strike_price"] = "501"
+        with self.assertRaisesRegex(BrokerError, "mismatched requested-date option"):
+            await self.broker.nearest_expiry(request)
+
+        requested_row["strike_price"] = "500.00"
+        requested_row["type"] = "put"
+        with self.assertRaisesRegex(BrokerError, "mismatched requested-date option"):
+            await self.broker.nearest_expiry(request)
+
+    async def _configure_requested_date_probe(
+        self, *, include_same_day=False, probe_error=None, calendar_omits_requested=False,
+        same_day_state="active", same_day_tradability="tradable", same_day_strike="500.00",
+        same_day_type="call", duplicate_same_day=False, filter_requested_results=False,
+        include_unrelated_same_day=False, include_same_day_bulk=False,
+    ):
         requested_date, later_date = "2026-09-28", "2026-09-30"
-        chain = self.chain | {"expiration_dates": [requested_date, later_date]}
+        listed_dates = [later_date] if calendar_omits_requested else [requested_date, later_date]
+        chain = self.chain | {"expiration_dates": listed_dates}
         same_day = self.instrument | {
             "id": "33333333-3333-4333-8333-333333333333",
             "expiration_date": requested_date,
+            "state": same_day_state,
+            "tradability": same_day_tradability,
+            "strike_price": same_day_strike,
+            "type": same_day_type,
+        }
+        same_day_rows = [same_day]
+        if duplicate_same_day:
+            same_day_rows.append(same_day | {"id": "44444444-4444-4444-8444-444444444444"})
+        unrelated_same_day = self.instrument | {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "chain_id": "ineligible-chain",
+            "expiration_date": requested_date,
+            "strike_price": "501.00",
         }
         later = self.instrument | {"expiration_date": later_date}
         request = self.contract | {"expiry": requested_date}
@@ -533,20 +561,38 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             if name == "get_option_chains":
                 return {"chains": [chain]}
             if name != "get_option_instruments":
+                if name == "get_option_quotes":
+                    return {"results": [{"quote": self.quote | {"instrument_id": same_day_rows[0]["id"]}}]}
                 raise AssertionError(name)
+            if args.get("ids"):
+                available = same_day_rows + [later]
+                return {"instruments": [row for row in available if row["id"] in args["ids"]]}
             dates = args["expiration_dates"].split(",")
             self.assertEqual(args.get("chain_symbol"), "SPY")
             self.assertEqual(args.get("strike_price"), "500")
             self.assertEqual(args.get("type"), "call")
-            self.assertEqual(args.get("state"), "active")
-            self.assertEqual(args.get("tradability"), "tradable")
             if dates == [requested_date]:
                 probe_requests.append(copy.deepcopy(args))
                 if probe_error is not None:
                     raise probe_error
-                return {"instruments": [same_day] if include_same_day else []}
+                if filter_requested_results and (
+                    (args.get("state") is not None and args["state"] != same_day_state)
+                    or (args.get("tradability") is not None and args["tradability"] != same_day_tradability)
+                ):
+                    return {"instruments": []}
+                probe_rows = same_day_rows if include_same_day else []
+                if include_unrelated_same_day:
+                    probe_rows = probe_rows + [unrelated_same_day]
+                return {"instruments": probe_rows}
             if later_date in dates:
-                return {"instruments": [later]}
+                self.assertEqual(args.get("state"), "active")
+                self.assertEqual(args.get("tradability"), "tradable")
+                bulk_rows = [later]
+                if include_same_day_bulk:
+                    bulk_rows.append(same_day)
+                if include_unrelated_same_day:
+                    bulk_rows.append(unrelated_same_day)
+                return {"instruments": bulk_rows}
             return {"instruments": []}
 
         self.broker._data = AsyncMock(side_effect=data)
@@ -568,6 +614,119 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
             {"attempted": True, "status": "matched", "instrument_count": 1, "eligible_count": 1},
         )
         self.assertEqual(diagnostic["selection_source"], "requested_date_probe")
+
+    async def test_nearest_expiry_probes_requested_date_missing_from_calendar_and_bulk(self):
+        request, _, probe_requests = await self._configure_requested_date_probe(
+            include_same_day=True, calendar_omits_requested=True
+        )
+        diagnostic = {}
+
+        resolved = await self.broker.nearest_expiry(request, diagnostic=diagnostic)
+
+        self.assertEqual(resolved, request)
+        self.assertEqual(len(probe_requests), 1)
+        self.assertEqual(diagnostic["requested_date_probe"]["status"], "matched")
+        self.assertEqual(diagnostic["selection_source"], "requested_date_probe")
+
+    async def test_nearest_expiry_selects_valid_target_amid_unrelated_same_day_rows(self):
+        request, _, probe_requests = await self._configure_requested_date_probe(
+            include_same_day=True,
+            calendar_omits_requested=True,
+            include_unrelated_same_day=True,
+        )
+
+        resolved = await self.broker.nearest_expiry(request)
+
+        self.assertEqual(resolved["expiry"], request["expiry"])
+        self.assertEqual(len(probe_requests), 1)
+
+    async def test_nearest_expiry_selects_bulk_target_amid_ineligible_same_day_rows(self):
+        request, _, probe_requests = await self._configure_requested_date_probe(
+            include_same_day_bulk=True,
+            calendar_omits_requested=True,
+            include_unrelated_same_day=True,
+        )
+        diagnostic = {}
+
+        resolved = await self.broker.nearest_expiry(request, diagnostic=diagnostic)
+
+        self.assertEqual(resolved["expiry"], request["expiry"])
+        self.assertEqual(probe_requests, [])
+        self.assertEqual(diagnostic["selection_source"], "bulk")
+
+    async def test_nearest_expiry_falls_back_when_unlisted_requested_date_is_empty(self):
+        request, _, probe_requests = await self._configure_requested_date_probe(
+            calendar_omits_requested=True
+        )
+        diagnostic = {}
+
+        resolved = await self.broker.nearest_expiry(request, diagnostic=diagnostic)
+
+        self.assertEqual(resolved["expiry"], "2026-09-30")
+        self.assertEqual(len(probe_requests), 1)
+        self.assertEqual(diagnostic["requested_date_probe"]["status"], "empty")
+        self.assertEqual(diagnostic["selection_source"], "later_date")
+
+    async def test_wrong_date_probe_result_cannot_authorize_later_fallback(self):
+        request, _, _ = await self._configure_requested_date_probe(calendar_omits_requested=True)
+        original = self.broker._data.side_effect
+
+        async def data(name, args):
+            if name == "get_option_instruments" and args.get("expiration_dates") == request["expiry"]:
+                return {"instruments": [self.instrument | {"expiration_date": "2026-09-30"}]}
+            return await original(name, args)
+
+        self.broker._data.side_effect = data
+        with self.assertRaisesRegex(BrokerError, "mismatched requested-date option"):
+            await self.broker.nearest_expiry(request)
+
+    async def test_nearest_expiry_does_not_skip_untradable_requested_date(self):
+        request, _, _ = await self._configure_requested_date_probe(
+            include_same_day=True,
+            calendar_omits_requested=True,
+            same_day_tradability="untradable",
+            filter_requested_results=True,
+        )
+
+        with self.assertRaisesRegex(BrokerError, "requested-date option is not tradable"):
+            await self.broker.nearest_expiry(request)
+
+    async def test_nearest_expiry_does_not_skip_ambiguous_requested_date(self):
+        request, _, _ = await self._configure_requested_date_probe(
+            include_same_day=True,
+            calendar_omits_requested=True,
+            duplicate_same_day=True,
+        )
+
+        with self.assertRaisesRegex(BrokerError, "ambiguous across chains"):
+            await self.broker.nearest_expiry(request)
+
+    async def test_nearest_expiry_does_not_skip_malformed_requested_date_metadata(self):
+        request, _, _ = await self._configure_requested_date_probe(
+            include_same_day=True,
+            calendar_omits_requested=True,
+            same_day_strike="501.00",
+        )
+
+        with self.assertRaisesRegex(BrokerError, "mismatched requested-date option"):
+            await self.broker.nearest_expiry(request)
+
+    async def test_prepared_entry_accepts_exact_date_instrument_missing_from_calendar(self):
+        request, _, _ = await self._configure_requested_date_probe(
+            include_same_day=True, calendar_omits_requested=True
+        )
+        self.broker.currency = "USD"
+
+        metadata = await self.broker.prewarm_entry(request)
+
+        self.assertEqual(metadata["contract"]["expiry"], request["expiry"])
+        self.assertEqual(Decimal(metadata["contract"]["strike"]), Decimal(request["strike"]))
+        prepared = self.broker.prepared_entry(request, Decimal("1.00"))
+        self.assertEqual(prepared["option_id"], "33333333-3333-4333-8333-333333333333")
+        quote = await self.broker.quote(request)
+        self.assertEqual(quote["contract"]["expiry"], request["expiry"])
+        self.assertEqual(Decimal(quote["contract"]["strike"]), Decimal(request["strike"]))
+        self.assertTrue(quote["tradable"])
 
     async def test_nearest_expiry_confirms_empty_requested_date_before_bulk_fallback(self):
         request, _, probe_requests = await self._configure_requested_date_probe()

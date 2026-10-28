@@ -18,6 +18,7 @@ class PutExecutionParityTests(unittest.IsolatedAsyncioTestCase):
         live.now = now
 
         original_data = live.broker._data.side_effect
+        instrument_queries = []
 
         async def data(name, args=None):
             if name == "search":
@@ -30,7 +31,16 @@ class PutExecutionParityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args["chain_symbol"], "QQQ")
                 self.assertEqual(args["strike_price"], "743")
                 self.assertEqual(args["type"], live.instrument["type"])
-                self.assertIn("2026-09-24", args["expiration_dates"].split(","))
+                dates = args["expiration_dates"].split(",")
+                instrument_queries.append(dates)
+                if dates == [source_day]:
+                    self.assertNotIn("state", args)
+                    self.assertNotIn("tradability", args)
+                    # This fixture has only the explicitly described next-day
+                    # contract. Confirm today's absence before allowing it.
+                    return {"instruments": []}
+                else:
+                    self.assertIn("2026-09-24", dates)
             if name == "get_option_quotes":
                 self.assertEqual(args["instrument_ids"], [live.instrument["id"]])
             return await original_data(name, args)
@@ -83,9 +93,11 @@ class PutExecutionParityTests(unittest.IsolatedAsyncioTestCase):
                 ZoneInfo("America/New_York")
             ).date().isoformat()
             requested = decision["contract"] | {"expiry": source_day}
+            query_start = len(instrument_queries)
             contract = await live.broker.nearest_expiry(requested)
             self.assertEqual(contract["expiry"], "2026-09-24")
             self.assertEqual(contract["option_type"], option_type)
+            self.assertIn([source_day], instrument_queries[query_start:])
 
             args, quote = await live.broker._order_args({
                 "contract": contract,

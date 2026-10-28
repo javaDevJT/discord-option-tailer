@@ -45,6 +45,8 @@ An entry's message card shows whether it used prepared watch metadata or fetched
 
 Expiry diagnostics show the requested and selected dates, bounded lists of listed/returned dates, and counts explaining whether matching instruments for the requested day were absent or rejected. These are broker lookup observations, not a guarantee that the publisher intended the selected expiry. A later-expiry ask should not be interpreted as movement in the same-day contract.
 
+Prepared watches retain the expiry-selection evidence across refreshes. A default that previously resolved to a later date is rechecked on each scheduled preparation refresh; the old later contract cannot be reused while that recheck is in flight. A prepared same-day contract can be reused without an additional expiry lookup on entry. Explicit future dates are preserved.
+
 Watch-only shorthand such as `QQQ740P` and `QQQ $740P` prepares the same contract metadata. It cannot authorize an order. A tick schedule may legitimately have a zero price cutoff; its actual price increments must remain positive. Prepared entry still requires a fresh account snapshot, current watch/source checks, a bounded limit price, broker review, and the existing execution permissions. It does not guarantee sub-second submission. Older decisions without these diagnostics are left unchanged.
 
 ## Uncertain orders and restart recovery
@@ -66,6 +68,8 @@ The three-second prepared-entry deadline is armed after final checks, immediatel
 To permit 0DTE entries, enable **Allow same-day (0DTE) entries** in Setup and select **Save permission**. When the relay is running, the button reads **Pause and save** and pauses before saving. Wait for the saved confirmation, then select **Resume relay** when ready. Editing the checkbox does not change the saved permission until you save; the selected mode, credentials and other risk rules remain intact.
 
 When an actionable new entry omits expiry, the interpreter requests the nearest listed expiration. The broker selects 0DTE when the exact standard contract is listed, otherwise the first later expiration at the same symbol, strike and call/put. An explicit text, embed or pictured date is preserved even if unavailable; it never silently rolls to another date. Exits inherit the owned position's expiry. Defaults use the original message's New York date, and earlier-day implicit entries cannot be revived with a newly listed contract. The existing same-day permission gate remains authoritative.
+
+The broker explicitly checks that original message date even when the advertised expiration calendar or bulk response omits it. A failed or uncertain same-day lookup does not establish that 0DTE is unavailable. The later-expiry fallback requires a conclusive empty exact-day result; metadata omission alone cannot select a Friday contract instead of an available same-day option.
 
 Current-message and directly replied-to Discord attachment pictures are passed to Codex through native image input using the existing subscription. Supported PNG/JPEG/WebP images are fetched only from approved Discord CDN attachment paths, bounded in count and size, and kept in private temporary files. Signed URLs never enter model text. Unreadable or unsupported pictures stop interpretation; filenames cannot supply an expiration. Image-only alerts without an accompanying textual action remain held.
 

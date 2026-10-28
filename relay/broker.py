@@ -1952,18 +1952,21 @@ class RobinhoodBroker(RobinhoodMCP):
         ]
 
         eligible_ids = {chain["id"] for chain in eligible_chains}
+        requested_rows = [row for row in instruments if isinstance(row, dict) and row.get("expiration_date") == target[1]]
         if diagnostic is not None:
-            requested_rows = [row for row in instruments if row.get("expiration_date") == target[1]]
             rejected, eligible = {}, 0
             for row in requested_rows:
-                reason = (
-                    "wrong_chain" if row["chain_id"] not in eligible_ids else
-                    "inactive" if row.get("state") != "active" else
-                    "untradable" if row.get("tradability") != "tradable" else
-                    "non_equity" if row["underlying_type"] != "equity" else
-                    "nonstandard_multiplier" if _decimal(row["trade_value_multiplier"], "multiplier") != 100 else
-                    "contract_mismatch" if _contract_key(self._instrument_contract(row)) != target else None
-                )
+                try:
+                    reason = (
+                        "wrong_chain" if row.get("chain_id") not in eligible_ids else
+                        "inactive" if row.get("state") != "active" else
+                        "untradable" if row.get("tradability") != "tradable" else
+                        "non_equity" if row.get("underlying_type") != "equity" else
+                        "nonstandard_multiplier" if _decimal(row.get("trade_value_multiplier"), "multiplier") != 100 else
+                        "contract_mismatch" if _contract_key(self._instrument_contract(row)) != target else None
+                    )
+                except (BrokerError, KeyError, TypeError, ValueError):
+                    reason = "malformed"
                 if reason:
                     rejected[reason] = rejected.get(reason, 0) + 1
                 else:
@@ -1974,13 +1977,31 @@ class RobinhoodBroker(RobinhoodMCP):
                 requested_date_instruments=len(requested_rows), requested_date_eligible=eligible,
                 rejected=rejected,
             )
+
+        def validate_requested_rows(rows):
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise BrokerError("Broker returned malformed requested-date option metadata; refusing fallback")
+                if _contract_key(self._instrument_contract(row)) != target:
+                    raise BrokerError("Broker returned a mismatched requested-date option; refusing fallback")
+                if row.get("chain_id") not in eligible_ids:
+                    raise BrokerError("Requested-date option belongs to an ineligible chain; refusing fallback")
+                if row.get("state") != "active" or row.get("tradability") != "tradable":
+                    raise BrokerError("Broker requested-date option is not tradable; refusing fallback")
+                if (row.get("underlying_type") != "equity"
+                        or _decimal(row.get("trade_value_multiplier"), "multiplier") != 100):
+                    raise BrokerError("Broker requested-date option is not a standard equity contract; refusing fallback")
+
         expiries = sorted({
             expiry for chain in eligible_chains
             for expiry in (chain["expiration_dates"] or [])
-            if expiry >= target[1]
+            if expiry > target[1]
         } | {row["expiration_date"] for row in instruments
-             if row["chain_id"] in eligible_ids and row["expiration_date"] in prefetched_dates})
-        def matching(rows, expiry):
+             if isinstance(row, dict) and row.get("chain_id") in eligible_ids
+             and row.get("expiration_date") in prefetched_dates
+             and row["expiration_date"] > target[1]})
+
+        def matching(rows, expiry, *, verified_requested_date=False):
             candidates = []
             for chain in eligible_chains:
                 for instrument in rows:
@@ -1992,51 +2013,66 @@ class RobinhoodBroker(RobinhoodMCP):
                         continue
                     key = _contract_key(self._instrument_contract(instrument))
                     if key[0] == target[0] and key[1] == expiry and key[2:] == target[2:]:
-                        if expiry not in (chain["expiration_dates"] or []):
+                        if (expiry not in (chain["expiration_dates"] or [])
+                                and not (verified_requested_date and expiry == target[1])):
                             raise BrokerError("Broker option expiry metadata is inconsistent; refusing to skip an available date")
                         candidates.append((chain, instrument))
             if len(candidates) > 1:
                 raise BrokerError("Option expiration is ambiguous across chains")
             return candidates
 
-        async def exact_date(expiry):
-            return await self._pages(
-                    "get_option_instruments",
-                    {
-                        "chain_symbol": target[0],
-                        "expiration_dates": expiry,
-                        "strike_price": format(Decimal(target[2]), "f"),
-                        "type": target[3],
-                        "state": "active",
-                        "tradability": "tradable",
-                    },
-                    "instruments",
-                )
+        async def exact_date(expiry, *, eligible_only=True):
+            query = {
+                "chain_symbol": target[0],
+                "expiration_dates": expiry,
+                "strike_price": format(Decimal(target[2]), "f"),
+                "type": target[3],
+            }
+            if eligible_only:
+                query.update(state="active", tradability="tradable")
+            return await self._pages("get_option_instruments", query, "instruments")
+
+        def select(expiry, candidates, selection_source):
+            resolved = dict(contract, expiry=expiry)
+            if diagnostic is not None:
+                diagnostic["selected_expiry"] = expiry
+                diagnostic["selection_source"] = selection_source
+            self._remember_execution_handoff(resolved, *candidates[0])
+            return resolved
+
+        # Resolve the requested day before consulting later calendar dates. The
+        # exact-date endpoint can confirm a valid contract omitted by the chain
+        # calendar or by the bounded bulk response.
+        requested_candidates = matching(instruments, target[1], verified_requested_date=True)
+        if requested_candidates:
+            return select(target[1], requested_candidates, "bulk")
+
+        probe = {"attempted": True, "status": "failed"}
+        if diagnostic is not None:
+            diagnostic["requested_date_probe"] = probe
+        started = time.monotonic()
+        try:
+            # Leave status filters off so an inactive or untradable contract
+            # cannot look like an absent date and silently trigger fallback.
+            exact_rows = await exact_date(target[1], eligible_only=False)
+            probe.update(instrument_count=len(exact_rows), eligible_count=0,
+                         status="filtered" if exact_rows else "empty")
+            candidates = matching(exact_rows, target[1], verified_requested_date=True)
+            probe.update(eligible_count=len(candidates), status="matched" if candidates else "empty")
+            if candidates:
+                return select(target[1], candidates, "requested_date_probe")
+            # A unique valid target wins over unrelated rows. With no valid
+            # target, a nonempty or inconsistent response is not proof that
+            # today's option is absent and cannot authorize a later expiry.
+            validate_requested_rows(exact_rows)
+        finally:
+            probe["duration_seconds"] = round(time.monotonic() - started, 6)
+
         for expiry in expiries:
             rows = instruments if expiry in prefetched_dates else await exact_date(expiry)
             candidates = matching(rows, expiry)
-            selection_source = "bulk" if expiry == target[1] else "later_date"
-            if not candidates and expiry == target[1]:
-                # Confirm an omitted listed date before accepting a different contract.
-                probe = {"attempted": True, "status": "failed"}
-                if diagnostic is not None:
-                    diagnostic["requested_date_probe"] = probe
-                started = time.monotonic()
-                try:
-                    exact_rows = await exact_date(expiry)
-                    candidates = matching(exact_rows, expiry)
-                    probe.update(instrument_count=len(exact_rows), eligible_count=len(candidates),
-                                 status="matched" if candidates else "filtered" if exact_rows else "empty")
-                finally:
-                    probe["duration_seconds"] = round(time.monotonic() - started, 6)
-                selection_source = "requested_date_probe"
             if candidates:
-                resolved = dict(contract, expiry=expiry)
-                if diagnostic is not None:
-                    diagnostic["selected_expiry"] = expiry
-                    diagnostic["selection_source"] = selection_source
-                self._remember_execution_handoff(resolved, *candidates[0])
-                return resolved
+                return select(expiry, candidates, "later_date")
         raise BrokerError("No listed expiration for the requested option")
 
     @_scope_operation
@@ -2062,7 +2098,6 @@ class RobinhoodBroker(RobinhoodMCP):
             candidates = [
                 (chain, instrument) for chain in chains for instrument in instruments
                 if chain["id"] == cached["chain_id"] and chain["symbol"] == target[0]
-                and target[1] in (chain["expiration_dates"] or [])
                 and instrument["id"] == cached["option_id"]
                 and instrument["chain_id"] == chain["id"]
                 and _contract_key(self._instrument_contract(instrument)) == target
@@ -2081,7 +2116,7 @@ class RobinhoodBroker(RobinhoodMCP):
             ])
             matching_chains = [
                 chain for chain in chains
-                if chain["symbol"] == target[0] and target[1] in (chain["expiration_dates"] or [])
+                if chain["symbol"] == target[0]
             ]
 
             for chain in matching_chains:
@@ -2164,7 +2199,6 @@ class RobinhoodBroker(RobinhoodMCP):
             chain
             for chain in chains
             if chain.get("symbol") == target[0]
-            and target[1] in (chain.get("expiration_dates") or [])
         ]
         candidates = [
             (chain, instrument)

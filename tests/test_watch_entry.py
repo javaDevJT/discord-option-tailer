@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from tests import test_core as fixtures
 from relay.core import Engine, Hold, Store
+from relay.entry_rules import deterministic_entry
 from relay.watch import WATCH_MARKET_REQUEST_INTERVAL_SECONDS, watch_candidate
 
 
@@ -37,8 +38,8 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
 
     message = fixtures.CoreChecks.message
 
-    async def warm(self, content="On watch: BAC $63C"):
-        message = self.message(content=content)
+    async def warm(self, content="On watch: BAC $63C", **changes):
+        message = self.message(content=content, **changes)
         message["source_group"] = self.config["channels"][0]["source_group"]
         self.store.observe(message)
         self.engine.watches.note(message)
@@ -68,6 +69,102 @@ class WatchEntryChecks(unittest.IsolatedAsyncioTestCase):
         resolved = await self.engine.resolve_expiry(entry, decision)
         self.assertEqual(resolved["contract"], fixtures.CONTRACT)
         self.assertEqual(self.broker.nearest_expiry.await_count, 1)
+
+    async def test_default_future_watch_refresh_switches_to_newly_available_0dte(self):
+        today = fixtures.CONTRACT | {"expiry": self.now.date().isoformat()}
+        self.broker.nearest_expiry.side_effect = [fixtures.CONTRACT, today]
+        watch = await self.warm()
+        cached = self.engine.watches.entries[watch["id"]]
+        self.assertEqual(cached["contract"], fixtures.CONTRACT)
+        await self.engine.watches._prepare(cached)
+        self.assertEqual(cached["contract"], today)
+        self.assertEqual(self.broker.nearest_expiry.await_count, 2)
+        entry = self.message(content="ENTRY BAC $63C @ .80")
+        entry["source_group"] = cached["group"]
+        self.store.observe(entry)
+        decision = self.interpreter.decision | {"contract": today | {"expiry": "nearest"},
+                                                "origin_message_id": entry["id"],
+                                                "evidence": [{"message_id": entry["id"], "quote": entry["content"]}]}
+        self.assertEqual((await self.engine.resolve_expiry(entry, decision))["contract"], today)
+        self.assertEqual(self.broker.nearest_expiry.await_count, 2)
+        self.assertEqual(self.broker.submissions, [])
+
+    async def test_observed_tsla_put_entry_without_date_uses_october_28_preparation(self):
+        self.now = self.now.replace(month=10, day=28, hour=13, minute=47)
+        today = {"symbol": "TSLA", "expiry": "2026-10-28", "strike": "397.5", "option_type": "put"}
+        self.broker.nearest_expiry.return_value = today
+        watch = await self.warm("On watch: TSLA $397.5P", timestamp=self.now.isoformat())
+        entry = self.message(timestamp=self.now.isoformat(), content="<@&1545000000000000001>", embeds=[{
+            "title": "ENTRY", "description": "📈 Contract: TSLA $397.5P\n💰 Price: 1.10\n‼️ Comments: none"}])
+        entry["source_group"] = self.engine.watches.entries[watch["id"]]["group"]
+        self.store.observe(entry)
+        decision = deterministic_entry(entry)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["contract"]["expiry"], "nearest")
+        resolved = await self.engine.resolve_expiry(entry, decision)
+        self.assertEqual(resolved["contract"], today)
+        self.assertEqual(self.broker.nearest_expiry.await_count, 1)
+        self.assertEqual(self.broker.submissions, [])
+
+    async def test_future_default_is_not_reused_while_expiry_is_being_rechecked(self):
+        watch = await self.warm()
+        cached = self.engine.watches.entries[watch["id"]]
+        started, release = asyncio.Event(), asyncio.Event()
+        today = fixtures.CONTRACT | {"expiry": self.now.date().isoformat()}
+
+        async def resolve(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return today
+
+        self.broker.nearest_expiry.side_effect = resolve
+        refresh = asyncio.create_task(self.engine.watches._prepare(cached))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            entry = self.message(content="ENTRY BAC $63C @ .80")
+            entry["source_group"] = cached["group"]
+            decision = self.interpreter.decision | {"contract": today | {"expiry": "nearest"}}
+            self.assertIsNone(self.engine.watches.match(entry, decision))
+        finally:
+            release.set()
+            await refresh
+        self.assertEqual(cached["contract"], today)
+
+    async def test_queued_future_expiry_recheck_cannot_reuse_old_contract(self):
+        watch = await self.warm()
+        cached = self.engine.watches.entries[watch["id"]]
+        cached["busy"] = True
+        entry = self.message(content="ENTRY BAC $63C @ .80")
+        entry["source_group"] = cached["group"]
+        decision = self.interpreter.decision | {"contract": fixtures.CONTRACT | {"expiry": "nearest"}}
+        diagnostic = {}
+        self.assertIsNone(self.engine.watches.match(entry, decision, diagnostic=diagnostic))
+        self.assertEqual(diagnostic["reason"], "watch_preparing")
+
+    async def test_same_day_watch_refresh_retains_expiry_evidence_without_new_lookup(self):
+        today = fixtures.CONTRACT | {"expiry": self.now.date().isoformat()}
+        resolution = {"requested_expiry": today["expiry"], "selected_expiry": today["expiry"],
+                      "selection_source": "requested_date_probe"}
+
+        async def resolve(contract, *, diagnostic):
+            diagnostic.update(copy.deepcopy(resolution))
+            return today
+
+        self.broker.nearest_expiry.side_effect = resolve
+        watch = await self.warm()
+        cached = self.engine.watches.entries[watch["id"]]
+        previous = cached["diagnostic"]["expiry_resolution"]
+        await self.engine.watches._prepare(cached)
+        self.assertEqual(cached["diagnostic"].get("expiry_resolution"), resolution)
+        self.assertIsNot(cached["diagnostic"]["expiry_resolution"], previous)
+        self.assertEqual(self.broker.nearest_expiry.await_count, 1)
+
+    async def test_explicit_future_watch_refresh_preserves_requested_expiry(self):
+        watch = await self.warm("On watch: BAC $63C 9/18")
+        cached = self.engine.watches.entries[watch["id"]]
+        await self.engine.watches._prepare(cached)
+        self.assertEqual(cached["contract"], fixtures.CONTRACT)
+        self.broker.nearest_expiry.assert_not_awaited()
 
     async def test_hot_poll_window_uses_notice_time_and_does_not_extend_on_duplicate(self):
         watch = await self.warm()

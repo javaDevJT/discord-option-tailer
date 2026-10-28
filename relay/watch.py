@@ -102,6 +102,7 @@ class WatchEntries:
             WATCH_PREPARATION_REFRESH_MAX_SECONDS - WATCH_PREPARATION_REFRESH_MIN_SECONDS)
 
     async def _prepare(self, entry):
+        previous_resolution = entry.get("diagnostic", {}).get("expiry_resolution")
         diagnostic = {"route": "fresh", "reason": "watch_preparing",
                       "watch_message_id": entry["message"]["id"],
                       "attempts": entry.get("diagnostic", {}).get("attempts", 0) + 1,
@@ -113,9 +114,15 @@ class WatchEntries:
             async with getattr(self.engine.broker, "background_reads", nullcontext)():
                 requested = entry["requested"]
                 if requested["expiry"] == "nearest":
-                    if entry["contract"] is not None:
+                    if entry["contract"] is not None and entry["contract"]["expiry"] == entry["day"]:
                         contract = canonical_contract(entry["contract"])
+                        if previous_resolution:
+                            diagnostic["expiry_resolution"] = copy.deepcopy(previous_resolution)
                     else:
+                        # A later default must not become a permanent choice:
+                        # today's contract can be missing from earlier discovery.
+                        # Do not expose the old fallback while rechecking it.
+                        entry["contract"] = None
                         anchored = canonical_contract(requested | {"expiry": entry["day"]})
                         resolution = diagnostic.setdefault("expiry_resolution", {})
                         contract = canonical_contract(await self.engine.broker.nearest_expiry(anchored, diagnostic=resolution))
@@ -342,6 +349,10 @@ class WatchEntries:
             if not self._current(entry):
                 if diagnostic is not None and diagnostic.get("watch_message_id") == entry["message"]["id"]:
                     diagnostic["reason"] = "watch_expired" if time.monotonic() >= entry["expires"] else "watch_invalidated"
+                continue
+            if (entry["busy"] and contract and entry["requested"]["expiry"] == "nearest"
+                    and contract["expiry"] != entry["day"]):
+                report(entry, "watch_preparing")
                 continue
             if not contract:
                 continue
