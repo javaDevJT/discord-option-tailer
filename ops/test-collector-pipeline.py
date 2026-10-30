@@ -79,6 +79,8 @@ def main():
     config = (ROOT / "docker/otelcol.yaml").read_text()
     for old, new in {
         "/data/telemetry/collector-checkpoints": str(directory / "checkpoints"),
+        "/data/telemetry/collector-queue/compaction": str(directory / "queue-compaction"),
+        "/data/telemetry/collector-queue": str(directory / "queue"),
         "/var/log/relay-telemetry/process-output.jsonl": str(directory / "process-output.jsonl"),
         "/var/log/supervisor/relay-supervisor.log": str(directory / "supervisor.log"),
         "127.0.0.1:4318": f"127.0.0.1:{receiver_port}",
@@ -87,6 +89,8 @@ def main():
         "endpoint: https://openwoof.javadevjt.tech": f"endpoint: https://127.0.0.1:{sink.server_port}",
         "      insecure: false": f"      ca_file: {cert}\n      insecure: false",
     }.items(): config = config.replace(old, new)
+    if "openwoof.javadevjt.tech" in config or "/data/telemetry/collector-queue" in config:
+        raise RuntimeError("fixture config retained a production endpoint or persistent storage path")
     configuration = directory / "collector.yaml"; configuration.write_text(config)
     env = dict(os.environ, OPENWOOF_INGEST_KEY_FILE=str(credential), RELAY_SOURCE_REVISION="fixture-20261021")
     actor = r'''

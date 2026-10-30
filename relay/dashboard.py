@@ -16,6 +16,7 @@ import tempfile
 from .account import AUTH_ERROR, CACHE_KEY, REFRESH_ERROR, REFRESH_SECONDS
 from .telemetry import http_request, mark_error
 from .status import project_dispatch_checks, project_execution_diagnostic
+from .resources import ResourceDiagnostics
 from .images import collect_images, download_images, ImageTransportError, MAX_IMAGES
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
@@ -1201,6 +1202,7 @@ class DashboardApp:
         self._config_lock = threading.RLock()
         self.static_root = (Path(__file__).resolve().parent / "static").resolve()
         self.csrf_token = secrets.token_urlsafe(32)
+        self.resources = ResourceDiagnostics(self.config["database"].parent)
         self.setup = None
         if enable_setup:
             from .setup import SetupManager
@@ -1789,7 +1791,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if parsed.query:
                     raise QueryError("telemetry does not accept query parameters")
                 from .telemetry import status as telemetry_status
-                self._json(200, telemetry_status(), api=True, head=head)
+                self._json(200, telemetry_status() | {"resources": self.app.resources.snapshot()}, api=True, head=head)
                 return
             if path == "/api/status":
                 if parsed.query:

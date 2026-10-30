@@ -6,6 +6,22 @@ extensions:
   file_storage:
     directory: /data/telemetry/collector-checkpoints
     create_directory: true
+    directory_permissions: "0700"
+    max_size: 4194304
+  file_storage/queue:
+    directory: /data/telemetry/collector-queue
+    create_directory: true
+    directory_permissions: "0700"
+    # Each signal exporter has its own bbolt file, capped at 32 MiB.
+    max_size: 33554432
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: /data/telemetry/collector-queue/compaction
+      cleanup_on_start: true
+      rebound_needed_threshold_mib: 24
+      rebound_trigger_threshold_mib: 8
+      check_interval: 30s
   health_check:
     endpoint: 127.0.0.1:13133
 
@@ -54,6 +70,7 @@ receivers:
     include: [/var/log/supervisor/relay-supervisor.log]
     start_at: beginning
     storage: file_storage
+    max_log_size: 1MiB
     resource:
       service.name: discord-option-tailer-runtime
       service.namespace: trading
@@ -105,11 +122,12 @@ processors:
           - 'replace_all_patterns(attributes, "value", "(?i)(Bearer|Basic) [A-Za-z0-9._~+/=-]+", "$$1 [REDACTED]")'
   batch:
     timeout: 1s
-    send_batch_size: 64
-    send_batch_max_size: 128
+    # Keep each request bounded; the exporter queue performs byte-sized coalescing.
+    send_batch_size: 1
+    send_batch_max_size: 1
 
 exporters:
-  otlp_http/openwoof:
+  otlp_http/openwoof_traces:
     endpoint: https://openwoof.javadevjt.tech
     encoding: proto
     auth:
@@ -120,16 +138,79 @@ exporters:
     timeout: 10s
     sending_queue:
       enabled: true
-      num_consumers: 2
-      queue_size: 64
+      num_consumers: 1
+      wait_for_result: false
+      sizer: bytes
+      queue_size: 16777216
+      storage: file_storage/queue
+      block_on_overflow: false
+      batch:
+        flush_timeout: 1s
+        sizer: bytes
+        min_size: 262144
+        max_size: 4194304
     retry_on_failure:
       enabled: true
       initial_interval: 1s
-      max_interval: 5s
-      max_elapsed_time: 30s
+      max_interval: 30s
+      max_elapsed_time: 0s
+  otlp_http/openwoof_metrics:
+    endpoint: https://openwoof.javadevjt.tech
+    encoding: proto
+    auth:
+      authenticator: bearertokenauth/openwoof
+    tls:
+      insecure: false
+      insecure_skip_verify: false
+    timeout: 10s
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      wait_for_result: false
+      sizer: bytes
+      queue_size: 16777216
+      storage: file_storage/queue
+      block_on_overflow: false
+      batch:
+        flush_timeout: 1s
+        sizer: bytes
+        min_size: 262144
+        max_size: 4194304
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
+  otlp_http/openwoof_logs:
+    endpoint: https://openwoof.javadevjt.tech
+    encoding: proto
+    auth:
+      authenticator: bearertokenauth/openwoof
+    tls:
+      insecure: false
+      insecure_skip_verify: false
+    timeout: 10s
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      wait_for_result: false
+      sizer: bytes
+      queue_size: 16777216
+      storage: file_storage/queue
+      block_on_overflow: false
+      batch:
+        flush_timeout: 1s
+        sizer: bytes
+        min_size: 262144
+        max_size: 4194304
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
 
 service:
-  extensions: [bearertokenauth/openwoof, file_storage, health_check]
+  extensions: [bearertokenauth/openwoof, file_storage, file_storage/queue, health_check]
   telemetry:
     logs:
       level: info
@@ -144,12 +225,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, transform/privacy, batch]
-      exporters: [otlp_http/openwoof]
+      exporters: [otlp_http/openwoof_traces]
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp_http/openwoof]
+      exporters: [otlp_http/openwoof_metrics]
     logs:
       receivers: [filelog/processes, filelog/supervisor]
       processors: [memory_limiter, transform/privacy, batch]
-      exporters: [otlp_http/openwoof]
+      exporters: [otlp_http/openwoof_logs]

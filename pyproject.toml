@@ -12,7 +12,7 @@ dependencies = ["httpx>=0.28,<1"]
 [project.optional-dependencies]
 discord = ["discord.py-self==2.1.0"]
 browser = ["playwright>=1.51,<2"]
-robinhood = ["mcp>=1.28,<2", "jsonschema>=4.23,<5", "exchange-calendars>=4.13,<5"]
+robinhood = ["mcp==1.30.0", "jsonschema>=4.23,<5", "exchange-calendars>=4.13,<5"]
 telemetry = [
   "opentelemetry-api==1.45.1",
   "opentelemetry-sdk==1.45.1",

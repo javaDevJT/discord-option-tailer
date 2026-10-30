@@ -710,11 +710,30 @@ class PaperBroker:
         return dict(result)
 
 
+OAUTH_TOKEN_EXPIRY_FIELD = "token_expires_at"
+
+
 class _OAuthStorage:
     """Owner-only atomic credential file; never include its content in diagnostics."""
 
     def __init__(self, path):
         self.path = Path(path)
+        self._stored_token_expires_at = None
+
+    @property
+    def stored_token_expires_at(self):
+        """Expiry from the same private-store snapshot as the last token read."""
+        return self._stored_token_expires_at
+
+    @staticmethod
+    def _valid_expiry(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            value = float(value)
+        except (OverflowError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     def _read(self):
         if not self.path.exists():
@@ -730,6 +749,13 @@ class _OAuthStorage:
     def _write(self, key, value):
         data = self._read()
         data[key] = value.model_dump(mode="json", exclude_none=True)
+        if key == "tokens":
+            expires_in = self._valid_expiry(getattr(value, "expires_in", None))
+            expires_at = time.time() + expires_in if expires_in is not None else None
+            if expires_at is not None and math.isfinite(expires_at):
+                data[OAUTH_TOKEN_EXPIRY_FIELD] = expires_at
+            else:
+                data.pop(OAUTH_TOKEN_EXPIRY_FIELD, None)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         name = None
         try:
@@ -746,7 +772,9 @@ class _OAuthStorage:
 
     async def get_tokens(self):
         from mcp.shared.auth import OAuthToken
-        value = self._read().get("tokens")
+        data = self._read()
+        self._stored_token_expires_at = self._valid_expiry(data.get(OAUTH_TOKEN_EXPIRY_FIELD))
+        value = data.get("tokens")
         return OAuthToken.model_validate(value) if value else None
 
     async def set_tokens(self, tokens):
@@ -759,6 +787,38 @@ class _OAuthStorage:
 
     async def set_client_info(self, client_info):
         self._write("client_info", client_info)
+
+
+def _oauth_client_provider(**kwargs):
+    """Create MCP auth that restores the expiry our owner-only store records.
+
+    MCP 1.30 loads OAuthToken but does not rebuild its in-memory expiry from
+    storage. Keep this compatibility shim local to our provider instance.
+    """
+    from mcp.client.auth import OAuthClientProvider
+
+    class _PersistedExpiryOAuthClientProvider(OAuthClientProvider):
+        async def _initialize(self):
+            was_initialized = self._initialized
+            await super()._initialize()
+            if was_initialized:
+                # The SDK may invoke _initialize from multiple request flows,
+                # while its base implementation preserves in-memory refreshes.
+                # Do not overwrite the refreshed expiry with the original store snapshot.
+                return
+            expires_at = getattr(self.context.storage, "stored_token_expires_at", None)
+            if expires_at == 0.0:
+                # Epoch zero is expired, but the SDK uses falsey values for
+                # "no expiry", so preserve it as an explicit past timestamp.
+                expires_at = 1.0
+            if expires_at is None and self.context.can_refresh_token():
+                # Legacy stores have no trustworthy issued-at time. Refresh a
+                # saved refresh token before sending its associated access token.
+                # The SDK treats a falsey expiry (including 0.0) as no expiry.
+                expires_at = 1.0
+            self.context.token_expiry_time = expires_at
+
+    return _PersistedExpiryOAuthClientProvider(**kwargs)
 
 
 class RobinhoodMCP:
@@ -869,9 +929,8 @@ class RobinhoodMCP:
                 raise error
             headers["Authorization"] = f"Bearer {token}"
         elif auth_mode == "oauth":
-            from mcp.client.auth import OAuthClientProvider
             from mcp.shared.auth import OAuthClientMetadata
-            auth = OAuthClientProvider(
+            auth = _oauth_client_provider(
                 server_url=ROBINHOOD_ENDPOINT,
                 client_metadata=OAuthClientMetadata(
                     client_name="Discord Options Relay",

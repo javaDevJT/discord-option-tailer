@@ -89,13 +89,26 @@ private-query and webhook-path filtering in the same Collector. No body-wide
 replacement, literal-message allowlist or generic operation rename is used.
 
 Queues, batch sizes, receiver body size, span attributes and file rotation are
-bounded. Each signal exporter queues at most 64 requests with two consumers,
-a 10-second request timeout and a 30-second retry window; the Collector retains
-its 256 MiB memory limit. This absorbs brief upstream stalls without an unbounded backlog.
+bounded. Traces, metrics and logs each have an independent persistent queue with
+a 16 MiB serialized-payload budget and one export consumer. Requests retain their
+10-second timeout; retries use exponential backoff/jitter up to 30 seconds and
+continue without an age cutoff while buffering remains available. The Collector
+retains its 256 MiB memory limit. Small pipeline batches bound persisted inputs;
+queue batching coalesces them to at most 4 MiB for export, flushing every second.
+
+Queue databases live under `/data/telemetry/collector-queue`; each bbolt file is
+capped at 32 MiB and compacts on startup/rebound. Filelog checkpoints are stored
+separately, with a 4 MiB limit per database. These are per-file limits, not an
+exact aggregate volume quota; compaction needs temporary space. Queued redacted
+data survives a Collector process restart. Full queues, disk exhaustion/failure,
+or an indefinitely unavailable backend can still lose telemetry. Overflow is
+nonblocking and failed-enqueue counters remain visible; the app does not wait
+for remote telemetry acceptance. Backpressure is not a reason to erase queues,
+replace the ingest key, or conclude that application authentication failed.
 Excluded health/status handlers suppress their dependency spans too.
 SDK export runs off the entry path; export failure cannot turn an
-application return into a failure. The Collector uses a memory limiter and a
-finite retry window. Graceful process exit flushes providers; the output tee
+application return into a failure. The Collector uses a memory limiter and finite
+storage budgets. Graceful process exit flushes providers; the output tee
 stops before the Collector. Existing app retry, timeout, cancellation, logging
 and trading policies remain authoritative.
 
@@ -160,6 +173,18 @@ per-run counts; compare instances and time windows correctly.
 The authenticated read-only `/api/telemetry` route reports SDK initialization,
 Collector health and raw current-process Collector counters. Receiver acceptance
 or exporter sent counts alone do not establish persistence or owner readback.
+
+The same route includes a cached `resources` snapshot for prolonged-uptime
+troubleshooting: current/peak cgroup memory, memory and process limits, OOM
+counters, cumulative CPU/throttling counters, per-process resident memory,
+thread/descriptor counts, and data-filesystem free space. Missing values remain
+null; `max` limits are explicitly unlimited. Cgroup counters describe the current
+namespace and do not establish the time or cause of a past login failure.
+Process RSS is not summed as container memory. Snapshots scan at most 64 processes
+and 1,024 descriptors each, report truncation, and never read arguments,
+environment variables or credential files. Collection runs in at most one
+background thread, is cached for 10 seconds and reports its age/staleness;
+normal dashboard status polling does not trigger it.
 
 Run the ordinary suite with `.[browser,robinhood,discord,telemetry,telemetry-test]`
 and `node --test ops/test-deploy-openwoof.mjs`. The new tests exercise unchanged

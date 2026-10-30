@@ -153,6 +153,22 @@ class DashboardTests(unittest.TestCase):
             payload = body.decode("utf-8")
         return response.status, headers, payload
 
+    def test_resource_snapshot_is_in_explicit_telemetry_diagnostics_only(self):
+        resources = {"available": True, "container": {"memory_current_bytes": 12345}}
+        with patch("relay.telemetry.status", return_value={"enabled": False}), patch.object(
+            self.app.resources, "snapshot", return_value=resources
+        ) as snapshot:
+            status, _, payload = self.request("/api/telemetry")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["resources"], resources)
+            self.assertEqual(snapshot.call_count, 1)
+            status, _, payload = self.request("/api/status")
+            self.assertEqual(status, 200)
+            self.assertNotIn("resources", payload)
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertEqual(self.request("/api/telemetry?path=secrets")[0], 400)
+            self.assertEqual(snapshot.call_count, 1)
+
     def test_healthz_reports_only_a_valid_baked_source_commit(self):
         with patch.dict("os.environ", {"QB_SOURCE_COMMIT": "A" * 40}):
             status, _, payload = self.request("/healthz?quarterback_probe=1729000000")

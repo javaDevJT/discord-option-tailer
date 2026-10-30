@@ -6,7 +6,7 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 
 ## Project index
 
-- [OpenWoof telemetry](docs/observability.md): original process logs, real dependency spans, typed metrics, private Collector, secure Mac/TrueNAS key custody and deployed verification boundaries.
+- [OpenWoof telemetry](docs/observability.md): original logs, dependency spans, persistent bounded Collector queues, authenticated resource diagnostics, key custody and deployed verification boundaries.
 - [Image security gate](docs/container.md#build-and-published-image-path): local archive scanning, dependency refresh, runner-owned storage protection, and verified publication.
 - [Active watch polling](docs/container.md#active-watch-polling): ten-minute market refresh windows, broker request budgets, and fresh deterministic-entry snapshot reuse.
 - [Deterministic position management](docs/jev-evaluation-design.md#deterministic-management-and-source-episodes): exact half-sales with breakeven protection, full closes, status-only updates, and persistent source attribution.
@@ -22,7 +22,7 @@ The [account monitoring guide](docs/container.md#account-balances-and-holdings) 
 - [Container setup and dashboard](docs/container.md): start the service and complete Discord, Codex, Robinhood, notification, and trading-mode setup in the frontend.
 - [TrueNAS deployment](docs/truenas.md): deploy the published image with persistent private storage.
 - [TrueNAS Compose file](compose.truenas.yaml): image-based deployment with no source build.
-- [Broker integration](docs/robinhood-integration.md): authorization, account inspection, schema compatibility and failure diagnostics, and execution checks.
+- [Broker integration](docs/robinhood-integration.md): authorization and saved-token expiry recovery, account inspection, schema compatibility, failure diagnostics and execution checks.
 - [Prepared-entry diagnostics](docs/robinhood-integration.md#prepared-entry-diagnostics): watch-cache fallback reasons and expiration lookup evidence.
 - [Exit intent and profit-taking](docs/container.md#exit-intent-and-profit-taking): distinguish status updates from authorized trims and preserve whole-contract rounding.
 - [Agent-directed stops](docs/container.md#agent-directed-stop-losses): compound trims, breakeven protection, cancellation and restart behavior.

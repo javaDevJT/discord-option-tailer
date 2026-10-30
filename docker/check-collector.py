@@ -37,10 +37,12 @@ def free_port(used):
 
 
 def rewrite(config, replacements):
-    for old, new, label in replacements:
-        if config.count(old) != 1:
+    for replacement in replacements:
+        old, new, label = replacement[:3]
+        expected = replacement[3] if len(replacement) == 4 else 1
+        if config.count(old) != expected:
             raise CheckFailure(f"production config no longer has one expected {label}")
-        config = config.replace(old, new, 1)
+        config = config.replace(old, new, expected)
     return config
 
 
@@ -52,8 +54,8 @@ def attr_strings(attributes):
     }
 
 
-def wait_for_health(process, port, opener):
-    deadline = time.monotonic() + 20
+def wait_for_health(process, port, opener, timeout=20):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise CheckFailure("Collector exited before its health endpoint became ready")
@@ -62,7 +64,7 @@ def wait_for_health(process, port, opener):
                 return
         except (OSError, URLError):
             time.sleep(0.1)
-    raise CheckFailure("Collector did not become ready within 20 seconds")
+    raise CheckFailure(f"Collector did not become ready within {timeout:g} seconds")
 
 
 def send_otlp(port, path, message, opener):
@@ -106,8 +108,10 @@ def main():
         "/v1/logs": ExportLogsServiceRequest,
     }
     received = {path: [] for path in PATHS}
+    attempts = []
     errors = []
     changed = threading.Condition()
+    blocked = threading.Event()
 
     def record_error(name):
         with changed:
@@ -129,6 +133,8 @@ def main():
                     body = gzip.decompress(body)
                 elif encoding:
                     raise ValueError
+                message = None
+                status = None
                 if self.path not in types:
                     self.send_response(404)
                     record_error("unexpected_export_path")
@@ -141,12 +147,18 @@ def main():
                 else:
                     message = types[self.path]()
                     message.ParseFromString(body)
-                    with changed:
-                        received[self.path].append(message)
-                        changed.notify_all()
-                    self.send_response(200)
+                    status = 429 if blocked.is_set() else 200
+                    self.send_response(status)
+                    if status == 429:
+                        self.send_header("Retry-After", "1")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+                if status in (200, 429):
+                    with changed:
+                        attempts.append((self.path, status, message))
+                        if status == 200:
+                            received[self.path].append(message)
+                        changed.notify_all()
             except Exception:
                 record_error("invalid_export_request")
                 self.send_error(400)
@@ -194,6 +206,10 @@ def main():
                 config_path.read_text(encoding="utf-8"),
                 [
                     ("/data/telemetry/collector-checkpoints", str(directory / "checkpoints"), "checkpoint path"),
+                    ("directory: /data/telemetry/collector-queue/compaction",
+                     f"directory: {directory / 'queue-compaction'}", "queue compaction path"),
+                    ("directory: /data/telemetry/collector-queue",
+                     f"directory: {directory / 'queue'}", "queue storage path"),
                     ("include: [/var/log/relay-telemetry/process-output.jsonl, /var/log/relay-telemetry/process-output.jsonl.1]",
                      f"include: [{process_file}, {process_file}.1]", "process filelog paths"),
                     ("/var/log/supervisor/relay-supervisor.log", str(supervisor_file), "supervisor filelog path"),
@@ -204,11 +220,30 @@ def main():
                         "endpoint: https://openwoof.javadevjt.tech",
                         f"endpoint: http://127.0.0.1:{sink.server_port}",
                         "provider exporter endpoint",
+                        3,
                     ),
                 ],
             )
             if "openwoof.javadevjt.tech" in config:
                 raise CheckFailure("fixture config retained the provider endpoint")
+            if "  extensions: [bearertokenauth/openwoof, file_storage, file_storage/queue, health_check]" not in config:
+                raise CheckFailure("persistent queue storage extension is not enabled")
+            if config.count("      storage: file_storage/queue") != 3:
+                raise CheckFailure("all signal exporters must use persistent queue storage")
+            for text, count in (
+                ("      queue_size: 16777216", 3),
+                ("      num_consumers: 1", 3),
+                ("      sizer: bytes", 6),
+                ("      block_on_overflow: false", 3),
+                ("      wait_for_result: false", 3),
+                ("      max_elapsed_time: 0s", 3),
+            ):
+                if config.count(text) != count:
+                    raise CheckFailure(f"signal queue config does not meet resilience requirement: {text.strip()}")
+            if any(f"exporters: [otlp_http/openwoof_{signal}]" not in config for signal in ("traces", "metrics", "logs")):
+                raise CheckFailure("each signal must use its isolated exporter queue")
+            if "/data/telemetry/collector-queue" in config:
+                raise CheckFailure("fixture config retained the production queue path")
             fixture_config = directory / "collector.yaml"
             fixture_config.write_text(config, encoding="utf-8")
             credential = directory / "fixture-ingest-key"
@@ -312,6 +347,142 @@ def main():
                     raise CheckFailure("loopback OTLP exporter rejected a request")
                 batches = {path: list(messages) for path, messages in received.items()}
 
+            # Exercise actual queue persistence with a synthetic upstream 429,
+            # abrupt Collector loss, and recovery from the same storage directory.
+            marker = "collector.check.restart-persisted"
+            blocked.set()
+            restart_trace = ParseDict(
+                {
+                    "resourceSpans": [
+                        {
+                            "scopeSpans": [
+                                {
+                                    "scope": {"name": "collector-check"},
+                                    "spans": [
+                                        {
+                                            "traceId": base64.b64encode(b"\x33" * 16).decode(),
+                                            "spanId": base64.b64encode(b"\x44" * 8).decode(),
+                                            "name": marker,
+                                            "kind": "SPAN_KIND_INTERNAL",
+                                            "startTimeUnixNano": str(now + 2),
+                                            "endTimeUnixNano": str(now + 3),
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                },
+                ExportTraceServiceRequest(),
+            )
+            restart_metric = ParseDict(
+                {
+                    "resourceMetrics": [
+                        {
+                            "scopeMetrics": [
+                                {
+                                    "scope": {"name": "collector-check"},
+                                    "metrics": [
+                                        {
+                                            "name": marker,
+                                            "unit": "1",
+                                            "gauge": {"dataPoints": [{"timeUnixNano": str(now + 2), "asDouble": 1.0}]},
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                },
+                ExportMetricsServiceRequest(),
+            )
+            send_otlp(receiver, "/v1/traces", restart_trace, opener)
+            send_otlp(receiver, "/v1/metrics", restart_metric, opener)
+            process_file.write_text(
+                process_file.read_text(encoding="utf-8")
+                + json.dumps(
+                    {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{nanos:09d}Z",
+                        "severity": "INFO",
+                        "service_name": "collector-check-process",
+                        "service_version": "fixture-revision",
+                        "service_instance": "fixture-process-1",
+                        "body": marker + " Bearer fixture-private-restart-token",
+                        "attributes": {"fixture.source": "process-jsonl"},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def has_marker(path, message):
+                if path == "/v1/traces":
+                    return any(
+                        span.name == marker
+                        for resource in message.resource_spans
+                        for scope in resource.scope_spans
+                        for span in scope.spans
+                    )
+                if path == "/v1/metrics":
+                    return any(
+                        metric.name == marker
+                        for resource in message.resource_metrics
+                        for scope in resource.scope_metrics
+                        for metric in scope.metrics
+                    )
+                return any(
+                    marker in record.body.string_value
+                    for resource in message.resource_logs
+                    for scope in resource.scope_logs
+                    for record in scope.log_records
+                )
+
+            deadline = time.monotonic() + 20
+            with changed:
+                while not all(
+                    any(path == expected and status == 429 and has_marker(path, message)
+                        for path, status, message in attempts)
+                    for expected in PATHS
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CheckFailure("synthetic marker did not receive 429 on all three signal queues")
+                    changed.wait(min(remaining, 0.25))
+                if errors:
+                    raise CheckFailure("loopback 429 fixture rejected a synthetic request")
+
+            # Allow the 429 response to finish before killing the collector so the
+            # failed request remains pending in the persistent queue.
+            time.sleep(0.1)
+            process.kill()
+            process.wait(timeout=3)
+            blocked.clear()
+            process = subprocess.Popen(
+                [str(executable.resolve()), "--config=" + str(fixture_config)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=directory,
+                env=env,
+                close_fds=True,
+            )
+            wait_for_health(process, health, opener)
+
+            deadline = time.monotonic() + 20
+            with changed:
+                while not all(
+                    any(has_marker(path, message) for message in received[path])
+                    for path in PATHS
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CheckFailure("queued synthetic data did not recover after Collector restart")
+                    changed.wait(min(remaining, 0.25))
+                if errors:
+                    raise CheckFailure("loopback recovery fixture rejected a synthetic request")
+                batches = {path: list(messages) for path, messages in received.items()}
+
             spans = [s for m in batches["/v1/traces"] for r in m.resource_spans for q in r.scope_spans for s in q.spans]
             metrics_out = [x for m in batches["/v1/metrics"] for r in m.resource_metrics for q in r.scope_metrics for x in q.metrics]
             records = [
@@ -324,6 +495,8 @@ def main():
             span = next((s for s in spans if s.name == "collector.check.synthetic"), None)
             if span is None or not any(x.name == "collector.check.synthetic" for x in metrics_out):
                 raise CheckFailure("synthetic span or metric did not reach the exporter")
+            if not any(s.name == marker for s in spans) or not any(m.name == marker for m in metrics_out):
+                raise CheckFailure("a queued trace or metric was not recovered after Collector restart")
             attrs = attr_strings(span.attributes)
             if attrs.get("fixture.auth") != "Bearer [REDACTED]" or "http.request.header.authorization" in attrs:
                 raise CheckFailure("source privacy transform did not redact the synthetic span attributes")
@@ -342,8 +515,10 @@ def main():
             if not process_records or not supervisor_records:
                 raise CheckFailure("process JSONL and supervisor filelog records were not both exported")
             log_wire = b"".join(m.SerializeToString() for m in batches["/v1/logs"])
-            if any(secret in log_wire for secret in (b"fixture-private-process-token", b"fixture-private-supervisor-token")):
+            if any(secret in log_wire for secret in (b"fixture-private-process-token", b"fixture-private-supervisor-token", b"fixture-private-restart-token")):
                 raise CheckFailure("synthetic log credential reached the exporter")
+            if not any(marker in record.body.string_value for record in process_records):
+                raise CheckFailure("queued log was not recovered after Collector restart")
             for record in process_records + supervisor_records:
                 if "Bearer [REDACTED]" not in record.body.string_value:
                     raise CheckFailure("source privacy transform did not redact a synthetic log")
@@ -351,6 +526,7 @@ def main():
             print("PASS: synthetic span and metric traversed the OTLP receiver and pipelines")
             print("PASS: process JSONL and supervisor filelog records reached the fake OTLP exporter")
             print("PASS: source privacy redaction and fixture-only exporter authorization")
+            print("PASS: synthetic 429 then abrupt restart recovered queued traces, metrics, and logs")
     finally:
         if process is not None and process.poll() is None:
             process.terminate()

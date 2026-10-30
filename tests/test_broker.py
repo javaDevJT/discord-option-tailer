@@ -296,7 +296,7 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("mcp"), "Optional Robinhood SDK is not installed")
     async def test_remote_redirect_uses_saved_credentials_and_pkce(self):
-        from mcp.client.auth import OAuthClientProvider
+        from relay.broker import _oauth_client_provider
         from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
         remote = "http://192.168.1.20:8787/callback"
         with tempfile.TemporaryDirectory() as directory:
@@ -309,10 +309,10 @@ class BrokerChecks(unittest.IsolatedAsyncioTestCase):
             original = path.read_bytes()
             providers = []
             def capture_provider(**kwargs):
-                providers.append(OAuthClientProvider(**kwargs))
+                providers.append(_oauth_client_provider(**kwargs))
                 return providers[-1]
             with patch.dict(os.environ, {"RELAY_ROBINHOOD_REDIRECT_URI": remote}), \
-                    patch("mcp.client.auth.OAuthClientProvider", side_effect=capture_provider), \
+                    patch("relay.broker._oauth_client_provider", side_effect=capture_provider), \
                     patch("httpx.AsyncClient", side_effect=RuntimeError("offline transport stop")):
                 broker = RobinhoodMCP({"token_store": str(path)})
                 with self.assertRaisesRegex(RuntimeError, "offline transport stop"):
