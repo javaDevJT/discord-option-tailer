@@ -12,11 +12,11 @@ RUN --mount=type=cache,target=/go/pkg/mod,id=relay-collector-modules \
     && go mod tidy \
     && CGO_ENABLED=0 go build -p=4 -buildvcs=false -trimpath -ldflags='-s -w' -o /otelcol-contrib .
 
-FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS codex-runtime
+FROM node:24.22.1-trixie-slim@sha256:89c5244bc22a9bc3287d89ebc7e49b9cb5bb84cd40e6175ac3421d5a9f68b95a AS codex-runtime
 ARG CODEX_VERSION=latest
 RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}"
 
-FROM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS novnc-assets
+FROM node:24.22.1-trixie-slim@sha256:89c5244bc22a9bc3287d89ebc7e49b9cb5bb84cd40e6175ac3421d5a9f68b95a AS novnc-assets
 ARG NOVNC_VERSION=1:1.6.0-2
 WORKDIR /tmp
 # Only the static client is served by nginx; Python websockify handles sockets.
@@ -50,6 +50,7 @@ WORKDIR /app
 
 # Keep filesystem steps few: the isolated builder copies snapshots slowly.
 # Startup uses supervisord; discard the unused Pebble server from the base.
+# Playwright shares Codex's patched Node instead of keeping a vulnerable copy.
 RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,readonly \
     --mount=type=cache,target=/root/.cache/pip \
     apt-get update \
@@ -91,6 +92,7 @@ RUN --mount=type=bind,source=pyproject.toml,target=/tmp/relay-project.toml,reado
     && python3 -c 'import tomllib; p=tomllib.load(open("/tmp/relay-project.toml", "rb"))["project"]; print("\n".join(p.get("dependencies", []) + p["optional-dependencies"]["browser"] + p["optional-dependencies"]["robinhood"] + p["optional-dependencies"]["discord"] + p["optional-dependencies"]["telemetry"]))' > /tmp/relay-requirements.txt \
     && printf 'playwright==%s\n' "${PLAYWRIGHT_VERSION}" > /tmp/relay-constraints.txt \
     && /opt/venv/bin/pip install --timeout 120 --constraint /tmp/relay-constraints.txt -r /tmp/relay-requirements.txt \
+    && /opt/venv/bin/python -c 'from pathlib import Path; import playwright; p = Path(playwright.__file__).parent / "driver" / "node"; assert p.is_file(); p.unlink(); p.symlink_to("/usr/local/bin/node")' \
     && rm -f /tmp/relay-constraints.txt /tmp/relay-requirements.txt \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/bin/pebble \
@@ -118,6 +120,7 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
 
 ARG QB_SOURCE_COMMIT=unknown
 RUN --network=none /opt/venv/bin/python /app/docker/check-codex-cli.py
+RUN --network=none /opt/venv/bin/python /app/docker/check-browser-runtime.py
 RUN --network=none RELAY_OTEL_ENABLED=0 /opt/venv/bin/python /app/docker/check-collector.py
 ENV QB_SOURCE_COMMIT=${QB_SOURCE_COMMIT} \
     RELAY_SOURCE_REVISION=${QB_SOURCE_COMMIT} \

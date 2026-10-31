@@ -670,6 +670,11 @@ class Janitor:
                 kept += 1
                 self.log(f"keep artifact_id={artifact_id} reason={reason}")
                 continue
+            if (reason == "download_failed" and isinstance(name, str) and
+                    name.startswith("security-high-critical-")):
+                failures += 1
+                self.log(f"error artifact_id={artifact_id} reason=download_failed")
+                continue
             try:
                 self.api.delete_artifact(self.repository, artifact_id)
                 deleted += 1
