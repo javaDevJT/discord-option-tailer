@@ -9,7 +9,7 @@ import time
 import unittest
 from urllib.parse import parse_qs
 
-from relay.broker import BrokerError, RobinhoodMCP, OAUTH_TOKEN_EXPIRY_FIELD, _OAuthStorage, _oauth_client_provider, is_auth_required
+from relay.broker import BrokerError, RobinhoodMCP, OAUTH_TOKEN_EXPIRY_FIELD, ROBINHOOD_TOKEN_ENDPOINT, _OAuthStorage, _oauth_client_provider, is_auth_required
 
 
 @unittest.skipUnless(importlib.util.find_spec("mcp") and importlib.util.find_spec("httpx"),
@@ -41,7 +41,9 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
 
             async def handle(request):
                 seen.append((request.url.path, request.headers.get("Authorization")))
-                if request.url.path == "/token":
+                if request.url.path == "/oauth2/token/":
+                    self.assertEqual(str(request.url), ROBINHOOD_TOKEN_ENDPOINT)
+                    self.assertEqual(request.headers["Host"], "api.robinhood.com")
                     form = parse_qs(request.content.decode("ascii"))
                     self.assertEqual(form["grant_type"], ["refresh_token"])
                     self.assertEqual(form["refresh_token"], ["synthetic-refresh"])
@@ -74,7 +76,7 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(second_response.status_code, 200)
             self.assertEqual(seen, [
-                ("/token", None),
+                ("/oauth2/token/", None),
                 ("/mcp/trading", "Bearer synthetic-new-access"),
                 ("/mcp/trading", "Bearer synthetic-new-access"),
             ])
@@ -144,7 +146,8 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
 
             async def handle(request):
                 seen.append((request.url.path, request.headers.get("Authorization")))
-                if request.url.path == "/token":
+                if request.url.path == "/oauth2/token/":
+                    self.assertEqual(str(request.url), ROBINHOOD_TOKEN_ENDPOINT)
                     return httpx.Response(400, json={"error": "invalid_grant"})
                 return httpx.Response(500, text="synthetic upstream unavailable")
 
@@ -167,10 +170,68 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(response.status_code, 500)
             self.assertEqual(seen, [
-                ("/token", None),
+                ("/oauth2/token/", None),
                 ("/mcp/trading", None),
             ])
             self.assertNotIn("synthetic-revoked-access", repr(seen))
+
+    async def test_refresh_preserves_discovered_token_endpoint_and_sdk_form(self):
+        import httpx
+        from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata, OAuthToken
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = _OAuthStorage(Path(directory) / "oauth.json")
+            await storage.set_client_info(OAuthClientInformationFull(
+                client_id="synthetic-client", redirect_uris=["http://127.0.0.1:8766/callback"],
+                token_endpoint_auth_method="none"))
+            await storage.set_tokens(OAuthToken(access_token="synthetic-expired-access",
+                token_type="Bearer", refresh_token="synthetic-refresh", expires_in=0))
+            provider = _oauth_client_provider(
+                server_url="https://agent.robinhood.com/mcp/trading",
+                client_metadata=OAuthClientMetadata(redirect_uris=["http://127.0.0.1:8766/callback"]),
+                storage=storage, redirect_handler=None, callback_handler=None)
+            await provider._initialize()
+            advertised = "https://api.robinhood.com/oauth2/versioned-token/"
+            provider.context.oauth_metadata = OAuthMetadata(
+                issuer="https://agent.robinhood.com/mcp/trading", token_endpoint=advertised,
+                authorization_endpoint="https://robinhood.com/oauth",
+                response_types_supported=["code"])
+            seen = []
+
+            async def handle(request):
+                seen.append(str(request.url))
+                if str(request.url) == advertised:
+                    self.assertEqual(request.headers["Host"], "api.robinhood.com")
+                    self.assertEqual(parse_qs(request.content.decode()), {
+                        "grant_type": ["refresh_token"], "refresh_token": ["synthetic-refresh"],
+                        "client_id": ["synthetic-client"]})
+                    return httpx.Response(200, json={"access_token": "synthetic-new-access",
+                        "token_type": "Bearer", "expires_in": 3600, "refresh_token": "synthetic-new-refresh"})
+                self.assertEqual(request.headers.get("Authorization"), "Bearer synthetic-new-access")
+                return httpx.Response(200, text="ok")
+
+            async with httpx.AsyncClient(auth=provider, transport=httpx.MockTransport(handle)) as client:
+                response = await client.get("https://agent.robinhood.com/mcp/trading")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(seen, [advertised, "https://agent.robinhood.com/mcp/trading"])
+
+    async def test_robinhood_refresh_fallback_is_scoped_to_robinhood_resource(self):
+        from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = _OAuthStorage(Path(directory) / "oauth.json")
+            await storage.set_client_info(OAuthClientInformationFull(
+                client_id="synthetic-client", redirect_uris=["http://127.0.0.1:8766/callback"],
+                token_endpoint_auth_method="none"))
+            await storage.set_tokens(OAuthToken(access_token="synthetic-expired-access",
+                token_type="Bearer", refresh_token="synthetic-refresh", expires_in=0))
+            provider = _oauth_client_provider(server_url="https://example.test/mcp",
+                client_metadata=OAuthClientMetadata(redirect_uris=["http://127.0.0.1:8766/callback"]),
+                storage=storage, redirect_handler=None, callback_handler=None)
+            await provider._initialize()
+            request = await provider._refresh_token()
+            self.assertEqual(str(request.url), "https://example.test/token")
+            self.assertEqual(request.headers["Host"], "example.test")
 
     async def test_unauthorized_after_rejected_refresh_requires_user_authorization(self):
         import httpx
@@ -189,7 +250,8 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
 
             async def handle(request):
                 seen.append((request.url.path, request.headers.get("Authorization")))
-                if request.url.path == "/token":
+                if request.url.path == "/oauth2/token/":
+                    self.assertEqual(str(request.url), ROBINHOOD_TOKEN_ENDPOINT)
                     return httpx.Response(400, json={"error": "invalid_grant"})
                 if request.url.path.startswith("/.well-known/oauth-protected-resource"):
                     return httpx.Response(200, json={"resource": "https://agent.robinhood.com/mcp/trading",
@@ -197,7 +259,7 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
                 if request.url.path.startswith("/.well-known/oauth-authorization-server"):
                     return httpx.Response(200, json={"issuer": "https://agent.robinhood.com",
                         "authorization_endpoint": "https://robinhood.com/oauth/authorize",
-                        "token_endpoint": "https://agent.robinhood.com/token",
+                        "token_endpoint": ROBINHOOD_TOKEN_ENDPOINT,
                         "response_types_supported": ["code"], "code_challenge_methods_supported": ["S256"]})
                 return httpx.Response(401, headers={"WWW-Authenticate": "Bearer"})
 
@@ -215,7 +277,7 @@ class RobinhoodOAuthExpiryChecks(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(BrokerError) as failure:
                         await client.get("https://agent.robinhood.com/mcp/trading")
                     self.assertTrue(is_auth_required(failure.exception))
-            self.assertEqual(sum(path == "/token" for path, _ in seen), 2)
+            self.assertEqual(sum(path == "/oauth2/token/" for path, _ in seen), 2)
             self.assertTrue(all(authorization is None for _, authorization in seen))
             self.assertEqual(path.read_bytes(), original)
 

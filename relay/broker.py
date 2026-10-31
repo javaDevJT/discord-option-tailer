@@ -34,6 +34,7 @@ from .schema_contracts import cursor_mode, schema_problem
 
 
 ROBINHOOD_ENDPOINT = "https://agent.robinhood.com/mcp/trading"
+ROBINHOOD_TOKEN_ENDPOINT = "https://api.robinhood.com/oauth2/token/"
 READ_TOOLS = frozenset({
     "get_accounts", "get_portfolio", "get_realized_pnl", "get_pnl_trade_history",
     "search", "get_equity_quotes", "get_option_chains", "get_option_instruments", "get_option_quotes",
@@ -817,6 +818,24 @@ def _oauth_client_provider(**kwargs):
                 # The SDK treats a falsey expiry (including 0.0) as no expiry.
                 expires_at = 1.0
             self.context.token_expiry_time = expires_at
+
+        async def _refresh_token(self):
+            request = await super()._refresh_token()
+            if self.context.oauth_metadata is None and self.context.server_url == ROBINHOOD_ENDPOINT:
+                # MCP does not restore authorization metadata across restarts.
+                # Its generic /token fallback is not Robinhood's token endpoint.
+                # Keep the SDK-generated form and authentication, and rebuild
+                # Host for the fixed, official Robinhood authorization origin.
+                import httpx
+                request = httpx.Request(
+                    request.method, ROBINHOOD_TOKEN_ENDPOINT,
+                    headers=[(key, value) for key, value in request.headers.multi_items()
+                             if key.lower() != "host"],
+                    content=request.content, extensions=request.extensions,
+                )
+                logging.getLogger(__name__).info(
+                    "Robinhood OAuth refresh: using official token endpoint after metadata-free restart")
+            return request
 
     return _PersistedExpiryOAuthClientProvider(**kwargs)
 

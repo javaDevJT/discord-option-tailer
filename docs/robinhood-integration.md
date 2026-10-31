@@ -10,6 +10,8 @@ OAuth uses PKCE. Registration and tokens are stored atomically with owner-only p
 
 The relay records the access-token expiry when tokens are issued and restores that deadline when opening a new MCP session. Older token files without a trustworthy deadline use their refresh token before sending the saved access token. A refreshed session keeps the SDK's updated deadline for later requests. Invalid or revoked refresh credentials still require user authorization; no trade is replayed by this repair. MCP is pinned to 1.30.0 because this compatibility adapter corrects that release's private initialization behavior. Upgrades must pass the synthetic OAuth refresh/restart regressions before changing the pin.
 
+The SDK also loses discovered authorization metadata on restart. For the fixed Robinhood resource only, metadata-free refresh uses Robinhood's published `https://api.robinhood.com/oauth2/token/` endpoint instead of the SDK's generic `/token` fallback. The SDK still builds the refresh form and client authentication; fresh discovery takes precedence. Synthetic transport checks cover the exact destination and Host header, refresh rejection, credential preservation and restarted sessions.
+
 Account selection requires authenticated eligibility fields and an unambiguous eligible account. A display name alone does not establish eligibility. Keep the account binding and its mode-specific ledger together when migrating an existing installation.
 
 Account inspection uses the dashboard's display reads, so yesterday's held-option quotes do not make authorization appear failed before market open. Trading snapshots and order execution retain their quote freshness checks.
