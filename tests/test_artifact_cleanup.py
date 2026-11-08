@@ -114,7 +114,12 @@ class ArtifactCleanupTests(unittest.TestCase):
         )
         errors = io.StringIO()
 
-        with patch.object(JANITOR, "GitHubApi", return_value=api), redirect_stderr(errors):
+        with (
+            patch.object(JANITOR, "GitHubApi", return_value=api),
+            patch.object(JANITOR, "datetime", wraps=datetime) as clock,
+            redirect_stderr(errors),
+        ):
+            clock.now.return_value = self.now
             exit_code = JANITOR.main(
                 ["--run-id", str(self.run_id)],
                 environ={"GITHUB_REPOSITORY": self.repository, "GH_TOKEN": "synthetic-token"},
