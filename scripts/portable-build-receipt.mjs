@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 const API_VERSION = '2022-11-28';
 const FETCH_TIMEOUT_MS = 30_000;
 const RECEIPT_UPLOAD_MAX_ATTEMPTS = 3;
-const RECEIPT_UPLOAD_MAX_WAIT_MS = 15 * 60_000;
+const RECEIPT_UPLOAD_MAX_WAIT_MS = 65 * 60_000;
 const SUPPORTED_SOURCE_EVENTS = new Set(['push', 'schedule', 'workflow_dispatch', 'workflow_run']);
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_ZIP_BYTES = 32 * 1024 * 1024;
@@ -632,9 +632,26 @@ async function postReceipt(endpoint, token, receipt, fetchImpl, imageRepository,
         signal: AbortSignal.timeout(Math.min(FETCH_TIMEOUT_MS, Math.ceil(remainingDeadlineMs))),
         redirect: 'manual',
       });
-    } catch {
-      if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
-      fail(`Quarterback receipt submission failed for ${imageRepository}.`);
+    } catch (cause) {
+      if (budget.now() >= budget.deadline) {
+        throw new ReceiptEvidenceError(`Quarterback receipt submission retry deadline expired after a transport failure for ${imageRepository}; check the receipt service route and runner connectivity.`, { cause });
+      }
+      if (attempt >= RECEIPT_UPLOAD_MAX_ATTEMPTS) {
+        throw new ReceiptEvidenceError(`Quarterback receipt submission transport failed after ${attempt} attempts for ${imageRepository}; check the receipt service route and runner connectivity.`, { cause });
+      }
+      const retryDelay = attempt * 1_000;
+      if (retryDelay > RECEIPT_UPLOAD_MAX_WAIT_MS - budget.totalWait) {
+        throw new ReceiptEvidenceError(`Quarterback receipt submission transport retry delay of ${retryDelayDescription(retryDelay)} would exceed the 65 minute cumulative retry wait cap for ${imageRepository}; check the receipt service route before replaying.`, { cause });
+      }
+      if (retryDelay > budget.deadline - budget.now()) {
+        throw new ReceiptEvidenceError(`Quarterback receipt submission transport retry delay of ${retryDelayDescription(retryDelay)} exceeds the retry deadline for ${imageRepository}; check the receipt service route before replaying.`, { cause });
+      }
+      budget.totalWait += retryDelay;
+      await budget.sleep(retryDelay);
+      if (budget.now() >= budget.deadline) {
+        throw new ReceiptEvidenceError(`Quarterback receipt submission retry deadline expired before the next transport attempt for ${imageRepository}; check the receipt service route before replaying.`, { cause });
+      }
+      continue;
     }
     if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
     const responseBytes = await readLimited(response, MAX_JSON_BYTES, 'Quarterback receipt submission');
@@ -648,7 +665,7 @@ async function postReceipt(endpoint, token, receipt, fetchImpl, imageRepository,
       fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} was received, but the retry attempt limit of ${RECEIPT_UPLOAD_MAX_ATTEMPTS} was reached.`);
     }
     if (retryDelay > RECEIPT_UPLOAD_MAX_WAIT_MS - budget.totalWait) {
-      fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} would exceed the 15 minute cumulative retry wait cap.`);
+      fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} would exceed the 65 minute cumulative retry wait cap.`);
     }
     if (retryDelay > budget.deadline - budget.now()) {
       fail(`Quarterback receipt submission returned HTTP 503 for ${imageRepository}; Retry-After ${retryDelayDescription(retryDelay)} exceeds the retry deadline.`);
