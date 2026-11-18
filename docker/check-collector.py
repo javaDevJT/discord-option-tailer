@@ -236,7 +236,7 @@ def main():
                 ("      sizer: bytes", 6),
                 ("      block_on_overflow: false", 3),
                 ("      wait_for_result: false", 3),
-                ("      max_elapsed_time: 0s", 3),
+                ("      max_elapsed_time: 10m", 3),
             ):
                 if config.count(text) != count:
                     raise CheckFailure(f"signal queue config does not meet resilience requirement: {text.strip()}")

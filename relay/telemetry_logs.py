@@ -15,9 +15,11 @@ from pathlib import Path
 import re
 import signal
 import sys
+import tempfile
 import time
 
 ROOT = Path("/var/log/relay-telemetry")
+COLLECTOR_EXPORT_STATUS = Path("/run/relay-collector-export.json")
 MAX_FRAME = 65536
 MAX_PENDING = 2 * 1024 * 1024
 MAX_FILE = 8 * 1024 * 1024
@@ -33,6 +35,7 @@ PRIVATE_QUERY = re.compile(r'(?i)([?&](?:token|access_token|refresh_token|key|ap
 ASSIGNMENT = re.compile(r'(?i)\b(password|access_token|refresh_token|api_key|authorization)\s*=\s*[^\s,;]+')
 LEVEL = re.compile(r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL):([\w.]+):")
 ACCESS = re.compile(r'"(GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS) ([^ ?"]+)(?:\?[^ "]*)? HTTP/[^" ]+" (\d{3}) ')
+EXPORT_FAILURE = re.compile(r"\bHTTP status code ([45]\d\d)\b", re.IGNORECASE)
 
 
 def redact(text):
@@ -217,6 +220,47 @@ class RingWriter:
                 print("Telemetry output tee could not append; original console output is unaffected.", file=sys.stderr, flush=True)
 
 
+class CollectorFailures:
+    """Keep only the last bounded failure classification per exporter locally."""
+
+    def __init__(self, path=COLLECTOR_EXPORT_STATUS):
+        self.path = path
+        self.failures = {}
+        self.pending = ""
+
+    def feed(self, text):
+        lines = (self.pending + text).split("\n")
+        self.pending = lines.pop()[-MAX_FRAME:]
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            message = event.get("msg") if isinstance(event, dict) else None
+            if not isinstance(message, str) or message.split(".", 1)[0] != "Exporting failed":
+                continue
+            component = event.get("otelcol.component.id", event.get("name", ""))
+            signal = component.removeprefix("otlp_http/openwoof_") if isinstance(component, str) else ""
+            if signal not in {"traces", "metrics", "logs"}:
+                continue
+            error = event.get("error", "")
+            if not isinstance(error, str):
+                continue
+            status = EXPORT_FAILURE.search(error)
+            code = "http_error" if status else "timeout" if "deadline exceeded" in error.lower() else "export_failed"
+            self.failures[signal] = {"code": code, "http_status": int(status[1]) if status else None,
+                                     "observed_at": datetime.now(timezone.utc).isoformat()}
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as stream:
+                target = Path(stream.name)
+                try:
+                    os.fchmod(stream.fileno(), 0o644)
+                    json.dump(self.failures, stream)
+                    stream.flush()
+                    target.replace(self.path)
+                finally:
+                    target.unlink(missing_ok=True)
+
+
 def headers(line):
     if isinstance(line, bytes):
         line = line.decode("ascii")
@@ -226,6 +270,7 @@ def headers(line):
 def main(directory=ROOT):
     from .telemetry import enabled
     framer = Framer(RingWriter(directory) if enabled() else lambda _record: None)
+    collector_failures = CollectorFailures()
     def stop(_signum, _frame):
         framer.flush()
         # The filelog receiver polls every 200 ms. It stops after this listener.
@@ -251,7 +296,9 @@ def main(directory=ROOT):
             else:
                 metadata, chunk = payload.split("\n", 1)
                 fields = headers(metadata)
-                if fields["processname"] in SERVICES:
+                if fields["processname"] == "telemetry-collector":
+                    collector_failures.feed(chunk)
+                elif fields["processname"] in SERVICES:
                     # Supervisor represents a chunk ending mid-codepoint as a
                     # bytes literal. Recover those actual bytes for incremental
                     # UTF-8 decoding instead of forwarding its escape wrapper.

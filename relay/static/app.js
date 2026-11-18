@@ -2558,6 +2558,8 @@ async function loadAccount() {
       test.disabled = saving || testing;
       test.textContent = testing ? "Testing…" : "Test JEV connection";
     }
+    const testCodex = setupById("test-codex-evaluation");
+    if (testCodex) testCodex.disabled = saving || testing;
   };
 
   const setupRenderRisk = (risk) => {
@@ -2999,17 +3001,20 @@ async function loadAccount() {
     }
   };
 
-  const setupTestEvaluation = async () => {
+  const setupTestEvaluation = async (provider) => {
+    const codex = provider === "codex";
+    const label = codex ? "Codex" : "JEV";
+    const feedbackId = codex ? "evaluation-feedback" : "evaluation-jev-feedback";
     if (setupState.evaluationTestInFlight || setupState.evaluationInFlight) return;
     if (!setupState.csrfToken) {
-      setupSetFeedback("evaluation-jev-feedback", "Wait for setup status, then test again.", "error");
+      setupSetFeedback(feedbackId, "Wait for setup status, then test again.", "error");
       return;
     }
     setupState.evaluationTestInFlight = true;
-    setupSetFeedback("evaluation-jev-feedback", "Running synthetic JEV classification…");
+    setupSetFeedback(feedbackId, `Running synthetic ${label} evaluation…`);
     setupRenderEvaluation(setupState.status?.evaluation || {});
     try {
-      const payload = await setupJson("/api/setup/evaluation/test", { method: "POST", body: {} });
+      const payload = await setupJson("/api/setup/evaluation/test", { method: "POST", body: codex ? { provider } : {} });
       const returnedStatus = payload?.setup && typeof payload.setup === "object"
         ? payload.setup
         : payload?.evaluation && typeof payload.evaluation === "object" && payload?.configured !== undefined
@@ -3023,9 +3028,10 @@ async function loadAccount() {
       const suffix = Number.isFinite(latency) && latency >= 0 ? ` · ${Math.round(latency)} ms` : "";
       const kind = ["ok", "ready", "configured", "connected", "completed", "success", "passed"].includes(setupStateName(stateName)) ? "success" : "";
       const displayState = setupText(stateName, "completed").replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-      setupSetFeedback("evaluation-jev-feedback", `JEV test ${displayState}${suffix}: ${detail}`, kind);
+      const model = codex && result.model ? ` · ${result.model === "codex_default" ? "CLI default model" : result.model}` : "";
+      setupSetFeedback(feedbackId, `${label} test ${displayState}${suffix}${model}: ${detail}`, kind);
     } catch (error) {
-      setupSetFeedback("evaluation-jev-feedback", `JEV test failed: ${setupText(error?.message, "request failed")}`, "error");
+      setupSetFeedback(feedbackId, `${label} test failed: ${setupText(error?.message, "request failed")}`, "error");
     } finally {
       setupState.evaluationTestInFlight = false;
       setupRenderEvaluation(setupState.status?.evaluation || {});
@@ -3356,7 +3362,8 @@ async function loadAccount() {
       event.preventDefault();
       setupSaveEvaluation();
     });
-    setupById("test-evaluation")?.addEventListener("click", setupTestEvaluation);
+    setupById("test-evaluation")?.addEventListener("click", () => setupTestEvaluation("jev"));
+    setupById("test-codex-evaluation")?.addEventListener("click", () => setupTestEvaluation("codex"));
     setupById("pause-relay")?.addEventListener("click", async () => {
       const paused = Boolean(setupState.status?.paused);
       const status = await setupPost("/api/setup/pause", { paused: !paused }, "control-feedback");

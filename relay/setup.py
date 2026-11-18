@@ -43,7 +43,7 @@ from .discord_session import (
     read_token,
     write_token,
 )
-from .interpreter import CodexInterpreter
+from .interpreter import CodexInterpreter, InterpretationError, safe_interpretation_reason
 from .status import failure_detail, is_auth_required_state
 
 
@@ -572,8 +572,10 @@ class SetupManager:
 
     def test_evaluation(self, payload: dict | None = None) -> dict:
         """Explicitly run the provider's synthetic, non-trading probe."""
+        if payload == {"provider": "codex"}:
+            return self._test_codex_evaluation()
         if payload not in (None, {}):
-            raise ValueError("Synthetic evaluation test does not accept parameters")
+            raise ValueError("Choose a supported synthetic evaluation test")
         started = time.monotonic()
         try:
             from .evaluation import synthetic_test
@@ -607,6 +609,24 @@ class SetupManager:
                 "latency_ms": round(max(0.0, time.monotonic() - started) * 1000, 3),
                 "detail": "Synthetic classification failed.",
             }
+
+    def _test_codex_evaluation(self) -> dict:
+        started = time.monotonic()
+        result = {"provider": "codex", "synthetic": True}
+        with self._lock:
+            self._ensure_open_locked()
+            llm = copy.deepcopy(self._read_raw_locked().get("llm", {}))
+        try:
+            llm["timeout_seconds"] = 20
+            interpreter = CodexInterpreter({"llm": llm}, source_home=self._codex_home)
+            response = asyncio.run(interpreter.test_connection())
+            model = response["evaluation_timing"]["model"]
+            result.update(state="connected", model=model, detail="Codex answered the synthetic check.")
+        except InterpretationError as error:
+            state = "auth_required" if error.code in {"auth_required", "credentials_missing"} else "unavailable"
+            result.update(state=state, code=error.code, detail=safe_interpretation_reason(error))
+        result["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+        return result
 
     def set_mode(self, payload: dict) -> dict:
         """Select a mode and its own ledger; activation remains a separate Resume."""

@@ -91,8 +91,11 @@ replacement, literal-message allowlist or generic operation rename is used.
 Queues, batch sizes, receiver body size, span attributes and file rotation are
 bounded. Traces, metrics and logs each have an independent persistent queue with
 a 16 MiB serialized-payload budget and one export consumer. Requests retain their
-10-second timeout; retries use exponential backoff/jitter up to 30 seconds and
-continue without an age cutoff while buffering remains available. The Collector
+10-second timeout. Retries use exponential backoff and jitter up to 30 seconds.
+A batch that still fails after 10 minutes is dropped so it cannot hold the
+consumer indefinitely. The authenticated telemetry endpoint reports the last
+export failure per signal with its observed time, class and HTTP status when
+available. Collector diagnostics stay local and do not re-enter export. The Collector
 retains its 256 MiB memory limit. Small pipeline batches bound persisted inputs;
 queue batching coalesces them to at most 4 MiB for export, flushing every second.
 

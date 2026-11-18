@@ -33,7 +33,7 @@ class TelemetryResilienceTests(unittest.TestCase):
                 self.assertIn("storage: file_storage/queue", block)
                 self.assertIn("block_on_overflow: false", block)
                 self.assertIn("wait_for_result: false", block)
-                self.assertIn("max_elapsed_time: 0s", block)
+                self.assertIn("max_elapsed_time: 10m", block)
                 self.assertIn("max_interval: 30s", block)
                 self.assertIn("max_size: 4194304", block)
                 self.assertIn("min_size: 262144", block)

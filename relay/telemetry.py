@@ -302,6 +302,7 @@ def shutdown():
 
 def status():
     """Authenticated dashboard diagnostics; fixed loopback URLs, never key contents."""
+    import json
     import re
     import urllib.request
     result = {"enabled": enabled(), "sdk_initialized": _runtime is not None,
@@ -309,6 +310,14 @@ def status():
         "collector_healthy": False, "collector_metrics": {}}
     if not result["enabled"]:
         return result
+    from .telemetry_logs import COLLECTOR_EXPORT_STATUS
+    try:
+        with COLLECTOR_EXPORT_STATUS.open("rb") as stream:
+            failure = json.loads(stream.read(4096))
+        if isinstance(failure, dict):
+            result["collector_last_export_failure"] = failure
+    except (OSError, ValueError):
+        pass
     try:
         from opentelemetry.instrumentation.utils import suppress_http_instrumentation
         # The diagnostics reader must not manufacture telemetry about reading

@@ -1866,6 +1866,45 @@ class RobinhoodBroker(RobinhoodMCP):
             "scope": "option_positions",
         }
 
+    async def inventory_snapshot(self):
+        """Read bound-account ownership without requiring current option prices."""
+        observed_at = self.clock()
+        accounts, positions, orders = await self._bounded_reads(lambda read: read(), [
+            lambda: self._data("get_accounts", {}),
+            lambda: self._pages("get_option_positions", {"account_number": self.account_number, "nonzero": True}, "positions"),
+            lambda: self._pages("get_option_orders", {"account_number": self.account_number}, "orders"),
+        ])
+        matches = [row for row in accounts["accounts"] or [] if row["account_number"] == self.account_number]
+        if len(matches) != 1:
+            raise BrokerError("Bound Robinhood account is missing or ambiguous")
+        account = matches[0]
+        if (account.get("agentic_allowed") is not True or account["state"] != "active"
+                or account["deactivated"] or account["permanently_deactivated"]):
+            raise BrokerError("Bound Robinhood account is not active for inventory reconciliation")
+        working = [order["id"] for order in orders
+                   if order["state"] not in {"filled", "rejected", "cancelled", "failed", "voided"}]
+        inventory = []
+        for position in positions:
+            quantity = _contracts(position["quantity"])
+            if not quantity:
+                continue
+            if position["type"] != "long" or _decimal(position["trade_value_multiplier"], "multiplier") != 100:
+                raise BrokerError("Unsupported option inventory requires separate reconciliation")
+            option_id = position["option_id"]
+            contract = self._instrument_contract(await self._instrument(option_id))
+            pending_sell = _contracts(position["pending_sell_quantity"])
+            pending_other = sum(_contracts(position[key]) for key in (
+                "pending_exercise_quantity", "pending_assignment_quantity", "pending_expiration_quantity"))
+            if pending_sell + pending_other > quantity or _contracts(position["pending_buy_quantity"]):
+                raise BrokerError("Pending option activity prevents conclusive inventory reconciliation")
+            inventory.append({"contract": contract, "option_id": option_id, "quantity": quantity,
+                              "available_quantity": quantity - pending_sell - pending_other,
+                              "pending_sell_quantity": pending_sell, "pending_other_quantity": pending_other})
+        return {"account_id": self.account_number, "positions": inventory, "working_order_ids": working,
+                "timestamp": observed_at.isoformat(), "timestamp_source": "local_fetch_started",
+                "agentic_allowed": True, "account_state": "active", "restrictions": [],
+                "simulated": False, "source": "Robinhood Agentic MCP"}
+
     @_scope_operation
     async def snapshot(self):
         cached = self._execution_snapshot()

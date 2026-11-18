@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -37,16 +37,24 @@ function makeRunnerTemp(t) {
   return { path, githubEnv };
 }
 
-function fakeExecutor(calls, { failCommand, failWhen, contents } = {}) {
+function fakeExecutor(calls, { failCommand, failWhen, contents, onPython } = {}) {
   return (command, args, context) => {
     calls.push({ command, args, context });
     if (command === failCommand || failWhen?.(command, args)) throw new Error(`simulated ${command} failure`);
     if (command === 'apt-get' && args.includes('install')) {
-      writeFileSync(join(context.paths.archives, 'libatk1.0-0_1.0_amd64.deb'), 'fake deb');
+      const archive = args.includes('libatomic1') ? 'libatomic1_1.0_amd64.deb' : 'libatk1.0-0_1.0_amd64.deb';
+      writeFileSync(join(context.paths.archives, archive), 'fake deb');
     }
-    if (command === 'dpkg-deb' && args[0] === '--contents') return contents ?? '-rw-r--r-- root/root 123 ./usr/lib/x86_64-linux-gnu/libatk-1.0.so.0\n';
+    if (command === 'python') return onPython?.(args, context) ?? '';
+    if (command === 'dpkg-deb' && args[0] === '--contents') {
+      if (contents !== undefined) return contents;
+      return args[1].includes('libatomic1_')
+        ? '-rw-r--r-- root/root 123 ./usr/lib/x86_64-linux-gnu/libatomic.so.1\n'
+        : '-rw-r--r-- root/root 123 ./usr/lib/x86_64-linux-gnu/libatk-1.0.so.0\n';
+    }
     if (command === 'dpkg-deb' && args[0] === '--extract') {
-      const extractedFile = join(args[2], 'usr/lib/x86_64-linux-gnu/libatk-1.0.so.0');
+      const library = args[1].includes('libatomic1_') ? 'libatomic.so.1' : 'libatk-1.0.so.0';
+      const extractedFile = join(args[2], 'usr/lib/x86_64-linux-gnu', library);
       mkdirSync(join(args[2], 'usr/lib/x86_64-linux-gnu'), { recursive: true });
       writeFileSync(extractedFile, 'fake library');
     }
@@ -77,27 +85,20 @@ test('builds plans from supplied Playwright Chromium metadata without Xvfb', () 
   assert.equal(debianArm.libraryArchitecture, 'aarch64-linux-gnu');
 });
 
-test('queries installed Python Playwright and stages dependencies without root', (t) => {
+test('stages libatomic before probing Playwright bundled Node without root', (t) => {
   const { path, githubEnv } = makeRunnerTemp(t);
   const calls = [];
-  const executor = (command, args, context) => {
-    calls.push({ command, args, context });
-    if (command === 'python') {
+  const executor = fakeExecutor(calls, {
+    onPython: (args, context) => {
+      assert.deepEqual(args, ['-m', 'playwright', 'install-deps', '--dry-run', 'chromium']);
+      const atomicLibrary = join(context.paths.prefix, 'usr/lib/x86_64-linux-gnu/libatomic.so.1');
+      const libraryDirectory = join(context.paths.prefix, 'usr/lib/x86_64-linux-gnu');
+      if (!existsSync(atomicLibrary) || !context.environment.LD_LIBRARY_PATH.split(':').includes(libraryDirectory)) {
+        throw new Error('playwright/driver/node: error while loading shared libraries: libatomic.so.1: cannot open shared object file');
+      }
       return 'sudo apt-get update && sudo apt-get install -y --no-install-recommends libatk1.0-0 xvfb';
-    }
-    if (command === 'apt-get' && args.includes('install')) {
-      writeFileSync(join(context.paths.archives, 'libatk1.0-0_1.0_amd64.deb'), 'fake deb');
-    }
-    if (command === 'dpkg-deb' && args[0] === '--contents') {
-      return '-rw-r--r-- root/root 123 ./usr/lib/x86_64-linux-gnu/libatk-1.0.so.0\\n';
-    }
-    if (command === 'dpkg-deb' && args[0] === '--extract') {
-      const extractedFile = join(args[2], 'usr/lib/x86_64-linux-gnu/libatk-1.0.so.0');
-      mkdirSync(join(args[2], 'usr/lib/x86_64-linux-gnu'), { recursive: true });
-      writeFileSync(extractedFile, 'fake library');
-    }
-    return '';
-  };
+    },
+  });
   const result = installBrowserDependencies({
     env: { RUNNER_TEMP: path, GITHUB_ENV: githubEnv, LD_LIBRARY_PATH: '/existing/lib' },
     platform: 'linux',
@@ -109,7 +110,13 @@ test('queries installed Python Playwright and stages dependencies without root',
   const probe = calls.find(({ command }) => command === 'python');
   assert.deepEqual(probe.args, ['-m', 'playwright', 'install-deps', '--dry-run', 'chromium']);
   assert.equal(probe.context.captureOutput, true);
+  const bootstrapDownload = calls.findIndex(({ command, args }) => command === 'apt-get' && args.includes('libatomic1'));
+  const bootstrapExtraction = calls.findIndex(({ command, args }) => command === 'dpkg-deb' && args[0] === '--extract' && args[1].includes('libatomic1_'));
+  const probeIndex = calls.indexOf(probe);
+  assert.ok(bootstrapDownload < bootstrapExtraction && bootstrapExtraction < probeIndex,
+    'libatomic1 must be downloaded and extracted before Playwright invokes its bundled Node');
   assert.ok(calls.every(({ command }) => command !== 'sudo'));
+  assert.ok(result.packages.includes('libatomic1'));
   assert.ok(result.packages.includes('fonts-liberation'));
   assert.ok(!result.packages.includes('xvfb'));
   assert.match(readFileSync(githubEnv, 'utf8'), /LD_LIBRARY_PATH=.*discord-playwright-deps-/);
@@ -159,10 +166,11 @@ test('downloads signed APT packages and extracts them only into the private pref
   });
 
   const aptCalls = calls.filter((call) => call.command === 'apt-get');
-  assert.equal(aptCalls.length, 2);
+  assert.equal(aptCalls.length, 3);
   assert.ok(aptCalls[0].args.includes('update'));
-  assert.ok(aptCalls[1].args.includes('install'));
-  assert.ok(aptCalls[1].args.includes('--download-only'));
+  assert.ok(aptCalls[1].args.includes('libatomic1'));
+  assert.ok(aptCalls[2].args.includes('install'));
+  assert.ok(aptCalls[2].args.includes('--download-only'));
   assert.ok(aptCalls.every(({ args }) => args.includes('Debug::NoLocking=1')));
   assert.ok(aptCalls.every(({ args }) => args.includes('Dir::State::status=/var/lib/dpkg/status')));
   const temporaryAptPaths = aptCalls.flatMap(({ args }) => args.filter((arg) => /^(?:Dir::State::lists|Dir::State::extended_states|Dir::Cache::archives|Dir::Cache::pkgcache|Dir::Cache::srcpkgcache|Dir::Log)=/.test(arg)));
@@ -170,7 +178,7 @@ test('downloads signed APT packages and extracts them only into the private pref
   assert.ok(temporaryAptPaths.every((arg) => arg.slice(arg.indexOf('=') + 1).replace(/\/$/, '').startsWith(`${aptCalls[0].context.paths.root}/`)));
   assert.ok(aptCalls.every(({ args }) => !args.some((arg) => /unauthenticated/i.test(arg))));
   assert.ok(aptCalls.every(({ args }) => !args.includes('--allow-unauthenticated')));
-  assert.ok(aptCalls[1].args.includes('--no-install-recommends'));
+  assert.ok(aptCalls[2].args.includes('--no-install-recommends'));
   assert.ok(!calls.some(({ command, args }) => command === 'sudo' || (command === 'dpkg' && args.includes('--install'))));
   assert.ok(calls.filter(({ command }) => command === 'dpkg-deb').every(({ args }) => args[0] === '--contents' || args[0] === '--extract'));
   assert.ok(calls.filter(({ command }) => command === 'dpkg-deb').every(({ context }) => context.paths.prefix.startsWith(join(path, 'discord-playwright-deps-'))));

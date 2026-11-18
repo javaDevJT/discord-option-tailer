@@ -1232,6 +1232,7 @@ class CodexInterpreter:
         self.last_notices = []
         self.last_attempts = 0
         self.last_timing = None
+        self._model_retry_at = 0.0
 
     def _environment(self, runtime_home):
         env = os.environ.copy()
@@ -1330,6 +1331,20 @@ class CodexInterpreter:
         if model is not None and not is_valid_codex_identifier(model):
             raise InterpretationError("The user's configured Codex model is invalid")
         return model
+
+    async def test_connection(self) -> dict:
+        """Ask for one fixed response from the same isolated inference path."""
+        schema = {"type": "object", "properties": {"status": {"type": "string", "enum": ["ready"]}},
+                  "required": ["status"], "additionalProperties": False}
+
+        def validate(result):
+            if result != {"status": "ready"}:
+                raise InterpretationError("Invalid synthetic response", code="invalid_output")
+            return result
+
+        self.last_model = None
+        return await self._request({}, schema=schema, validator=validate,
+                                   system_prompt='Connectivity check. Respond with {"status":"ready"}.')
 
     @traced("relay.evaluate")
     async def interpret(self, message: dict, context: list[dict], positions: list[dict]) -> dict:
@@ -1528,25 +1543,42 @@ class CodexInterpreter:
         last_error = None
         for attempt in (1, 2):
             self.last_attempts = attempt
+            self.last_model = None
+            use_cli_default = time.monotonic() < self._model_retry_at
             try:
-                result = await asyncio.to_thread(self._interpret, data, **options)
+                run_options = options | {"use_cli_default": True} if use_cli_default else options
+                result = await asyncio.to_thread(self._interpret, data, **run_options)
                 if validator is not None:
                     result = validator(result)
                 timing = _evaluation_timing(
                     data.get("current_message", {}), started_monotonic, attempt, path=timing_path,
                 )
+                if self.last_model:
+                    timing["model"] = self.last_model
                 self.last_timing = timing
-                publish_status(self.on_status, "codex", "ready")
+                if use_cli_default:
+                    publish_status(self.on_status, "codex", "ready", detail=(
+                        "Codex is using its default model because the selected model was unavailable."))
+                else:
+                    publish_status(self.on_status, "codex", "ready")
                 return result | {"evaluation_timing": timing}
             except Exception as exc:
                 if isinstance(exc, ImageTransportError):
                     error = _image_interpretation_error(exc)
+                elif isinstance(exc, TimeoutError):
+                    error = InterpretationError(DIAGNOSTIC_DETAILS["timeout"], code="timeout", retryable=False)
                 elif isinstance(exc, InterpretationError):
                     error = exc
                 else:
                     error = InterpretationError("interpreter failed before producing a decision", code="internal_error", retryable=False)
                 error.attempts = attempt
                 last_error = error
+                if error.code == "model_unavailable" and not use_cli_default and self.last_model not in (None, "codex_default"):
+                    # Retry with the account's CLI default, then periodically probe
+                    # the selected model again. Never switch on unrelated errors.
+                    self._model_retry_at = time.monotonic() + 900
+                    if attempt < 2:
+                        continue
                 if error.code == "invalid_evidence" and error.retryable and attempt < 2:
                     base_prompt = options.get("system_prompt") or SYSTEM_PROMPT
                     guidance = (_RECOVERY_EVIDENCE_RETRY_GUIDANCE if timing_path == "recovery"
@@ -1568,11 +1600,13 @@ class CodexInterpreter:
                     timing = _evaluation_timing(
                         data.get("current_message", {}), started_monotonic, attempt, path=timing_path,
                     )
+                    if self.last_model:
+                        timing["model"] = self.last_model
                     self.last_timing = timing
                     error.evaluation_timing = timing
                     break
         if self.on_status and last_error is not None and not last_error.code.startswith("image_"):
-            state = "auth_required" if last_error.code == "auth_required" else "unavailable"
+            state = "auth_required" if last_error.code in {"auth_required", "credentials_missing"} else "unavailable"
             action = ("Use Codex sign-in to renew the ChatGPT subscription session." if last_error.code in {"auth_required", "credentials_missing"}
                       else "Check the ChatGPT usage allowance and wait for its reset before retrying." if last_error.code == "quota_exhausted"
                       else "Check NAS internet access and OpenAI service availability." if last_error.code in {"network_unavailable", "timeout"}
@@ -1582,11 +1616,13 @@ class CodexInterpreter:
             publish_status(self.on_status, "codex", state, detail=f"{safe_interpretation_reason(last_error)}. {action}")
         raise last_error
 
-    def _interpret(self, data, *, schema=DECISION_SCHEMA, system_prompt=SYSTEM_PROMPT, image_sources=()):
+    def _interpret(self, data, *, schema=DECISION_SCHEMA, system_prompt=SYSTEM_PROMPT,
+                   image_sources=(), use_cli_default=False):
         credential = self.source_home / "auth.json"
         if not credential.is_file():
             raise InterpretationError("Isolated Codex requires a file-backed ChatGPT login; run codex login with ChatGPT first", code="credentials_missing", retryable=False)
-        with tempfile.TemporaryDirectory(prefix="discord-relay-codex-") as directory:
+        from .codex_auth import inference_auth_lock
+        with inference_auth_lock(self.source_home, self.timeout), tempfile.TemporaryDirectory(prefix="discord-relay-codex-") as directory:
             root = Path(directory)
             runtime_home, workspace = root / "home", root / "workspace"
             runtime_home.mkdir(mode=0o700)
@@ -1604,7 +1640,8 @@ class CodexInterpreter:
             schema_path, instructions, output = root / "schema.json", root / "instructions.txt", root / "decision.json"
             schema_path.write_text(json.dumps(schema))
             instructions.write_text(system_prompt + "\nReturn JSON only. Do not call tools or read any filesystem, environment, network, skill, or project instructions.\n")
-            model = self._default_model()
+            model = None if use_cli_default else self._default_model()
+            self.last_model = model or "codex_default"
             args = [
                 self.executable, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                 "--skip-git-repo-check", "--sandbox", "read-only", "--strict-config", "--json",
@@ -1626,14 +1663,15 @@ class CodexInterpreter:
                 "cli_auth_credentials_store": "file",
                 "web_search": "disabled", "project_doc_max_bytes": 0, "skills.include_instructions": False,
                 "skills.bundled.enabled": False, "features.skip_host_skill_discovery": True,
-                "model_reasoning_effort": self.reasoning_effort,
-                "features.fast_mode": self.service_tier == "fast",
+                "features.fast_mode": not use_cli_default and self.service_tier == "fast",
                 "model_instructions_file": str(instructions), "history.persistence": "none",
                 "log_dir": str(root / "logs"), "tools.update_plan.enabled": False,
                 "tools.experimental_request_user_input.enabled": False, "mcp_servers": {},
                 "suppress_unstable_features_warning": True,
             }
-            if self.service_tier == "fast":
+            if not use_cli_default:
+                overrides["model_reasoning_effort"] = self.reasoning_effort
+            if not use_cli_default and self.service_tier == "fast":
                 overrides["service_tier"] = "fast"
             overrides.update({"features." + name: False for name in self._DISABLED_FEATURES})
             for name, value in overrides.items():
@@ -1688,7 +1726,6 @@ class CodexInterpreter:
                     self.last_usage = {key: value for key, value in usage.items() if key in {"input_tokens", "cached_input_tokens", "output_tokens"} and type(value) is int and value >= 0}
             if not started or not completed or not output.is_file() or output.stat().st_size > 100_000:
                 raise InterpretationError("Codex did not finish with a bounded structured decision", code="invalid_output")
-            self.last_model = model or "codex_default"
             try:
                 output_text = output.read_text()
             except UnicodeDecodeError:

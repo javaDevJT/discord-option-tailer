@@ -9,10 +9,27 @@ import unittest
 from unittest.mock import patch
 
 from relay import telemetry
-from relay.telemetry_logs import Framer, RingWriter, record, redact
+from relay.telemetry_logs import CollectorFailures, Framer, RingWriter, record, redact
 
 
 class OriginalOutputTests(unittest.TestCase):
+    def test_collector_failure_stream_saves_classification_without_raw_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "export.json"
+            diagnostics = CollectorFailures(path)
+            error = json.dumps({"msg": "Exporting failed. Will retry the request after interval.",
+                "otelcol.component.id": "otlp_http/openwoof_traces",
+                "error": "HTTP Status Code 429, Message=fixture private response"})
+            diagnostics.feed(error[:30])
+            self.assertFalse(path.exists())
+            diagnostics.feed(error[30:] + "\n")
+            statuses = json.loads(path.read_text())
+            self.assertEqual(set(statuses), {"traces"})
+            self.assertEqual(statuses["traces"]["http_status"], 429)
+            self.assertEqual(statuses["traces"]["code"], "http_error")
+            self.assertNotIn("fixture private response", path.read_text())
+            self.assertIsNone(record("telemetry-collector", 1, "stderr", error, 1, "newline"))
+
     def test_json_utf8_and_multiline_are_preserved_across_every_byte_boundary(self):
         body = json.dumps({"state": "error", "at": "2026-10-21T18:00:00+00:00",
             "reason": "quote ‘retained’ and newline\nnext", "code": "schema_incompatible"}, indent=2, ensure_ascii=False)
@@ -143,7 +160,8 @@ class DeploymentWiringTests(unittest.TestCase):
             self.assertEqual(p[f"program:{name}"]["stdout_events_enabled"], "true")
         for name in ["dashboard", "service", "notifications"]:
             self.assertIn("relay.telemetry_exec " + name, p[f"program:{name}"]["command"])
-        self.assertNotIn("stdout_events_enabled", p["program:telemetry-collector"])
+        self.assertEqual(p["program:telemetry-collector"]["stdout_logfile"], "/dev/stdout")
+        self.assertEqual(p["program:telemetry-collector"]["stdout_events_enabled"], "true")
 
 
 class SQLiteShortcutTests(unittest.TestCase):

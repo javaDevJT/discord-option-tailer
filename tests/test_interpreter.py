@@ -866,6 +866,49 @@ class CodexInterpreterChecks(unittest.TestCase):
                 asyncio.run(interpreter.interpret(MESSAGE, [], []))
             self.assertEqual(run.call_count, 1)
 
+    def test_unavailable_model_uses_cli_default_for_a_bounded_period(self):
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory, model="missing-model", service_tier="fast")
+            calls = []
+
+            def execute(args, env, cwd, input_bytes=None):
+                if "exec" in args:
+                    calls.append(args)
+                    if "missing-model" in args:
+                        return subprocess.CompletedProcess(args, 1, b"", b"model is not supported")
+                return self.response(args, env, cwd, input_bytes)
+
+            async def exercise():
+                first = await interpreter.interpret(MESSAGE, [], [])
+                second = await interpreter.interpret(MESSAGE, [], [])
+                interpreter._model_retry_at = 0
+                third = await interpreter.interpret(MESSAGE, [], [])
+                self.assertEqual([d["evaluation_timing"]["attempts"] for d in (first, second, third)], [2, 1, 2])
+                self.assertTrue(all(d["evaluation_timing"]["model"] == "codex_default" for d in (first, second, third)))
+
+            with patch.object(interpreter, "_run_process", side_effect=execute):
+                asyncio.run(exercise())
+            self.assertEqual(["--model" in args for args in calls], [True, False, False, True, False])
+            for args in (calls[1], calls[2], calls[4]):
+                self.assertNotIn('service_tier="fast"', args)
+                self.assertIn('forced_login_method="chatgpt"', args)
+
+    def test_synthetic_probe_uses_fixed_schema_without_alert_or_account_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = self.interpreter(directory, model="probe-model")
+
+            def execute(args, env, cwd, input_bytes=None):
+                if "exec" in args:
+                    self.assertEqual(json.loads(input_bytes), {})
+                    schema = json.loads(Path(args[args.index("--output-schema") + 1]).read_text())
+                    self.assertEqual(schema["required"], ["status"])
+                return self.response(args, env, cwd, input_bytes, decision={"status": "ready"})
+
+            with patch.object(interpreter, "_run_process", side_effect=execute):
+                result = asyncio.run(interpreter.test_connection())
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["evaluation_timing"]["model"], "probe-model")
+
     def test_subscription_payload_is_bounded_and_omits_private_metadata(self):
         image_url = "https://cdn.discordapp.com/attachments/123456789012345678/234567890123456789/chart.png?token=private-fixture"
         message = MESSAGE | {

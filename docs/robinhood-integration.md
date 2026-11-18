@@ -16,6 +16,8 @@ Account selection requires authenticated eligibility fields and an unambiguous e
 
 Account inspection uses the dashboard's display reads, so yesterday's held-option quotes do not make authorization appear failed before market open. Trading snapshots and order execution retain their quote freshness checks.
 
+Live inventory reconciliation compares the relay ledger with complete Robinhood holdings and working orders about once per minute. Two fresh reads must both show that an exact contract is absent before the relay archives a position. The audit records the prior local quantity without creating a fill or inferring how the option was disposed of. Pending orders, active stop requests, and ambiguous source ownership keep the ledger entry in place. This check works outside market hours using holdings rather than price quotes.
+
 ## Reads and order lifecycle
 
 The normalized adapter exposes `snapshot()`, `quote(contract)`, `review(order)`, `submit(order, before_submit=None)` and `order_status(broker_uuid)`.

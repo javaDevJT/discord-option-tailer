@@ -153,7 +153,7 @@ exporters:
       enabled: true
       initial_interval: 1s
       max_interval: 30s
-      max_elapsed_time: 0s
+      max_elapsed_time: 10m
   otlp_http/openwoof_metrics:
     endpoint: https://openwoof.javadevjt.tech
     encoding: proto
@@ -180,7 +180,7 @@ exporters:
       enabled: true
       initial_interval: 1s
       max_interval: 30s
-      max_elapsed_time: 0s
+      max_elapsed_time: 10m
   otlp_http/openwoof_logs:
     endpoint: https://openwoof.javadevjt.tech
     encoding: proto
@@ -207,13 +207,14 @@ exporters:
       enabled: true
       initial_interval: 1s
       max_interval: 30s
-      max_elapsed_time: 0s
+      max_elapsed_time: 10m
 
 service:
   extensions: [bearertokenauth/openwoof, file_storage, file_storage/queue, health_check]
   telemetry:
     logs:
       level: info
+      encoding: json
     metrics:
       readers:
         - pull:

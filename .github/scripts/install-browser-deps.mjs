@@ -66,8 +66,7 @@ export function buildInstallPlan({
   if (platform !== 'linux') throw new Error('Browser dependency staging is supported only on Linux.');
   if (!officiallySupported) throw new Error(`Playwright does not officially support host platform ${hostPlatform}.`);
 
-  const platformMatch = /^(?:ubuntu\d{2}\.\d{2}|debian\d+)-(x64|arm64)$/.exec(hostPlatform ?? '');
-  if (!platformMatch) throw new Error(`Unsupported apt-based Playwright host platform: ${hostPlatform ?? '<unknown>'}.`);
+  const libraryArchitecture = libraryArchitectureForHost(hostPlatform);
 
   const platformDependencies = dependencies?.[hostPlatform];
   if (dependencies && (!platformDependencies || !Array.isArray(platformDependencies.chromium) || !Array.isArray(platformDependencies.tools))) {
@@ -85,8 +84,14 @@ export function buildInstallPlan({
   return {
     hostPlatform,
     packages,
-    libraryArchitecture: platformMatch[1] === 'x64' ? 'x86_64-linux-gnu' : 'aarch64-linux-gnu',
+    libraryArchitecture,
   };
+}
+
+function libraryArchitectureForHost(hostPlatform) {
+  const platformMatch = /^(?:ubuntu\d{2}\.\d{2}|debian\d+)-(x64|arm64)$/.exec(hostPlatform ?? '');
+  if (!platformMatch) throw new Error(`Unsupported apt-based Playwright host platform: ${hostPlatform ?? '<unknown>'}.`);
+  return platformMatch[1] === 'x64' ? 'x86_64-linux-gnu' : 'aarch64-linux-gnu';
 }
 
 export function buildAptConfiguration(paths) {
@@ -194,11 +199,22 @@ function makeStagingPaths(runnerTemp) {
   return paths;
 }
 
-function runCommand(command, args, { cwd, captureOutput, paths }) {
+function buildCommandEnvironment(paths, baseEnvironment) {
+  const environment = {
+    ...baseEnvironment,
+    TMPDIR: paths.temporary,
+    TMP: paths.temporary,
+    TEMP: paths.temporary,
+    APT_CONFIG: join(paths.root, 'apt.conf'),
+  };
+  if (paths.libraryPath) environment.LD_LIBRARY_PATH = paths.libraryPath;
+  return environment;
+}
+
+function runCommand(command, args, { cwd, captureOutput, paths, environment }) {
   const result = spawnSync(command, args, {
     cwd,
-    env: { ...process.env, TMPDIR: paths.temporary, TMP: paths.temporary, TEMP: paths.temporary,
-      APT_CONFIG: join(paths.root, 'apt.conf') },
+    env: environment,
     encoding: 'utf8',
     stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
   });
@@ -218,8 +234,9 @@ function runCommand(command, args, { cwd, captureOutput, paths }) {
   return captureOutput ? output : '';
 }
 
-function invoke(executor, command, args, paths, captureOutput = false) {
-  const result = executor(command, args, { cwd: paths.root, paths, captureOutput });
+function invoke(executor, command, args, paths, baseEnvironment, captureOutput = false) {
+  const environment = buildCommandEnvironment(paths, baseEnvironment);
+  const result = executor(command, args, { cwd: paths.root, paths, captureOutput, environment });
   if (captureOutput && typeof result !== 'string') throw new Error(`${command} did not return captured output.`);
   return result;
 }
@@ -243,6 +260,19 @@ function packageContainsProtectedLibrary(contents) {
     const basename = entry.replace(/\/$/, '').split('/').at(-1);
     return PROTECTED_SYSTEM_LIBRARY.test(basename);
   });
+}
+
+function stageDownloadedPackages(paths, executor, environment) {
+  const inspected = packageArchives(paths.archives).map((archive) => ({
+    archive,
+    contents: invoke(executor, 'dpkg-deb', ['--contents', archive], paths, environment, true),
+  }));
+  const unsafeArchive = inspected.find(({ contents }) => packageContainsProtectedLibrary(contents));
+  if (unsafeArchive) throw new Error(`Refusing to stage a protected system library from ${unsafeArchive.archive}.`);
+
+  for (const { archive } of inspected) {
+    invoke(executor, 'dpkg-deb', ['--extract', archive, paths.prefix], paths, environment);
+  }
 }
 
 export function buildLibraryPath(prefix, libraryArchitecture, existing = '') {
@@ -276,33 +306,25 @@ export function installBrowserDependencies({
 
   try {
     hostPlatform ??= detectHostPlatform(readFileSync('/etc/os-release', 'utf8'), process.arch);
+    const libraryArchitecture = libraryArchitectureForHost(hostPlatform);
+    const libraryPath = buildLibraryPath(paths.prefix, libraryArchitecture, env.LD_LIBRARY_PATH ?? '');
     writeFileSync(join(paths.root, 'apt.conf'), buildAptConfiguration(paths), { flag: 'wx', mode: 0o600 });
-    let metadataReady = false;
-    let dryRunOutput;
-    if (!dependencies) {
-      invoke(executor, 'apt-get', buildAptArguments('update', paths), paths);
-      metadataReady = true;
-      dryRunOutput = invoke(executor, PYTHON_EXECUTABLE, ['-m', 'playwright', 'install-deps', '--dry-run', 'chromium'], paths, true);
-    }
+    invoke(executor, 'apt-get', buildAptArguments('update', paths), paths, env);
+    // Playwright's bundled Node loads libatomic.so.1 before its dependency probe can run.
+    invoke(executor, 'apt-get', buildAptArguments('download', paths, ['libatomic1']), paths, env);
+    stageDownloadedPackages(paths, executor, env);
+    paths.libraryPath = libraryPath;
+
+    const dryRunOutput = dependencies ? undefined
+      : invoke(executor, PYTHON_EXECUTABLE, ['-m', 'playwright', 'install-deps', '--dry-run', 'chromium'], paths, env, true);
     const plan = buildInstallPlan({ platform, hostPlatform, officiallySupported, dependencies, dryRunOutput });
-    const packages = [...new Set([...plan.packages, 'fonts-liberation'])].sort();
-    const libraryPath = buildLibraryPath(paths.prefix, plan.libraryArchitecture, env.LD_LIBRARY_PATH ?? '');
-    if (packages.length) {
-      if (!metadataReady) invoke(executor, 'apt-get', buildAptArguments('update', paths), paths);
-      invoke(executor, 'apt-get', buildAptArguments('download', paths, packages), paths);
+    const packages = [...new Set([...plan.packages, 'fonts-liberation', 'libatomic1'])].sort();
+    const packagesToDownload = packages.filter((name) => name !== 'libatomic1');
+    if (packagesToDownload.length) {
+      invoke(executor, 'apt-get', buildAptArguments('download', paths, packagesToDownload), paths, env);
     }
 
-    const archives = packageArchives(paths.archives);
-    const inspected = archives.map((archive) => ({
-      archive,
-      contents: invoke(executor, 'dpkg-deb', ['--contents', archive], paths, true),
-    }));
-    const unsafeArchive = inspected.find(({ contents }) => packageContainsProtectedLibrary(contents));
-    if (unsafeArchive) throw new Error(`Refusing to stage a protected system library from ${unsafeArchive.archive}.`);
-
-    for (const { archive } of inspected) {
-      invoke(executor, 'dpkg-deb', ['--extract', archive, paths.prefix], paths);
-    }
+    stageDownloadedPackages(paths, executor, env);
 
     const fontCache = join(paths.root, 'font-cache');
     mkdirSync(fontCache);

@@ -54,6 +54,12 @@ def _configured_codex_model(config: Mapping[str, Any]) -> str:
     return model if isinstance(model, str) and model else "codex"
 
 
+def _reported_codex_model(config: Mapping[str, Any], timing: object) -> str:
+    if isinstance(timing, Mapping) and isinstance(timing.get("model"), str) and timing["model"]:
+        return timing["model"]
+    return _configured_codex_model(config)
+
+
 def _merge_timing(
     decision: dict[str, Any],
     metadata: Mapping[str, Any],
@@ -226,7 +232,7 @@ class EvaluationRouter:
                     {
                         "evaluator": "codex",
                         "route": "codex",
-                        "model": _configured_codex_model(self.config),
+                        "model": _reported_codex_model(self.config, getattr(error, "evaluation_timing", None)),
                         "codex_duration_seconds": max(
                             0.0, time.monotonic() - started
                         ),
@@ -239,7 +245,7 @@ class EvaluationRouter:
                 {
                     "evaluator": "codex",
                     "route": "codex",
-                    "model": _configured_codex_model(self.config),
+                    "model": _reported_codex_model(self.config, decision.get("evaluation_timing")),
                     "codex_duration_seconds": codex_seconds,
                 },
                 time.monotonic() - started,
@@ -268,7 +274,7 @@ class EvaluationRouter:
                 # Shadow evaluation is diagnostic; Codex remains authoritative.
                 shadow_reason = _safe_fallback_reason(error) if isinstance(error, JEVError) else "jev_provider_failed"
 
-            codex_model = _configured_codex_model(self.config)
+            codex_model = _reported_codex_model(self.config, codex_result.get("evaluation_timing"))
             metadata: dict[str, Any] = {
                 "evaluator": "codex",
                 "route": "shadow",
@@ -325,7 +331,7 @@ class EvaluationRouter:
             metadata: dict[str, Any] = {
                 "evaluator": "codex",
                 "route": "fallback",
-                "model": _configured_codex_model(self.config),
+                "model": _reported_codex_model(self.config, getattr(error, "evaluation_timing", None)),
                 "fallback_reason": fallback_reason,
                 "jev_duration_seconds": round(jev_seconds, 6),
                 "codex_duration_seconds": max(
@@ -344,7 +350,7 @@ class EvaluationRouter:
         metadata = {
             "evaluator": "codex",
             "route": "fallback",
-            "model": _configured_codex_model(self.config),
+            "model": _reported_codex_model(self.config, decision.get("evaluation_timing")),
             "fallback_reason": fallback_reason,
             "jev_duration_seconds": round(jev_seconds, 6),
             "codex_duration_seconds": codex_seconds,

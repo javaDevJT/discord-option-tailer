@@ -5,6 +5,7 @@ import asyncio
 import json
 import hashlib
 import time
+from datetime import timedelta
 from decimal import ROUND_CEILING
 from pathlib import Path
 
@@ -31,6 +32,9 @@ class RecoveryEvaluator:
         self.next_reconcile = 0
         self._reconcile_lock = asyncio.Lock()
         self._reconcile_seen_rowid = 0
+        self.next_inventory_reconcile = 0.0
+        self._inventory_absent = {}
+        self.last_inventory_reconcile = {"state": "not_checked", "archived": 0}
         self.retry_due = {}
         self.deferred_exits = {}
         with self.store.db:
@@ -262,6 +266,14 @@ class RecoveryEvaluator:
         if not self.engine.observe_only:
             with failure_stage("stop"):
                 await self.engine.stops.maintain()
+        # Position reconciliation shares the existing startup/periodic order
+        # cadence. It only archives local quantities from a complete, fresh
+        # account snapshot after local order state has settled.
+        if rows:
+            self._inventory_absent.clear()
+        elif now_mono >= self.next_inventory_reconcile:
+            self.next_inventory_reconcile = now_mono + 60
+            await self._reconcile_positions()
         pending = self.store.db.execute("""SELECT status,action,body FROM orders
             WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
         now = self.engine.clock()
@@ -278,6 +290,127 @@ class RecoveryEvaluator:
                     pass
         self.next_reconcile = time.monotonic() + delay
         return len(rows)
+
+    def _authoritative_inventory(self, snapshot, started_at):
+        """Validate the full broker snapshot before using absence as evidence."""
+        if (not isinstance(snapshot, dict)
+                or snapshot.get("account_id") != self.engine.account
+                or snapshot.get("source") != "Robinhood Agentic MCP"
+                or snapshot.get("simulated") is not False
+                or snapshot.get("agentic_allowed") is not True
+                or snapshot.get("account_state") != "active"
+                or snapshot.get("restrictions") != []):
+            raise Hold("broker inventory is not from the active bound account")
+        observed_at = instant(snapshot.get("timestamp"))
+        if observed_at < instant(started_at) or observed_at > instant(self.engine.clock()) + timedelta(seconds=5):
+            raise Hold("broker inventory snapshot is not current")
+        self.engine.check_quote_age(snapshot, self.engine.clock(), "account snapshot")
+        positions = snapshot.get("positions")
+        working = snapshot.get("working_order_ids")
+        if not isinstance(positions, list) or not isinstance(working, list):
+            raise Hold("broker inventory is incomplete")
+        if working:
+            raise Hold("broker inventory has working orders that may reserve contracts")
+
+        inventory = {}
+        for position in positions:
+            if not isinstance(position, dict):
+                raise Hold("broker inventory contains an invalid position")
+            contract = contract_key(position.get("contract"))
+            quantity = position.get("quantity")
+            available = position.get("available_quantity")
+            pending_sell = position.get("pending_sell_quantity")
+            pending_other = position.get("pending_other_quantity")
+            if (type(quantity) is not int or quantity <= 0
+                    or type(available) is not int or not 0 <= available <= quantity
+                    or type(pending_sell) is not int or pending_sell < 0
+                    or type(pending_other) is not int or pending_other < 0
+                    or available != quantity - pending_sell - pending_other
+                    or not isinstance(position.get("option_id"), str) or not position["option_id"]
+                    or contract in inventory):
+                raise Hold("broker inventory contains an ambiguous position")
+            inventory[contract] = position
+        return inventory
+
+    async def _reconcile_positions(self):
+        """Zero only a unique local contract absent from settled broker inventory."""
+        self.last_inventory_reconcile = {"state": "unavailable", "archived": 0}
+        read_inventory = getattr(self.engine.broker, "inventory_snapshot", None)
+        if self.engine.mode == "paper" or not callable(read_inventory):
+            return 0
+        # Keep local pending, partial, and uncertain executions intact. Their
+        # reservations make absence from one position snapshot inconclusive.
+        if self.store.db.execute("""SELECT 1 FROM orders
+                WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 1""").fetchone():
+            self._inventory_absent.clear()
+            self.last_inventory_reconcile = {"state": "orders_pending", "archived": 0}
+            return 0
+        before = self.store.positions()
+        if not before:
+            self._inventory_absent.clear()
+            return 0
+        try:
+            started_at = self.engine.clock()
+            snapshot = await read_inventory()
+            inventory = self._authoritative_inventory(snapshot, started_at)
+            after = self.store.positions()
+            if before != after:
+                raise Hold("local positions changed during broker inventory review")
+            if self.store.db.execute("""SELECT 1 FROM orders
+                    WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 1""").fetchone():
+                raise Hold("local order state changed during broker inventory review")
+
+            counts = {}
+            for position in before:
+                key = contract_key(position["contract"])
+                counts[key] = counts.get(key, 0) + 1
+
+            absent = {}
+            archived = 0
+            with self.store.db:
+                # Recheck the source attribution and quantity while applying
+                # each zero. Multiple local sources for one contract remain
+                # untouched because aggregate broker inventory cannot assign
+                # ownership between them.
+                for position in before:
+                    key = contract_key(position["contract"])
+                    if key in inventory or counts[key] != 1:
+                        continue
+                    if self.store.db.execute("""SELECT 1 FROM stop_requests
+                            WHERE contract=? AND status IN ('pending','active') LIMIT 1""", (key,)).fetchone():
+                        continue
+                    identity = (position["source_group"], key, position["quantity"], position["average_price"])
+                    previous = self._inventory_absent.get(identity)
+                    observed = instant(snapshot["timestamp"])
+                    if previous is None or observed <= previous:
+                        absent[identity] = observed
+                        continue
+                    changed = self.store.db.execute("""UPDATE positions SET quantity=0
+                            WHERE source_group=? AND contract=? AND quantity=?""",
+                        (position["source_group"], key, position["quantity"]))
+                    archived += changed.rowcount
+                    if changed.rowcount:
+                        recorded = self.engine.clock().isoformat()
+                        event_id = "inventory:" + hashlib.sha256(json.dumps([identity, recorded]).encode()).hexdigest()
+                        self.store.db.execute("""INSERT INTO events(message_id,revision,state,reason,decision,created_at)
+                                VALUES (?,?,?,?,?,?)""", (event_id, "inventory-v1", "context",
+                            "Local position archived after two complete Robinhood reads confirmed zero holdings; no fill recorded",
+                            json.dumps({"contract": position["contract"], "quantity": position["quantity"]}), recorded))
+            self._inventory_absent = absent
+            self.last_inventory_reconcile = {
+                "state": "complete", "archived": archived,
+                "timestamp": snapshot["timestamp"],
+            }
+            return archived
+        except Hold as exc:
+            self._inventory_absent.clear()
+            self.last_inventory_reconcile = {"state": "held", "archived": 0, "reason": str(exc)}
+            return 0
+        except Exception as exc:
+            self._inventory_absent.clear()
+            execution_failure(exc, stage="position_reconciliation", context={"action": "RECONCILE"})
+            self.last_inventory_reconcile = {"state": "unavailable", "archived": 0}
+            return 0
 
     async def reconcile_loop(self, emit=None):
         """Keep broker order state current independently of message recovery."""

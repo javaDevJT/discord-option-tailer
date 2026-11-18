@@ -84,6 +84,8 @@ In **Setup → Signal evaluation**, select the Codex model, reasoning effort, Fa
 
 Evaluation retries once for transient provider, network, timeout, or invalid-output failures, including evidence validation. Authentication, quota, and configuration errors report immediately. Failed evaluations show a sanitized cause and attempt count; no broker order is retried by this mechanism. The same handling applies to read-only recovery assessments. When Codex or Robinhood rejects authentication, Setup shows reauthentication required and the configured Discord webhook sends one alert per incident. Saved credentials alone do not clear the alert; a successful provider operation does.
 
+If Codex rejects the selected model as unavailable, the relay retries with the authenticated CLI's default model and standard service. It retries the selected model after 15 minutes. The decision timing identifies the route used. **Test Codex connection** in Setup runs a synthetic request through the same account and CLI without using alerts, positions, or orders.
+
 ## Trading modes
 
 | Mode | Data | Result |

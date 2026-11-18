@@ -187,6 +187,21 @@ class LiveBrokerChecks(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrokerError, "quote.*stale"):
             await self.broker.snapshot()
 
+    async def test_inventory_reconciliation_reads_bound_holdings_off_hours_without_quotes(self):
+        self.now = datetime(2026, 9, 9, 11, tzinfo=timezone.utc)
+        self.positions = [{"option_id": self.instrument["id"], "quantity": "2", "type": "long",
+                           "trade_value_multiplier": "100", "pending_buy_quantity": "0",
+                           "pending_sell_quantity": "1", "pending_exercise_quantity": "0",
+                           "pending_assignment_quantity": "0", "pending_expiration_quantity": "0"}]
+        self.orders = [{"id": "working-order", "state": "queued"}]
+        result = await self.broker.inventory_snapshot()
+        self.assertEqual(result["account_id"], "TEST0001")
+        self.assertEqual(result["positions"][0]["quantity"], 2)
+        self.assertEqual(result["positions"][0]["available_quantity"], 1)
+        self.assertEqual(result["working_order_ids"], ["working-order"])
+        self.assertEqual({name for name, _ in self.calls}, {
+            "get_accounts", "get_option_positions", "get_option_orders", "get_option_instruments"})
+
     async def test_account_overview_projects_negative_short_adjusted_and_stale(self):
         self.positions = [{
             "option_id": self.instrument["id"],

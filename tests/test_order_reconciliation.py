@@ -3,8 +3,10 @@ import json
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from relay.core import Engine, Store, contract_key
 from relay.recovery import RecoveryEvaluator
 from tests import test_core
 
@@ -45,6 +47,114 @@ class OrderReconciliationChecks(unittest.IsolatedAsyncioTestCase):
         evaluator = RecoveryEvaluator(self.engine)
         self.engine.stops.maintain = AsyncMock()
         return evaluator
+
+    def live_recovery(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / "config.example.json").read_text())
+        config.update(mode="live", database=str(Path(self.temp.name) / "live.sqlite3"),
+                      kill_switch=str(Path(self.temp.name) / "live-STOP"))
+        config["robinhood"].update(account_number="12345678", enable_live_orders=True)
+        store = Store(config["database"])
+        self.addCleanup(store.close)
+        broker = self.broker
+        engine = Engine(config, store, test_core.Interpreter(), broker, clock=lambda: NOW)
+        engine.stops.maintain = AsyncMock()
+        return RecoveryEvaluator(engine), store, broker
+
+    @staticmethod
+    def inventory_snapshot(positions=(), *, timestamp=None, working=()):
+        return {
+            "account_id": "12345678", "source": "Robinhood Agentic MCP", "simulated": False,
+            "agentic_allowed": True, "account_state": "active", "restrictions": [],
+            "timestamp": timestamp or (NOW + timedelta(milliseconds=1)).isoformat(),
+            "positions": list(positions), "working_order_ids": list(working),
+        }
+
+    async def test_authoritative_absence_zeros_unique_local_quantity_but_available_zero_does_not(self):
+        evaluator, store, broker = self.live_recovery()
+        absent = {"symbol": "TQQQ", "expiry": "2026-09-18", "strike": "55", "option_type": "call"}
+        present = {"symbol": "BAC", "expiry": "2026-09-18", "strike": "63", "option_type": "call"}
+        entry = self.order("archived-entry")
+        entry["contract"] = absent
+        message = self.message(content="OPEN archived-entry")
+        message["source_group"] = "source-a"
+        store.observe(message)
+        store.reserve(message, {"action": "OPEN"}, entry, NOW)
+        store.apply_result("archived-entry", {
+            "id": "broker-archived-entry", "status": "filled", "filled_quantity": 2, "fill_price": "1.00",
+        })
+        with store.db:
+            store.db.execute("INSERT INTO positions VALUES (?,?,?,?)",
+                             ("source-a", contract_key(present), 2, ".80"))
+        first_snapshot = self.inventory_snapshot([
+            {"contract": present, "quantity": 2, "available_quantity": 0,
+             "pending_sell_quantity": 2, "pending_other_quantity": 0,
+             "option_id": "option-bac"},
+        ])
+        second_snapshot = first_snapshot | {"timestamp": (NOW + timedelta(milliseconds=2)).isoformat()}
+        broker.inventory_snapshot = AsyncMock(side_effect=[first_snapshot, first_snapshot, second_snapshot])
+
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        result = await evaluator._reconcile_positions()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(evaluator.last_inventory_reconcile["state"], "complete")
+        self.assertEqual(evaluator.last_inventory_reconcile["archived"], 1)
+        self.assertEqual(store.positions(), [dict(source_group="source-a", contract=present,
+                                                  quantity=2, average_price=".80", bot_owned=True)])
+        self.assertEqual(store.db.execute("SELECT quantity FROM positions WHERE contract=?",
+                                          (contract_key(absent),)).fetchone()[0], 0)
+        fill = store.db.execute("SELECT status,filled_quantity,filled_notional FROM orders WHERE id='archived-entry'").fetchone()
+        self.assertEqual((fill["status"], fill["filled_quantity"], fill["filled_notional"]), ("filled", 2, "2.00"))
+        self.assertEqual(store.db.execute("SELECT COUNT(*) FROM events WHERE message_id LIKE 'inventory:%'").fetchone()[0], 1)
+        self.assertEqual(broker.submissions, [])
+
+    async def test_same_contract_across_sources_is_not_assigned_or_zeroed(self):
+        evaluator, store, broker = self.live_recovery()
+        with store.db:
+            for group in ("source-a", "source-b"):
+                store.db.execute("INSERT INTO positions VALUES (?,?,?,?)",
+                                 (group, contract_key(CONTRACT), 1, ".80"))
+        broker.inventory_snapshot = AsyncMock(return_value=self.inventory_snapshot())
+
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        self.assertEqual(len(store.positions()), 2)
+
+    async def test_pending_local_or_broker_orders_keep_inventory_unmodified(self):
+        evaluator, store, broker = self.live_recovery()
+        with store.db:
+            store.db.execute("INSERT INTO positions VALUES (?,?,?,?)",
+                             ("source-a", contract_key(CONTRACT), 1, ".80"))
+        order = self.order("pending-close", side="sell", effect="close", quantity=1)
+        message = self.message(content="CLOSE pending-close")
+        message["source_group"] = "source-a"
+        store.observe(message)
+        store.reserve(message, {"action": "CLOSE"}, order, NOW)
+        broker.inventory_snapshot = AsyncMock(side_effect=AssertionError("unresolved local order must gate inventory"))
+
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        broker.inventory_snapshot.assert_not_awaited()
+        self.assertEqual(store.positions()[0]["quantity"], 1)
+
+        # Once local orders settle, a broker-side working order still blocks absence.
+        store.db.execute("UPDATE orders SET status='canceled' WHERE id='pending-close'")
+        broker.inventory_snapshot = AsyncMock(return_value=self.inventory_snapshot(working=["external-order"]))
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        self.assertEqual(store.positions()[0]["quantity"], 1)
+
+    async def test_inventory_must_be_fresh_and_bound_to_the_configured_account(self):
+        evaluator, store, broker = self.live_recovery()
+        with store.db:
+            store.db.execute("INSERT INTO positions VALUES (?,?,?,?)",
+                             ("source-a", contract_key(CONTRACT), 1, ".80"))
+        broker.inventory_snapshot = AsyncMock(return_value=self.inventory_snapshot(
+            timestamp=(NOW - timedelta(seconds=30)).isoformat()))
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        self.assertEqual(store.positions()[0]["quantity"], 1)
+
+        broker.inventory_snapshot = AsyncMock(return_value=self.inventory_snapshot() | {"account_id": "87654321"})
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        self.assertEqual(store.positions()[0]["quantity"], 1)
 
     async def test_observe_only_reconciles_without_canceling_or_arming_orders(self):
         self.engine.observe_only = True
