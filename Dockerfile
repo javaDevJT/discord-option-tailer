@@ -8,7 +8,7 @@ RUN --mount=type=cache,target=/go/pkg/mod,id=relay-collector-modules \
     --mount=type=cache,target=/root/.cache/go-build,id=relay-collector-build \
     CGO_ENABLED=0 /go/bin/builder --config=/tmp/collector-builder.yaml --skip-compilation \
     && cd /tmp/relay-collector \
-    && go mod edit -require=github.com/go-jose/go-jose/v4@v4.1.6 \
+    && go mod edit -require=github.com/go-jose/go-jose/v4@v4.1.6 -require=golang.org/x/net@v0.62.0 \
     && go mod tidy \
     && CGO_ENABLED=0 go build -p=4 -buildvcs=false -trimpath -ldflags='-s -w' -o /otelcol-contrib .
 

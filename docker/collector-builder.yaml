@@ -1,5 +1,6 @@
 # Exact app-enabled components from the official Collector v0.163.2 manifest.
 # The build requires go-jose/v4 >=v4.1.6 if it is present in the selected graph.
+# The build requires x/net >=v0.62.0 to address GO-2026-6860.
 dist:
   module: github.com/javaDevJT/discord-option-tailer/collector
   name: otelcol-contrib

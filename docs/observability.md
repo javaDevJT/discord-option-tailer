@@ -18,11 +18,12 @@ header; it is not combined with an API-key header or browser credentials.
 The Collector uses the enabled components from the official **0.163.2**
 distribution: component modules **0.163.0** and configuration providers **1.69.0**,
 pinned in [the builder manifest](../docker/collector-builder.yaml). The official
-builder **0.163.0** compiles it with checksum-pinned Go **1.27.3**, requiring
-`go-jose/v4` **4.1.6** or later in the generated module graph. This avoids the
-vulnerable **4.1.5** dependency ([advisory](https://github.com/go-jose/go-jose/security/advisories/GHSA-mgcc-cww5-fp2q)) shipped in the full upstream binary without
-removing any component used by this app. All configured receivers, processors,
-extensions and exporters remain enabled, and the image build validates the
+builder **0.163.0** compiles it with checksum-pinned Go **1.27.3**. Before
+pruning unused dependencies, the build requests the patched versions of
+[`go-jose/v4` **4.1.6**](https://github.com/go-jose/go-jose/security/advisories/GHSA-mgcc-cww5-fp2q)
+and [`golang.org/x/net` **0.62.0**](https://pkg.go.dev/vuln/GO-2026-6860).
+All configured receivers, processors, extensions and exporters remain enabled,
+and the image build validates the
 complete production configuration. Python SDK/exporter **1.45.1** and
 instrumentation **0.66b1** remain pinned in the `telemetry` extra. The final image
 passes the existing test, secret, SBOM, High/Critical and publication gates as
