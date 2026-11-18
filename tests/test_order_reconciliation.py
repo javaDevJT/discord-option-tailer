@@ -156,6 +156,54 @@ class OrderReconciliationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await evaluator._reconcile_positions(), 0)
         self.assertEqual(store.positions()[0]["quantity"], 1)
 
+    async def test_slow_inventory_read_releases_execution_lock_and_discards_intervening_fill(self):
+        evaluator, store, broker = self.live_recovery()
+        with store.db:
+            store.db.execute("INSERT INTO positions VALUES (?,?,?,?)",
+                             ("source-a", contract_key(CONTRACT), 1, ".80"))
+        first = self.inventory_snapshot(timestamp=(NOW + timedelta(milliseconds=1)).isoformat())
+        broker.inventory_snapshot = AsyncMock(return_value=first)
+        self.assertEqual(await evaluator._reconcile_positions(), 0)
+        self.assertEqual(len(evaluator._inventory_absent), 1)
+
+        entered = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def slow_snapshot():
+            entered.set()
+            await resume.wait()
+            return first | {"timestamp": (NOW + timedelta(milliseconds=2)).isoformat()}
+
+        broker.inventory_snapshot = AsyncMock(side_effect=slow_snapshot)
+        reconcile = asyncio.create_task(evaluator._reconcile_positions())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        self.assertFalse(evaluator.engine.lock.locked())
+
+        # Model a real order execution while the independent broker read is in flight.
+        self.assertTrue(await asyncio.wait_for(evaluator.engine.lock.acquire(), timeout=1))
+        try:
+            order = self.order("inventory-intervening-fill", quantity=1)
+            message = self.message(content="OPEN inventory-intervening-fill")
+            message["source_group"] = "source-a"
+            store.observe(message)
+            store.reserve(message, {"action": "OPEN"}, order, NOW)
+            store.apply_result("inventory-intervening-fill", {
+                "id": "broker-inventory-intervening-fill", "status": "filled",
+                "filled_quantity": 1, "fill_price": "1.00",
+            })
+        finally:
+            evaluator.engine.lock.release()
+        resume.set()
+
+        self.assertEqual(await reconcile, 0)
+        self.assertEqual(evaluator.last_inventory_reconcile["state"], "held")
+        self.assertEqual(store.positions()[0]["quantity"], 2)
+        self.assertEqual(evaluator._inventory_absent, {})
+        self.assertEqual(store.db.execute(
+            "SELECT COUNT(*) FROM events WHERE message_id LIKE 'inventory:%'"
+        ).fetchone()[0], 0)
+        self.assertEqual(broker.submissions, [])
+
     async def test_observe_only_reconciles_without_canceling_or_arming_orders(self):
         self.engine.observe_only = True
         self.engine.interpreter = None

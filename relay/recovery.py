@@ -266,14 +266,8 @@ class RecoveryEvaluator:
         if not self.engine.observe_only:
             with failure_stage("stop"):
                 await self.engine.stops.maintain()
-        # Position reconciliation shares the existing startup/periodic order
-        # cadence. It only archives local quantities from a complete, fresh
-        # account snapshot after local order state has settled.
         if rows:
             self._inventory_absent.clear()
-        elif now_mono >= self.next_inventory_reconcile:
-            self.next_inventory_reconcile = now_mono + 60
-            await self._reconcile_positions()
         pending = self.store.db.execute("""SELECT status,action,body FROM orders
             WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 100""").fetchall()
         now = self.engine.clock()
@@ -332,71 +326,82 @@ class RecoveryEvaluator:
             inventory[contract] = position
         return inventory
 
+    def _inventory_execution_state(self):
+        """Capture inventory and execution state for validation after broker I/O."""
+        positions = sorted(self.store.positions(), key=lambda row: (row["source_group"], contract_key(row["contract"])))
+        # Newly inserted orders can complete before the broker read returns.
+        order_watermark = self.store.db.execute("SELECT MAX(rowid) FROM orders").fetchone()[0]
+        pending = self.store.db.execute("""SELECT 1 FROM orders
+                WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 1""").fetchone()
+        stops = self.store.db.execute("""SELECT rowid,contract,generation,order_id,status
+                FROM stop_requests WHERE status IN ('pending','active') ORDER BY rowid""").fetchall()
+        return positions, order_watermark, bool(pending), tuple(stops)
+
     async def _reconcile_positions(self):
         """Zero only a unique local contract absent from settled broker inventory."""
         self.last_inventory_reconcile = {"state": "unavailable", "archived": 0}
         read_inventory = getattr(self.engine.broker, "inventory_snapshot", None)
         if self.engine.mode == "paper" or not callable(read_inventory):
             return 0
-        # Keep local pending, partial, and uncertain executions intact. Their
-        # reservations make absence from one position snapshot inconclusive.
-        if self.store.db.execute("""SELECT 1 FROM orders
-                WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 1""").fetchone():
-            self._inventory_absent.clear()
-            self.last_inventory_reconcile = {"state": "orders_pending", "archived": 0}
-            return 0
-        before = self.store.positions()
-        if not before:
-            self._inventory_absent.clear()
-            return 0
         try:
-            started_at = self.engine.clock()
+            # Engine operations own engine.lock before touching execution
+            # state. Capture briefly, then release it before shared broker I/O.
+            async with self.engine.lock:
+                captured_state = self._inventory_execution_state()
+                before, _, pending, _ = captured_state
+                if pending:
+                    self._inventory_absent.clear()
+                    self.last_inventory_reconcile = {"state": "orders_pending", "archived": 0}
+                    return 0
+                if not before:
+                    self._inventory_absent.clear()
+                    return 0
+                started_at = self.engine.clock()
+
             snapshot = await read_inventory()
-            inventory = self._authoritative_inventory(snapshot, started_at)
-            after = self.store.positions()
-            if before != after:
-                raise Hold("local positions changed during broker inventory review")
-            if self.store.db.execute("""SELECT 1 FROM orders
-                    WHERE status NOT IN ('filled','canceled','rejected','expired') LIMIT 1""").fetchone():
-                raise Hold("local order state changed during broker inventory review")
+            async with self.engine.lock:
+                if self._inventory_execution_state() != captured_state:
+                    raise Hold("local execution state changed during broker inventory review")
+                inventory = self._authoritative_inventory(snapshot, started_at)
 
-            counts = {}
-            for position in before:
-                key = contract_key(position["contract"])
-                counts[key] = counts.get(key, 0) + 1
-
-            absent = {}
-            archived = 0
-            with self.store.db:
-                # Recheck the source attribution and quantity while applying
-                # each zero. Multiple local sources for one contract remain
-                # untouched because aggregate broker inventory cannot assign
-                # ownership between them.
+                counts = {}
                 for position in before:
                     key = contract_key(position["contract"])
-                    if key in inventory or counts[key] != 1:
-                        continue
-                    if self.store.db.execute("""SELECT 1 FROM stop_requests
-                            WHERE contract=? AND status IN ('pending','active') LIMIT 1""", (key,)).fetchone():
-                        continue
-                    identity = (position["source_group"], key, position["quantity"], position["average_price"])
-                    previous = self._inventory_absent.get(identity)
-                    observed = instant(snapshot["timestamp"])
-                    if previous is None or observed <= previous:
-                        absent[identity] = observed
-                        continue
-                    changed = self.store.db.execute("""UPDATE positions SET quantity=0
-                            WHERE source_group=? AND contract=? AND quantity=?""",
-                        (position["source_group"], key, position["quantity"]))
-                    archived += changed.rowcount
-                    if changed.rowcount:
-                        recorded = self.engine.clock().isoformat()
-                        event_id = "inventory:" + hashlib.sha256(json.dumps([identity, recorded]).encode()).hexdigest()
-                        self.store.db.execute("""INSERT INTO events(message_id,revision,state,reason,decision,created_at)
-                                VALUES (?,?,?,?,?,?)""", (event_id, "inventory-v1", "context",
-                            "Local position archived after two complete Robinhood reads confirmed zero holdings; no fill recorded",
-                            json.dumps({"contract": position["contract"], "quantity": position["quantity"]}), recorded))
-            self._inventory_absent = absent
+                    counts[key] = counts.get(key, 0) + 1
+
+                absent = {}
+                archived = 0
+                observed = instant(snapshot["timestamp"])
+                with self.store.db:
+                    # Recheck the source attribution and quantity while applying
+                    # each zero. Multiple local sources for one contract remain
+                    # untouched because aggregate broker inventory cannot assign
+                    # ownership between them.
+                    for position in before:
+                        key = contract_key(position["contract"])
+                        if key in inventory or counts[key] != 1:
+                            continue
+                        if self.store.db.execute("""SELECT 1 FROM stop_requests
+                                WHERE contract=? AND status IN ('pending','active') LIMIT 1""", (key,)).fetchone():
+                            continue
+                        identity = (position["source_group"], key, position["quantity"], position["average_price"])
+                        previous = self._inventory_absent.get(identity)
+                        if (previous is None or observed <= previous[0]
+                                or previous[1] != captured_state):
+                            absent[identity] = (observed, captured_state)
+                            continue
+                        changed = self.store.db.execute("""UPDATE positions SET quantity=0
+                                WHERE source_group=? AND contract=? AND quantity=?""",
+                            (position["source_group"], key, position["quantity"]))
+                        archived += changed.rowcount
+                        if changed.rowcount:
+                            recorded = self.engine.clock().isoformat()
+                            event_id = "inventory:" + hashlib.sha256(json.dumps([identity, recorded]).encode()).hexdigest()
+                            self.store.db.execute("""INSERT INTO events(message_id,revision,state,reason,decision,created_at)
+                                    VALUES (?,?,?,?,?,?)""", (event_id, "inventory-v1", "context",
+                                "Local position archived after two complete Robinhood reads confirmed zero holdings; no fill recorded",
+                                json.dumps({"contract": position["contract"], "quantity": position["quantity"]}), recorded))
+                self._inventory_absent = absent
             self.last_inventory_reconcile = {
                 "state": "complete", "archived": archived,
                 "timestamp": snapshot["timestamp"],
@@ -411,6 +416,26 @@ class RecoveryEvaluator:
             execution_failure(exc, stage="position_reconciliation", context={"action": "RECONCILE"})
             self.last_inventory_reconcile = {"state": "unavailable", "archived": 0}
             return 0
+
+    async def inventory_reconcile_loop(self):
+        """Run inventory checks independently of the execution-locked order loop."""
+        while True:
+            delay = max(0.0, self.next_inventory_reconcile - time.monotonic())
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._reconcile_positions()
+                if self.last_inventory_reconcile.get("state") == "orders_pending":
+                    # Preserve the order loop's prompt retry after unresolved
+                    # orders settle without polling Robinhood during that time.
+                    await asyncio.sleep(1)
+                else:
+                    self.next_inventory_reconcile = time.monotonic() + 60
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                execution_failure(exc, stage="position_reconciliation", context={"action": "RECONCILE"})
+                self.next_inventory_reconcile = time.monotonic() + 1
 
     async def reconcile_loop(self, emit=None):
         """Keep broker order state current independently of message recovery."""
