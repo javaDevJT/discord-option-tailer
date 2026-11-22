@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -18,6 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .incidents_auth import codex_auth_attention, t3_auth_attention
 from .status import AUTH_REQUIRED_STATES
 from .telemetry import traced
 from .pacing import discord_delay
@@ -26,6 +28,7 @@ from .pacing import discord_delay
 UTC = timezone.utc
 WEBHOOK_PATH = re.compile(r"^/api/(?:v10/)?webhooks/(\d+)/([A-Za-z0-9._-]+)$")
 MESSAGE_ID = re.compile(r"^\d{15,22}$")
+ROLE_ID = re.compile(r"^\d{15,22}$")
 SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 EXPIRY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SAFE_STATES = {"starting", "running", "retrying", "error", "disabled", "configuration_required", "unavailable"}
@@ -325,66 +328,132 @@ def _projection(decision, *, fallback_action=None, fallback_contract=None, fallb
     return result
 
 
-def _format_projection(projection):
-    parts = []
-    expiry = projection.get("expiry_status")
-    if expiry:
-        parts.append("Expiry exercise protection")
-        if expiry in {"unfilled", "blocked", "unavailable", "market_closed"}:
-            parts.append("— remaining inventory may exercise; check broker immediately —")
-    if projection.get("action"):
-        parts.append(projection["action"])
+def _payload(content, *, embed=None, allowed_mentions=None):
+    payload = {
+        "content": content[:2000],
+        "allowed_mentions": allowed_mentions or {"parse": []},
+    }
+    if embed is not None:
+        payload["embeds"] = [embed]
+    return payload
+
+
+_EMBED_COLORS = {
+    "info": 0x5865F2,
+    "success": 0x57F287,
+    "warning": 0xFEE75C,
+    "danger": 0xED4245,
+}
+
+
+def _embed_field(name, value, *, inline=False):
+    rendered = str(value).strip()
+    if not rendered:
+        rendered = "Not available"
+    return {"name": str(name)[:256], "value": rendered[:1024], "inline": bool(inline)}
+
+
+def _projection_fields(projection):
+    """Build Discord fields exclusively from the already-sanitized projection."""
+
+    fields = []
+    action = projection.get("action")
+    if action:
+        fields.append(_embed_field("Action", action, inline=True))
     contract = projection.get("contract")
     if contract:
-        parts.append(
-            f"{contract['symbol']} {contract['expiry']} {contract['strike']} {contract['option_type']}"
-        )
-    if projection.get("quantity"):
-        parts.append(f"x{projection['quantity']}")
-    if projection.get("price"):
-        parts.append(f"at ${projection['price']}")
+        fields.append(_embed_field(
+            "Contract",
+            f"{contract['symbol']} · {contract['expiry']} · ${contract['strike']} {contract['option_type'].title()}",
+        ))
+    quantity = projection.get("quantity")
+    if quantity:
+        fields.append(_embed_field("Quantity", f"{quantity} contract{'s' if quantity != 1 else ''}", inline=True))
+    price = projection.get("price")
+    if price:
+        fields.append(_embed_field("Limit / reference price", f"${price}", inline=True))
+
     evaluation = projection.get("entry_evaluation")
-    if evaluation:
-        deviation = evaluation["ask_deviation_percent"]
-        deviation = deviation if deviation.startswith("-") else "+" + deviation
-        parts.append(f"— evaluated ask ${evaluation['ask']} ({deviation}% vs alert)")
-        if "reference_price" in evaluation:
-            parts.append(f"alert ${evaluation['reference_price']}")
-        if "max_chase_percent" in evaluation:
-            parts.append(f"chase cap {evaluation['max_chase_percent']}%")
-        if "limit_price" in evaluation and "limit_deviation_percent" in evaluation:
-            limit_deviation = evaluation["limit_deviation_percent"]
-            limit_deviation = limit_deviation if limit_deviation.startswith("-") else "+" + limit_deviation
-            parts.append(f"limit ${evaluation['limit_price']} ({limit_deviation}%)")
+    if isinstance(evaluation, dict):
+        parts = []
+        if evaluation.get("ask"):
+            parts.append(f"Evaluated ask ${evaluation['ask']}")
+        if evaluation.get("ask_deviation_percent"):
+            deviation = evaluation["ask_deviation_percent"]
+            if not deviation.startswith("-"):
+                deviation = "+" + deviation
+            parts.append(f"{deviation}% vs alert")
+        if evaluation.get("reference_price"):
+            parts.append(f"Alert ${evaluation['reference_price']}")
+        if evaluation.get("max_chase_percent"):
+            parts.append(f"Chase cap {evaluation['max_chase_percent']}%")
+        if evaluation.get("limit_price"):
+            limit = f"Limit ${evaluation['limit_price']}"
+            if evaluation.get("limit_deviation_percent"):
+                deviation = evaluation["limit_deviation_percent"]
+                if not deviation.startswith("-"):
+                    deviation = "+" + deviation
+                limit += f" ({deviation}%)"
+            parts.append(limit)
+        if parts:
+            fields.append(_embed_field("Entry evaluation", " · ".join(parts)))
+
+    expiry = projection.get("expiry_status")
+    if expiry:
+        labels = {
+            "watching": "Monitoring expiry",
+            "closing": "Closing before expiry",
+            "blocked": "Blocked; review required",
+            "unfilled": "Unfilled; check broker immediately",
+            "unavailable": "Unavailable; check broker immediately",
+            "market_closed": "Market closed; check broker immediately",
+        }
+        fields.append(_embed_field("Expiry protection", labels.get(expiry, "Status unknown")))
+
     stop_evaluation = projection.get("stop_evaluation")
     if isinstance(stop_evaluation, dict):
         status = stop_evaluation.get("status")
-        label = {
+        labels = {
             "shadow": "Protection shadow",
             "pending": "Protection pending",
             "active": "Protection active",
             "complete": "Protection complete",
             "blocked": "Protection blocked",
-        }.get(status, "Protection status unknown")
-        stop_text = label
+        }
+        value = labels.get(status, "Protection status unknown")
         if stop_evaluation.get("stop_price"):
-            stop_text += f" at ${stop_evaluation['stop_price']}"
+            value += f" at ${stop_evaluation['stop_price']}"
         if status == "shadow":
-            stop_text += "; no order submitted"
-        parts.append(stop_text)
+            value += "; no order submitted"
+        fields.append(_embed_field("Stop evaluation", value))
+
     protection = projection.get("protection")
     if isinstance(protection, dict):
         order_type = protection.get("order_type")
-        label = "Native stop market order" if order_type == "stop_market" else "Protection market exit"
+        value = "Native stop market order" if order_type == "stop_market" else "Protection market exit"
         stop_price = protection.get("stop_price") or protection.get("requested_stop_price")
         if stop_price:
-            label += f" at ${stop_price}"
-        parts.append(label)
-    return " ".join(parts) or "an option action"
+            value += f" at ${stop_price}"
+        fields.append(_embed_field("Protection order", value))
+    return fields
 
 
-def _payload(content):
-    return {"content": content[:2000], "allowed_mentions": {"parse": []}}
+def _action_payload(*, title, tone, mode, projection, status, urgent=False):
+    fields = [_embed_field("Mode", mode, inline=True)]
+    fields.append(_embed_field("Status", status, inline=True))
+    fields.extend(_projection_fields(projection))
+    if mode == "Live" and (
+        urgent or projection.get("expiry_status") in {"blocked", "unfilled", "unavailable", "market_closed"}
+    ):
+        mention, allowed_mentions = _configured_alert_mention()
+    else:
+        mention, allowed_mentions = "", {"parse": []}
+    embed = {
+        "title": title[:256],
+        "color": _EMBED_COLORS[tone],
+        "fields": fields[:25],
+    }
+    return _payload(mention, embed=embed, allowed_mentions=allowed_mentions)
 
 
 def _fingerprint(value):
@@ -422,17 +491,20 @@ def _event_candidate(row, *, mode, order_ids, order_message_ids):
     )
     projection = _projection(decision)
     if state == "shadow_order":
-        content = f"{label} proposal: {_format_projection(projection)}."
+        title, tone, status = "Shadow proposal", "info", "Proposed"
     elif state == "held":
-        content = f"{label} action held for review: {_format_projection(projection)}."
+        title, tone, status = "Action held for review", "warning", "Held for review"
     elif state == "unknown":
-        content = f"{label} action needs reconciliation: {_format_projection(projection)}."
+        title, tone, status = "Action needs reconciliation", "danger", "Needs reconciliation"
     elif state == "error":
-        content = f"{label} action failed and needs assistance: {_format_projection(projection)}."
+        title, tone, status = "Action failed", "danger", "Assistance needed"
     else:
-        content = f"{label} action taken: {_format_projection(projection)}."
+        title, tone, status = "Action taken", "success", "Recorded"
     safe = {"state": state, "mode": label, "decision": projection}
-    return _Candidate("event", str(row["id"]), _fingerprint(safe), _payload(content))
+    payload = _action_payload(
+        title=title, tone=tone, mode=label, projection=projection, status=status, urgent=state == "unknown",
+    )
+    return _Candidate("event", str(row["id"]), _fingerprint(safe), payload)
 
 
 def _order_candidate(row, *, mode):
@@ -459,36 +531,42 @@ def _order_candidate(row, *, mode):
     )
     label = MODE_LABELS.get(mode, "Relay")
     if status == "unknown":
-        prefix = f"{label} order needs reconciliation"
+        title, tone = "Order needs reconciliation", "danger"
     elif status in {"filled", "submitted", "open", "partially_filled", "pending", "submitting"}:
-        prefix = f"{label} action taken"
+        title, tone = "Order update", "success"
     else:
-        prefix = f"{label} order update"
-    content = f"{prefix}: {_format_projection(projection)} ({status})."
+        title, tone = "Order update", "warning"
     safe = {
         "id": str(row["id"]), "status": status, "mode": label, "decision": projection,
         "filled_quantity": row["filled_quantity"] if type(row["filled_quantity"]) is int else 0,
     }
-    return _Candidate("order", str(row["id"]), _fingerprint(safe), _payload(content))
+    payload = _action_payload(
+        title=title, tone=tone, mode=label, projection=projection,
+        status=status.replace("_", " ").title(), urgent=status == "unknown",
+    )
+    return _Candidate("order", str(row["id"]), _fingerprint(safe), payload)
 
 
 def _runtime_issues(path, now=None):
+    issues = {"t3": "reauth"} if t3_auth_attention(path, now) else {}
     try:
         if not path.is_file() or path.stat().st_size > 1024 * 1024:
-            return {"worker": "unavailable"}
+            return issues | {"worker": "unavailable"}
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
-        return {"worker": "unavailable"}
+        return issues | {"worker": "unavailable"}
     if not isinstance(value, dict):
-        return {"worker": "unavailable"}
+        return issues | {"worker": "unavailable"}
     worker_state = str(value.get("state", "")).lower()
     heartbeat = _parse_time(value.get("heartbeat_at")) or _parse_time(value.get("updated_at"))
     if heartbeat is not None:
         reference = _timestamp(now) if now is not None else datetime.now(UTC)
         age = (reference - heartbeat).total_seconds()
         if age > STALE_SECONDS or age < -5:
-            return {"worker": "unavailable"}
-    issues = {}
+            issues["worker"] = "unavailable"
+            if codex_auth_attention(path, value, now):
+                issues["codex"] = "reauth"
+            return issues
     for key, _ in PROVIDERS:
         section = value.get(key)
         if not isinstance(section, dict):
@@ -496,27 +574,62 @@ def _runtime_issues(path, now=None):
         state = str(section.get("state", "")).lower()
         if (section.get("auth_required") is True
                 or section.get("reauth_required") is True
-                or state in AUTH_REQUIRED_STATES):
+                or state in AUTH_REQUIRED_STATES
+                or state in {"credential_missing", "credentials_missing"}):
             issues[key] = "reauth"
         elif state in {"unavailable", "unknown"}:
             issues[key] = "unavailable"
         elif state in {"error", "needs_attention"}:
             issues[key] = "error"
+    if codex_auth_attention(path, value, now):
+        issues["codex"] = "reauth"
     if worker_state in {"error", "stopped", "unavailable"} and not issues:
         issues["worker"] = "error" if worker_state == "error" else "unavailable"
     return issues
 
 
 def _runtime_payload(provider, issue):
-    labels = dict(PROVIDERS) | {"worker": "relay worker"}
+    labels = dict(PROVIDERS) | {"worker": "relay worker", "t3": "T3 incident webhook"}
     label = labels.get(provider, "relay worker")
-    if issue == "reauth":
-        content = f"Assistance needed: {label} reauthentication is required."
+    if provider == "t3":
+        title = "T3 webhook authorization rejected"
+        detail = "Check the webhook URL and signing secret in the relay container environment."
+    elif issue == "reauth":
+        title = f"{label} reauthentication required"
+        detail = "Open Setup and reconnect this provider."
     elif issue == "error":
-        content = f"Assistance needed: {label} connection failed; check the relay connection."
+        title = f"{label} connection failed"
+        detail = "Open the relay dashboard and check the provider status."
     else:
-        content = f"Assistance needed: {label} connection is unavailable; check the relay connection."
-    return _payload(content)
+        title = f"{label} unavailable"
+        detail = "Check whether the relay is running and the provider is reachable."
+
+    mention, allowed_mentions = _configured_alert_mention()
+    embed = {
+        "title": title[:256],
+        "description": detail,
+        "color": _EMBED_COLORS["danger" if issue in {"reauth", "error"} else "warning"],
+        "footer": {"text": "Discord Option Tailer"},
+    }
+    return _payload(mention, embed=embed, allowed_mentions=allowed_mentions)
+
+
+def _configured_alert_mention():
+    """Return an allowed top-level mention policy, failing closed on bad config."""
+
+    configured = os.environ.get("RELAY_DISCORD_ALERT_MENTION", "here")
+    if not isinstance(configured, str):
+        return "", {"parse": []}
+    configured = configured.strip().lower()
+    if configured == "none":
+        return "", {"parse": []}
+    if configured == "here":
+        return "@here", {"parse": ["everyone"]}
+    if configured == "everyone":
+        return "@everyone", {"parse": ["everyone"]}
+    if ROLE_ID.fullmatch(configured):
+        return f"<@&{configured}>", {"parse": [], "roles": [configured]}
+    return "", {"parse": []}
 
 
 def _meta(db, key, default=""):
@@ -876,7 +989,7 @@ class NotificationWorker:
                 "INSERT OR IGNORE INTO outbox(dedup_key,payload,created_at) VALUES (?,?,?)",
                 (dedup_key, json.dumps(_runtime_payload(provider, issue), separators=(",", ":")), now.isoformat()),
             )
-        known = {key for key, _ in PROVIDERS} | {"worker"}
+        known = {key for key, _ in PROVIDERS} | {"worker", "t3"}
         for provider in known - set(issues):
             key = f"runtime:{provider}"
             if _meta(db, key, ""):

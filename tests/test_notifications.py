@@ -16,17 +16,24 @@ WEBHOOK = "https://discord.com/api/webhooks/123456789012345678/" + "a" * 68
 UTC = timezone.utc
 
 
+def embed_text(payload):
+    return json.dumps(payload["embeds"][0])
+
+
 class NotificationTests(unittest.TestCase):
     def test_expiry_exit_and_unfilled_risk_reach_sanitized_notifications(self):
         decision = {"action": "CLOSE", "expiry_exit": {"status": "unfilled", "provider_response": "SECRET"}}
         event = {"id": 1, "state": "held", "message_id": "expiry:example", "decision": json.dumps(decision)}
-        alert = notifications._event_candidate(event, mode="live", order_ids=set(), order_message_ids=set())
-        self.assertIn("Expiry exercise protection", alert.payload["content"])
-        self.assertIn("check broker immediately", alert.payload["content"])
+        with patch.dict(notifications.os.environ, {"RELAY_DISCORD_ALERT_MENTION": "here"}):
+            alert = notifications._event_candidate(event, mode="live", order_ids=set(), order_message_ids=set())
+        self.assertEqual(alert.payload["content"], "@here")
+        self.assertEqual(alert.payload["allowed_mentions"], {"parse": ["everyone"]})
+        self.assertIn("Expiry protection", embed_text(alert.payload))
+        self.assertIn("check broker immediately", embed_text(alert.payload))
         self.assertNotIn("SECRET", json.dumps(alert.payload))
         order = {"id": "order", "status": "open", "body": json.dumps(decision), "action": "CLOSE", "filled_quantity": 0}
         alert = notifications._order_candidate(order, mode="live")
-        self.assertIn("Expiry exercise protection", alert.payload["content"])
+        self.assertIn("Expiry protection", embed_text(alert.payload))
 
     def test_chase_diagnostics_are_numeric_and_reach_hold_and_order_notifications(self):
         evaluation = {"ask": "1.16", "reference_price": "1.00", "ask_deviation_percent": "16",
@@ -35,16 +42,19 @@ class NotificationTests(unittest.TestCase):
         decision = {"action": "OPEN", "entry_evaluation": evaluation}
         event = {"id": 1, "state": "held", "message_id": "1", "decision": json.dumps(decision)}
         held = notifications._event_candidate(event, mode="live", order_ids=set(), order_message_ids=set())
-        self.assertIn("evaluated ask $1.16 (+16% vs alert)", held.payload["content"])
-        self.assertIn("chase cap 15%", held.payload["content"])
-        self.assertIn("limit $1.2 (+20%)", held.payload["content"])
+        self.assertIn("Evaluated ask $1.16", embed_text(held.payload))
+        self.assertIn("Chase cap 15%", embed_text(held.payload))
+        self.assertIn("Limit $1.2 (+20%)", embed_text(held.payload))
         order = {"id": "order", "status": "filled", "body": json.dumps({"side": "buy", "position_effect": "open", "entry_evaluation": evaluation}),
                  "action": "OPEN", "filled_quantity": 1}
         entered = notifications._order_candidate(order, mode="live")
-        self.assertIn("evaluated ask $1.16 (+16% vs alert)", entered.payload["content"])
+        self.assertIn("+16% vs alert", embed_text(entered.payload))
         self.assertNotIn("SECRET", json.dumps(entered.payload))
         evaluation["ask_deviation_percent"] = "-5"
-        self.assertIn("(-5% vs alert)", notifications._format_projection(notifications._projection(decision)))
+        candidate = notifications._event_candidate(
+            {**event, "decision": json.dumps(decision)}, mode="live", order_ids=set(), order_message_ids=set(),
+        )
+        self.assertIn("-5% vs alert", embed_text(candidate.payload))
         evaluation["ask"] = "NaN"
         self.assertNotIn("entry_evaluation", notifications._projection(decision))
 
@@ -53,6 +63,106 @@ class NotificationTests(unittest.TestCase):
         path.write_text(json.dumps({"state": "error", "heartbeat_at": datetime.now(UTC).isoformat(),
                                     "broker": {"state": "auth_required"}}))
         self.assertEqual(notifications._runtime_issues(path), {"broker": "reauth"})
+
+    def test_codex_auth_attention_overrides_ready_runtime_snapshot(self):
+        now = datetime.now(UTC)
+        path = self.state / "runtime-status.json"
+        runtime = {"state": "running", "heartbeat_at": now.isoformat(),
+                   "codex": {"state": "ready", "updated_at": now.isoformat()}}
+        path.write_text(json.dumps(runtime), encoding="utf-8")
+        with patch.object(notifications, "codex_auth_attention", return_value=True) as attention:
+            self.assertEqual(notifications._runtime_issues(path, now=now), {"codex": "reauth"})
+        attention.assert_called_once_with(path, runtime, now)
+
+    def test_missing_credential_state_aliases_are_reauthentication_issues(self):
+        now = datetime.now(UTC)
+        path = self.state / "runtime-status.json"
+        for state in ("credential_missing", "credentials_missing"):
+            with self.subTest(state=state):
+                path.write_text(json.dumps({"state": "running", "heartbeat_at": now.isoformat(),
+                                            "codex": {"state": state}}), encoding="utf-8")
+                with patch.object(notifications, "codex_auth_attention", return_value=False):
+                    self.assertEqual(notifications._runtime_issues(path, now=now), {"codex": "reauth"})
+
+    def test_action_update_uses_sanitized_structured_embed_without_ping(self):
+        decision = {
+            "action": "OPEN",
+            "contract": {"symbol": "SPY", "expiry": "2026-09-18", "strike": "600", "option_type": "call"},
+            "quantity": 2,
+            "alert_price": "0.80",
+            "entry_evaluation": {
+                "ask": "0.92", "reference_price": "0.80", "ask_deviation_percent": "15",
+                "max_chase_percent": "10", "provider_response": "PRIVATE RESPONSE",
+            },
+            "reason": "PRIVATE REASON",
+        }
+        row = {"id": 4, "state": "held", "message_id": "4", "decision": json.dumps(decision)}
+        candidate = notifications._event_candidate(row, mode="live", order_ids=set(), order_message_ids=set())
+        payload = candidate.payload
+        self.assertEqual(payload["allowed_mentions"], {"parse": []})
+        embed = payload["embeds"][0]
+        self.assertEqual(embed["title"], "Action held for review")
+        self.assertEqual(embed["color"], notifications._EMBED_COLORS["warning"])
+        fields = {field["name"]: field["value"] for field in embed["fields"]}
+        self.assertIn("SPY", fields["Contract"])
+        self.assertIn("2 contracts", fields["Quantity"])
+        self.assertIn("Evaluated ask $0.92", fields["Entry evaluation"])
+        encoded = json.dumps(payload)
+        self.assertNotIn("PRIVATE RESPONSE", encoded)
+        self.assertNotIn("PRIVATE REASON", encoded)
+        self.assertNotIn("@here", payload["content"])
+
+    def test_runtime_incident_mention_configuration_is_scoped_and_fails_closed(self):
+        with patch.dict(notifications.os.environ, {}, clear=True):
+            default = notifications._runtime_payload("codex", "reauth")
+        self.assertEqual(default["content"], "@here")
+        self.assertEqual(default["allowed_mentions"], {"parse": ["everyone"]})
+        self.assertIn("reauthentication required", default["embeds"][0]["title"])
+
+        configurations = (
+            ("none", "", {"parse": []}),
+            ("everyone", "@everyone", {"parse": ["everyone"]}),
+            ("123456789012345678", "<@&123456789012345678>",
+             {"parse": [], "roles": ["123456789012345678"]}),
+            ("@here", "", {"parse": []}),
+        )
+        for value, expected_content, allowed in configurations:
+            with self.subTest(value=value), patch.dict(notifications.os.environ, {"RELAY_DISCORD_ALERT_MENTION": value}):
+                payload = notifications._runtime_payload("broker", "unavailable")
+            self.assertEqual(payload["content"], expected_content)
+            self.assertEqual(payload["allowed_mentions"], allowed)
+
+        with patch.dict(notifications.os.environ, {"RELAY_DISCORD_ALERT_MENTION": "here"}):
+            action = notifications._event_candidate(
+                {"id": 1, "state": "held", "message_id": "1", "decision": "{}"},
+                mode="live", order_ids=set(), order_message_ids=set(),
+            ).payload
+        self.assertNotIn("@here", action["content"])
+        self.assertEqual(action["allowed_mentions"], {"parse": []})
+
+    def test_legacy_outbox_replay_keeps_its_saved_unpinged_payload(self):
+        now = datetime.now(UTC)
+        (self.state / "runtime-status.json").write_text(
+            json.dumps({"state": "running", "heartbeat_at": now.isoformat()}), encoding="utf-8",
+        )
+        sent = []
+        worker = NotificationWorker(self.config_path, sender=sent.append, clock=lambda: now)
+        worker.poll()
+        legacy = {"content": "Previously queued issue", "allowed_mentions": {"parse": []}}
+        db = notifications._open_state(worker.db_path)
+        try:
+            db.execute(
+                "INSERT INTO outbox(dedup_key,payload,created_at) VALUES (?,?,?)",
+                ("legacy:issue", json.dumps(legacy, separators=(",", ":")), now.isoformat()),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with patch.dict(notifications.os.environ, {"RELAY_DISCORD_ALERT_MENTION": "here"}):
+            result = worker.poll()
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(sent, [legacy])
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="notifications-")
@@ -194,8 +304,9 @@ class NotificationTests(unittest.TestCase):
         first = worker.poll()
         self.assertEqual(first["state"], "running")
         self.assertEqual(len(sent), 1)
-        self.assertIn("Codex reauthentication", sent[0]["content"])
-        self.assertEqual(sent[0]["allowed_mentions"], {"parse": []})
+        self.assertIn("Codex reauthentication", embed_text(sent[0]))
+        self.assertEqual(sent[0]["content"], "@here")
+        self.assertEqual(sent[0]["allowed_mentions"], {"parse": ["everyone"]})
         encoded = json.dumps(sent[0])
         self.assertNotIn("secret source text", encoded)
         self.assertNotIn("do not disclose", encoded)
@@ -212,7 +323,7 @@ class NotificationTests(unittest.TestCase):
         result = NotificationWorker(self.config_path, sender=sent.append).poll()
         self.assertEqual(result["state"], "running")
         self.assertEqual(len(sent), 1)
-        self.assertIn("Codex reauthentication", sent[0]["content"])
+        self.assertIn("Codex reauthentication", embed_text(sent[0]))
 
     def test_ledger_read_failure_keeps_runtime_worker_alive(self):
         status = self.state / "runtime-status.json"
@@ -223,7 +334,7 @@ class NotificationTests(unittest.TestCase):
             result = worker.poll()
         self.assertEqual(result["state"], "retrying")
         self.assertEqual(len(sent), 1)
-        self.assertIn("Codex reauthentication", sent[0]["content"])
+        self.assertIn("Codex reauthentication", embed_text(sent[0]))
 
     def test_unknown_event_with_order_row_is_not_duplicated(self):
         now = datetime(2026, 9, 8, tzinfo=UTC)
@@ -257,7 +368,7 @@ class NotificationTests(unittest.TestCase):
         connection.close()
         result = worker.poll()
         self.assertEqual(result["sent"], 1)
-        self.assertIn("needs reconciliation", sent[0]["content"])
+        self.assertIn("needs reconciliation", embed_text(sent[0]))
 
     def test_new_events_are_paginated_and_orders_are_read_only(self):
         worker = NotificationWorker(self.config_path, sender=lambda payload: None)
@@ -369,7 +480,7 @@ class NotificationTests(unittest.TestCase):
         result = restarted.poll()
         self.assertEqual(result["sent"], 1)
         self.assertEqual(len(calls), 2)
-        self.assertIn("Shadow proposal", calls[1]["content"])
+        self.assertIn("Shadow proposal", embed_text(calls[1]))
 
     def test_status_defaults_disabled_and_hides_invalid_or_private_state(self):
         disabled = self.root / "disabled.json"
@@ -398,7 +509,7 @@ class NotificationTests(unittest.TestCase):
         restarted = NotificationWorker(self.config_path, sender=sent.append, clock=lambda: now)
         self.assertEqual(restarted.poll()["sent"], 0)
         self.assertEqual(len(sent), 2)
-        self.assertTrue(all("Robinhood reauthentication" in payload["content"] for payload in sent))
+        self.assertTrue(all("Robinhood reauthentication" in embed_text(payload) for payload in sent))
 
 
 if __name__ == "__main__":

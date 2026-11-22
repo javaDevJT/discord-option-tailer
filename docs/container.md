@@ -90,7 +90,17 @@ Authentication, account inspection, and order execution are separate stages. Set
 
 **Setup → Discord output webhook** is an optional output destination. Paste a valid Discord webhook URL, enable notifications, and save. The URL is stored privately and stays hidden after saving; disabling notifications keeps the saved URL, while removing it clears the destination.
 
-Notifications can report authentication assistance and relay actions with a Paper, Shadow, or Live label. They are separate from the personal Discord account used as input. Message bodies, account identifiers, OAuth codes, and credentials are omitted, and no test post is sent by setup.
+Notifications use embeds for authentication issues, relay actions and order updates. Order cards label Paper, Shadow or Live and include structured details such as contract, quantity and evaluated price, when available. Use `RELAY_DISCORD_ALERT_MENTION` to choose `here` (the default), `everyone`, a numeric Discord role ID, or `none`. Discord must allow the chosen mention in the destination channel. Connection issues, uncertain live orders and urgent live expiry alerts can ping. Routine updates and normal risk holds are silent. A saved notification keeps its original mention policy if it is still waiting to send.
+
+Message bodies, account identifiers, OAuth codes and credentials are omitted. Setup sends no test post.
+
+### T3 incident escalation
+
+The optional incident worker runs next to the relay and reads bounded structured diagnostics and the runtime heartbeat. A current credential issue goes through the installed Discord notification worker. A new application failure, sustained connection problem or stale relay heartbeat can escalate to T3 after the worker has recent evidence of healthy Discord, Codex and Robinhood credentials. Paper mode counts its simulated broker as ready. Normal guard holds and failures logged before first activation are excluded.
+
+Set both `RELAY_T3_WEBHOOK_URL` and `RELAY_T3_WEBHOOK_SIGNING_SECRET` in the container environment. Leave both empty to disable remote escalation. Keep both values private. The worker sends JSON to the configured `relay.t3.codes` task URL, signed over the exact UTF-8 bytes in `X-Hub-Signature-256: sha256=<lowercase hex digest>`. Configure that header, prefix, and hex encoding in the destination task. The request contains the event `relay.incident`, an incident ID, a fingerprint, a short summary, a suggested read-only check, and allowlisted diagnostics such as a failure code, tool, source line, and revision. The destination task's prompt and approval settings govern what it does with the report.
+
+Codex uses the existing isolated ChatGPT session to summarize those diagnostic facts. If the session is busy or the summary fails validation, the worker sends a structured fallback summary. A Codex authentication failure discovered during summarization alerts Discord and defers T3. Discord also reports HTTP 401 or 403 from the T3 receiver so the operator can check its webhook credentials. A persistent local journal limits delivery to one attempt per five minutes and one attempt per matching failure per hour. Ambiguous webhook failures are recorded locally without automatic retries because the remote task may already have started. Failed dispatches and active delivery are independent of order handling.
 
 ## Choose Shadow, Paper, or Live
 

@@ -14,6 +14,7 @@ Fresh Docker volumes start in **Shadow** mode. Shadow can read current broker da
 - [Codex position monitoring](docs/container.md#codex-position-monitoring): bounded broker polling, saved triggers, restart recovery, and Codex reassessment without another Discord post.
 
 - [Execution failure diagnostics](docs/container.md#execution-failure-diagnostics): inspect named dispatch checks, chained causes, correlation IDs, and persistent credential-safe logs.
+- [Incident escalation](docs/container.md#t3-incident-escalation): signed Codex summaries for application failures and Discord alerts for reauthentication.
 - [Discord updates and message history](docs/container.md#discord-updates-and-message-history): distinguish unchanged notifications, actual edits, and prior evaluations.
 - [Discord connection recovery](docs/container.md#discord-input): bounded channel resolution and explicit access, missing-channel and reauthentication errors.
 

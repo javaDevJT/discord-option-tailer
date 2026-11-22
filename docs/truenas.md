@@ -20,6 +20,8 @@ Replace the dataset path and LAN address. Keep this file private (`chmod 600`) a
 
 With the TrueNAS Apps UI, choose **Apps → Discover Apps → Install via YAML** (called **Custom App** on some SCALE releases), paste or upload `compose.truenas.yaml`, and set the listed environment values and host path in the form. Apps installations do not necessarily read a neighboring `.env`; enter the values in the form or substitute them in a private YAML copy. Preserve the `127.0.0.1:8766:8766` callback mapping and the `/data` dataset bind.
 
+To enable [T3 incident escalation](container.md#t3-incident-escalation), set `RELAY_T3_WEBHOOK_URL` and `RELAY_T3_WEBHOOK_SIGNING_SECRET` in the app's private environment. Update both values together. Use `RELAY_DISCORD_ALERT_MENTION` to choose who receives urgency pings. Avoid displaying rendered Compose configuration with credentials expanded. For Compose validation, use `config --quiet`.
+
 Validate and start from the directory containing the files:
 
 ```sh

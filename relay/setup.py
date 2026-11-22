@@ -1496,7 +1496,7 @@ class SetupManager:
             # Device authentication must not inherit an API key or desktop
             # app control channel into the fixed login command.
             for key in list(environment):
-                if key.startswith("OPENAI_") or key in {"CODEX_APP_TOOLS_PIPE_PATH", "CODEX_SESSION_ID", "CODEX_THREAD_ID"}:
+                if key.startswith(("OPENAI_", "RELAY_T3_WEBHOOK_")) or key in {"CODEX_APP_TOOLS_PIPE_PATH", "CODEX_SESSION_ID", "CODEX_THREAD_ID"}:
                     environment.pop(key, None)
             process = subprocess.Popen(
                 [executable, "login", "--device-auth", "-c", 'cli_auth_credentials_store="file"'],

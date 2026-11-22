@@ -14,7 +14,7 @@ from relay.dashboard import (
     _project_position,
     _project_stop_evaluation,
 )
-from relay.notifications import _event_candidate, _format_projection, _order_candidate, _projection
+from relay.notifications import _event_candidate, _order_candidate, _projection, _projection_fields
 
 
 CONTRACT = {
@@ -138,22 +138,22 @@ class StopDisplayTests(unittest.TestCase):
                 "contract": CONTRACT,
                 "stop_evaluation": {"status": status, "stop_price": "0.80", "provider_response": "SECRET"},
             })
-            content = _format_projection(projection)
+            content = json.dumps(_projection_fields(projection))
             self.assertNotIn("Protection active", content)
             self.assertNotIn("SECRET", content)
 
-        active = _format_projection(_projection({
+        active = json.dumps(_projection_fields(_projection({
             "action": "REDUCE",
             "contract": CONTRACT,
             "stop_evaluation": {"status": "active", "stop_price": "0.80"},
-        }))
+        })))
         self.assertIn("Protection active at $0.8", active)
 
-        shadow = _format_projection(_projection({
+        shadow = json.dumps(_projection_fields(_projection({
             "action": "REDUCE",
             "contract": CONTRACT,
             "stop_evaluation": {"status": "shadow", "stop_price": "0.80"},
-        }))
+        })))
         self.assertIn("Protection shadow at $0.8; no order submitted", shadow)
 
     def test_order_notification_describes_native_stop_without_claiming_active(self):
@@ -170,8 +170,9 @@ class StopDisplayTests(unittest.TestCase):
                 "quantity": 2,
             }),
         }, mode="paper")
-        self.assertIn("Native stop market order at $0.8", alert.payload["content"])
-        self.assertNotIn("Protection active", alert.payload["content"])
+        embed_text = json.dumps(alert.payload["embeds"][0])
+        self.assertIn("Native stop market order at $0.8", embed_text)
+        self.assertNotIn("Protection active", embed_text)
 
     def test_existing_views_contain_bounded_protection_rows(self):
         source = (Path(__file__).parents[1] / "relay" / "static" / "app.js").read_text(encoding="utf-8")

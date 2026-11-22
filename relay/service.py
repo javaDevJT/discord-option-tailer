@@ -82,7 +82,7 @@ class RuntimeStatus:
                 # setup signal. Preserve a provider failure until real health.
                 self.write(heartbeat=True)
                 return
-            self.value[component].update(state=state, detail=event.get("detail", ""))
+            self.value[component].update(state=state, detail=event.get("detail", ""), updated_at=timestamp())
         self.write()
 
     def write(self, *, state=None, detail=None, heartbeat=False):

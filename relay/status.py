@@ -20,6 +20,7 @@ _FAILURE_STAGES = frozenset({
     "recovery", "expiry", "stop", "stop_submission", "reconciliation", "watch_preparation",
     "preflight", "review", "dispatch_guard", "placement", "response_validation", "cancellation",
     "interpretation", "worker", "discovery", "expiry_session", "monitor_poll", "monitor_evaluation",
+    "position_reconciliation",
 })
 _BROKER_OPERATIONS = frozenset({
     "snapshot", "quote", "nearest_expiry", "prepare_contract", "prepare_entry",
@@ -47,6 +48,10 @@ _FAILURE_EXCEPTIONS = frozenset(
 _FAILURE_CODES = frozenset({
     "internal_error", "broker_error", "schema_incompatible", "dns_failed", "tls_failed", "timeout",
     "browser_profile_busy", "runtime_missing", "local_permission", "network_unavailable",
+    "auth_required", "credentials_missing", "jev_auth_required", "jev_credentials_missing",
+    "model_unavailable", "quota_exhausted", "local_runtime", "runtime_unavailable",
+    "provider_failed", "config_invalid", "invalid_output", "invalid_evidence",
+    "jev_unavailable", "jev_timeout", "jev_rate_limited", "jev_provider_failed", "jev_schema_invalid",
 })
 _SCHEMA_CHECKS = frozenset({"catalog", "arguments", "response"})
 _SCHEMA_REASONS = frozenset({"missing_tool", "contract_changed", "arguments_invalid", "response_invalid"})
@@ -309,6 +314,10 @@ def execution_failure(error, *, stage="execution", context=None):
                 if path.parent.resolve() == Path(__file__).parent.resolve():
                     frames.append(f"relay/{path.name}:{line}:{frame.f_code.co_name}")
             attached = project_execution_diagnostic(getattr(current, "_relay_failure", {}))
+            if name in {"InterpretationError", "JEVError"}:
+                typed_code = getattr(current, "code", None)
+                if isinstance(typed_code, str) and typed_code in _FAILURE_CODES:
+                    code = typed_code
             items.append(project_execution_diagnostic(attached | {
                 "exception": name, "code": attached.get("code", code), "frames": frames[-16:],
             }))

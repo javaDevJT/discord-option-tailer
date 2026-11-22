@@ -1239,7 +1239,7 @@ class CodexInterpreter:
         for name in list(env):
             # Preserve transport/proxy/cert and sandbox settings, not API billing
             # overrides or the parent desktop task's tool connection and identity.
-            if name.startswith("OPENAI_") or name in {
+            if name.startswith(("OPENAI_", "RELAY_T3_WEBHOOK_")) or name in {
                 "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
                 "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
             }:
@@ -1616,13 +1616,20 @@ class CodexInterpreter:
             publish_status(self.on_status, "codex", state, detail=f"{safe_interpretation_reason(last_error)}. {action}")
         raise last_error
 
+    def summarize_incident(self, facts, schema, system_prompt):
+        """Use the isolated subscription path with one attempt and no lock wait."""
+        return self._interpret(facts, schema=schema, system_prompt=system_prompt,
+                               use_cli_default=True, lock_timeout=0, reasoning_effort=self.reasoning_effort)
+
     def _interpret(self, data, *, schema=DECISION_SCHEMA, system_prompt=SYSTEM_PROMPT,
-                   image_sources=(), use_cli_default=False):
+                   image_sources=(), use_cli_default=False, lock_timeout=None, reasoning_effort=None):
         credential = self.source_home / "auth.json"
         if not credential.is_file():
             raise InterpretationError("Isolated Codex requires a file-backed ChatGPT login; run codex login with ChatGPT first", code="credentials_missing", retryable=False)
         from .codex_auth import inference_auth_lock
-        with inference_auth_lock(self.source_home, self.timeout), tempfile.TemporaryDirectory(prefix="discord-relay-codex-") as directory:
+        with inference_auth_lock(
+            self.source_home, self.timeout if lock_timeout is None else lock_timeout
+        ), tempfile.TemporaryDirectory(prefix="discord-relay-codex-") as directory:
             root = Path(directory)
             runtime_home, workspace = root / "home", root / "workspace"
             runtime_home.mkdir(mode=0o700)
@@ -1669,8 +1676,8 @@ class CodexInterpreter:
                 "tools.experimental_request_user_input.enabled": False, "mcp_servers": {},
                 "suppress_unstable_features_warning": True,
             }
-            if not use_cli_default:
-                overrides["model_reasoning_effort"] = self.reasoning_effort
+            if reasoning_effort is not None or not use_cli_default:
+                overrides["model_reasoning_effort"] = reasoning_effort or self.reasoning_effort
             if not use_cli_default and self.service_tier == "fast":
                 overrides["service_tier"] = "fast"
             overrides.update({"features." + name: False for name in self._DISABLED_FEATURES})
