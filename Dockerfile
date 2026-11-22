@@ -12,11 +12,11 @@ RUN --mount=type=cache,target=/go/pkg/mod,id=relay-collector-modules \
     && go mod tidy \
     && CGO_ENABLED=0 go build -p=4 -buildvcs=false -trimpath -ldflags='-s -w' -o /otelcol-contrib .
 
-FROM node:24.22.3-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS codex-runtime
+FROM node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS codex-runtime
 ARG CODEX_VERSION=latest
 RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}"
 
-FROM node:24.22.3-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS novnc-assets
+FROM node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS novnc-assets
 ARG NOVNC_VERSION=1:1.6.0-2
 WORKDIR /tmp
 # Only the static client is served by nginx; Python websockify handles sockets.
