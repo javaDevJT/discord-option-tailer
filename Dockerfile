@@ -1,4 +1,4 @@
-FROM golang:1.27.3-bookworm@sha256:05237276236793ebedaf0b87dab86add9ec9adc66ebef2dbc3107c18254cde1c AS otel-collector
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS otel-collector
 ENV GOTOOLCHAIN=local GOMAXPROCS=4
 RUN --mount=type=cache,target=/go/pkg/mod,id=relay-collector-modules \
     --mount=type=cache,target=/root/.cache/go-build,id=relay-collector-build \
