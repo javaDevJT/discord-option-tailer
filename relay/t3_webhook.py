@@ -8,10 +8,8 @@ import hmac
 import json
 import os
 import re
-import socket
+import subprocess
 from typing import Mapping
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 URL_ENV = "RELAY_T3_WEBHOOK_URL"
@@ -20,7 +18,12 @@ SECRET_ENV = "RELAY_T3_WEBHOOK_SIGNING_SECRET"
 MAX_URL_BYTES = 2048
 MAX_SECRET_BYTES = 4096
 MAX_PAYLOAD_BYTES = 64 * 1024
-HTTP_TIMEOUT_SECONDS = 10.0
+_CURL_ARGS = (
+    "curl", "--disable", "--config", "-", "--request", "POST", "--proto", "=https",
+    "--noproxy", "*", "--silent", "--output", os.devnull, "--connect-timeout", "8", "--max-time", "10",
+    "--write-out", "%{http_code}\n%header{cf-ray}\n",
+)
+_CF_RAY = re.compile(rb"[0-9a-fA-F]{16,32}-[A-Z0-9]{3}")
 
 _ENDPOINT = re.compile(
     r"\Ahttps://relay\.t3\.codes/v1/hooks/"
@@ -82,7 +85,7 @@ class T3WebhookConfig:
 
 
 class DeliveryError(RuntimeError):
-    """A delivery failure carrying only a fixed code and optional HTTP status."""
+    """A delivery failure carrying a fixed code and sanitized response metadata."""
 
     _MESSAGES = {
         "invalid_configuration": "T3 webhook configuration is invalid",
@@ -95,18 +98,14 @@ class DeliveryError(RuntimeError):
         "invalid_response": "T3 webhook returned an invalid response",
     }
 
-    def __init__(self, code: str, status: int | None = None):
+    def __init__(self, code: str, status: int | None = None, *, cf_ray: bytes = b""):
         self.code = code if isinstance(code, str) and code in _DELIVERY_CODES else "network_error"
         self.status = _valid_status(status)
+        self.cf_ray = cf_ray.decode("ascii") if isinstance(cf_ray, bytes) and _CF_RAY.fullmatch(cf_ray) else None
         message = self._MESSAGES[self.code]
         if self.status is not None:
             message = f"{message} (status {self.status})"
         super().__init__(message)
-
-
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, new):
-        return None
 
 
 def load_config(environ: Mapping[str, object] | None = None) -> T3WebhookConfig | None:
@@ -163,55 +162,12 @@ def _serialize_payload(payload: object) -> bytes:
     return body
 
 
-def _close_quietly(response: object) -> None:
-    try:
-        response.close()
-    except Exception:
-        pass
-
-
-def _open_request(request: Request):
-    """Return (response, failure), converting urllib errors to safe values."""
-
-    try:
-        opener = build_opener(ProxyHandler({}), _NoRedirect())
-        return opener.open(request, timeout=HTTP_TIMEOUT_SECONDS), None
-    except HTTPError as exc:
-        status = _valid_status(getattr(exc, "code", None))
-        _close_quietly(exc)
-        return None, DeliveryError("http_error", status)
-    except (TimeoutError, socket.timeout):
-        return None, DeliveryError("timeout")
-    except URLError as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            return None, DeliveryError("timeout")
-        return None, DeliveryError("network_error")
-    except Exception:
-        return None, DeliveryError("network_error")
-
-
-def _response_failure(response: object) -> DeliveryError | None:
-    try:
-        status = _valid_status(response.getcode())
-    except Exception:
-        status = None
-    finally:
-        _close_quietly(response)
-
-    if status is None:
-        return DeliveryError("invalid_response")
-    if not 200 <= status < 300:
-        return DeliveryError("http_error", status)
-    return None
-
-
 def deliver(config: T3WebhookConfig, payload: dict) -> None:
     """POST one bounded JSON body with an HMAC over the exact bytes sent.
 
     This function is synchronous by design. Callers running an async loop should
     run it in a worker thread. It does not retry, log, emit telemetry, or follow
-    redirects. Response bodies are deliberately not read.
+    redirects. curl discards the response body.
     """
 
     if (
@@ -223,26 +179,39 @@ def deliver(config: T3WebhookConfig, payload: dict) -> None:
 
     body = _serialize_payload(payload)
     signature = hmac.new(config._signing_secret, body, hashlib.sha256).hexdigest()
-    request = None
-    request_failed = False
+    options = (
+        ("url", config._url),
+        ("header", "Content-Type: application/json"),
+        ("header", f"X-Hub-Signature-256: sha256={signature}"),
+        ("data-binary", body.decode("utf-8")),
+    )
+    # Supply the bearer URL, signature, and exact UTF-8 body privately on stdin.
+    request = "".join(f"{key} = {json.dumps(value, ensure_ascii=False)}\n" for key, value in options).encode("utf-8")
+    failure = None
     try:
-        request = Request(
-            config._url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Hub-Signature-256": f"sha256={signature}",
-            },
-            method="POST",
+        response = subprocess.run(
+            _CURL_ARGS,
+            input=request,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=12,
+            check=False,
+            env={"PATH": os.environ.get("PATH", os.defpath)},
         )
-    except Exception:
-        request_failed = True
-    if request_failed:
-        raise DeliveryError("request_error")
+    except subprocess.TimeoutExpired:
+        failure = DeliveryError("timeout")
+    except (OSError, subprocess.SubprocessError):
+        failure = DeliveryError("network_error")
+    if failure is not None:
+        raise failure
 
-    response, failure = _open_request(request)
-    if failure is not None:
-        raise failure
-    failure = _response_failure(response)
-    if failure is not None:
-        raise failure
+    status_line, _, headers = response.stdout.partition(b"\n")
+    cf_ray = headers.partition(b"\n")[0]
+    status = _valid_status(int(status_line)) if len(status_line) == 3 and status_line.isdigit() else None
+    if status is not None and not 200 <= status < 300:
+        raise DeliveryError("http_error", status, cf_ray=cf_ray)
+    if response.returncode:
+        code = "timeout" if response.returncode == 28 else "network_error"
+        raise DeliveryError(code, status, cf_ray=cf_ray)
+    if status is None:
+        raise DeliveryError("invalid_response")

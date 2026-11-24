@@ -316,6 +316,8 @@ class IncidentReporter:
         except t3_webhook.DeliveryError as exc:
             LOG.warning("T3 incident report failed (incident=%s, code=%s, http_status=%s)",
                         incident_id, exc.code, exc.status or "unavailable")
+            if exc.cf_ray:
+                LOG.warning("T3 webhook Cloudflare request (incident=%s, cf_ray=%s)", incident_id, exc.cf_ray)
             if exc.status in {401, 403}:
                 mark_t3_auth_attention(runtime_path)
 
