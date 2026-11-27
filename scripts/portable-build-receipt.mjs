@@ -14,6 +14,7 @@ const MAX_ZIP_BYTES = 32 * 1024 * 1024;
 const MAX_LOG_BYTES = 64 * 1024 * 1024;
 const MAX_LOG_MEMBERS = 256;
 const MAX_MEMBER_BYTES = 16 * 1024 * 1024;
+const INDETERMINATE_RECEIPT_ACK = 'Quarterback receipt submission returned an indeterminate success response; check the persisted receipt before replaying.';
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/i;
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
@@ -616,6 +617,19 @@ function createReceiptUploadBudget(targetCount, timing = {}) {
   };
 }
 
+function matchesPersistenceAcknowledgment(bytes, receipt) {
+  try {
+    const acknowledgment = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    const key = `${receipt.imageRepository}@${receipt.imageDigest}`.toLowerCase();
+    const sourceKey = `${key}@${receipt.sourceCommit.toLowerCase()}`;
+    return isRecord(acknowledgment) && acknowledgment.accepted === true
+      && (acknowledgment.key === key || acknowledgment.key === sourceKey)
+      && canonicalJSON(acknowledgment.receipt) === canonicalJSON(receipt);
+  } catch {
+    return false;
+  }
+}
+
 async function postReceipt(endpoint, token, receipt, fetchImpl, imageRepository, budget) {
   // Serialize once so every retry sends the exact same signed bytes.
   const body = JSON.stringify(receipt);
@@ -654,9 +668,19 @@ async function postReceipt(endpoint, token, receipt, fetchImpl, imageRepository,
       continue;
     }
     if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
-    const responseBytes = await readLimited(response, MAX_JSON_BYTES, 'Quarterback receipt submission');
+    const successful = response.status === 200 || response.status === 201;
+    let responseBytes;
+    try {
+      responseBytes = await readLimited(response, MAX_JSON_BYTES, 'Quarterback receipt submission');
+    } catch (error) {
+      if (successful) fail(INDETERMINATE_RECEIPT_ACK);
+      throw error;
+    }
     if (budget.now() >= budget.deadline) fail(`Quarterback receipt submission retry deadline expired for ${imageRepository}.`);
-    if (response.status === 200 || response.status === 201) return;
+    if (successful) {
+      if (!matchesPersistenceAcknowledgment(responseBytes, receipt)) fail(INDETERMINATE_RECEIPT_ACK);
+      return;
+    }
     if (response.status !== 503) fail(`Quarterback receipt submission returned HTTP ${response.status} for ${imageRepository}.`);
 
     const retryDelay = rateLimitRetryDelay(response, responseBytes);
@@ -710,7 +734,7 @@ export async function produceBuildReceipts(options) {
       runAttempt: evidence.runAttempt,
       runConclusion: 'success',
       publisherIdentity: config.publisherIdentity,
-      imageRepository: target.imageRepository,
+      imageRepository: `ghcr.io/${target.imageRepository}`,
       imageDigest,
       checkRuns: evidence.checks,
       securityResults: checksForSecurity,
