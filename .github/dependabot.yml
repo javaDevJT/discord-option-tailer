@@ -7,7 +7,7 @@ updates:
       day: monday
       time: "06:00"
       timezone: America/Detroit
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       minor-and-patch:
         patterns:
@@ -23,7 +23,7 @@ updates:
       day: monday
       time: "06:00"
       timezone: America/Detroit
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       minor-and-patch:
         patterns:
@@ -39,7 +39,7 @@ updates:
       day: monday
       time: "06:00"
       timezone: America/Detroit
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       minor-and-patch:
         patterns:
@@ -55,7 +55,7 @@ updates:
       day: monday
       time: "06:00"
       timezone: America/Detroit
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       minor-and-patch:
         patterns:
