@@ -1,0 +1,60 @@
+name: Renovate verification
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate-verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Renovate dependency CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Select the dependency verification scope
+        id: scope
+        env:
+          IS_DEPENDENCY_UPDATE: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.id == 29139614 && startsWith(github.head_ref, 'renovate/') && github.head_ref != 'renovate/configure' }}
+          IS_ONBOARDING: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'renovate/configure' || github.head_ref == 'chore/renovate-onboarding') }}
+        run: |
+          echo "deps=$IS_DEPENDENCY_UPDATE" >> "$GITHUB_OUTPUT"
+          echo "setup=$IS_ONBOARDING" >> "$GITHUB_OUTPUT"
+          if [[ "$IS_DEPENDENCY_UPDATE" == false && "$IS_ONBOARDING" == false ]]; then
+            echo "This pull request uses the repository's normal CI."
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: steps.scope.outputs.deps == 'true' || steps.scope.outputs.setup == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.scope.outputs.setup == 'true'
+        with:
+          node-version: '26.13.1'
+          package-manager-cache: false
+      - name: Validate the Renovate configuration
+        if: steps.scope.outputs.setup == 'true'
+        run: npx --yes --package renovate@45.1.2 -- renovate-config-validator --strict
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.scope.outputs.deps == 'true'
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: steps.scope.outputs.deps == 'true'
+        with:
+          python-version: '3.11'
+      - name: Test Python and JavaScript application
+        if: steps.scope.outputs.deps == 'true'
+        run: |
+          python -m pip install -e '.[browser,robinhood,discord,telemetry,telemetry-test]'
+          python -m playwright install --with-deps chromium
+          node --check relay/static/app.js
+          node --test ops/test-deploy-openwoof.mjs
+          node --test .github/scripts/test-install-browser-deps.mjs
+          python -m unittest discover -s tests -v
