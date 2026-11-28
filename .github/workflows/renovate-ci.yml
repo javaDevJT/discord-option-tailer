@@ -1,6 +1,8 @@
 name: Renovate verification
 on:
-  pull_request:
+  push:
+    branches: [chore/renovate-private-runner]
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -8,20 +10,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: renovate-verify-${{ github.event.pull_request.number }}
+  group: renovate-verify-${{ github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   verify:
     name: Renovate dependency CI
-    runs-on: ubuntu-24.04
+    if: >-
+      github.repository == 'javaDevJT/discord-option-tailer' &&
+      ((github.event_name == 'pull_request_target' &&
+        github.event.pull_request.head.repo.id == github.event.repository.id) ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/chore/renovate-private-runner'))
+    runs-on: truenas-discord-option-tailer-storage-11g
     timeout-minutes: 40
     steps:
       - name: Select the dependency verification scope
         id: scope
         env:
-          IS_DEPENDENCY_UPDATE: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.id == 29139614 && startsWith(github.head_ref, 'renovate/') && github.head_ref != 'renovate/configure' }}
-          IS_ONBOARDING: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'renovate/configure' || github.head_ref == 'chore/renovate-onboarding') }}
+          IS_DEPENDENCY_UPDATE: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.id == 29139614 && startsWith(github.head_ref, 'renovate/') && github.head_ref != 'renovate/configure' }}
+          IS_ONBOARDING: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'renovate/configure' || github.head_ref == 'chore/renovate-onboarding') }}
         run: |
           echo "deps=$IS_DEPENDENCY_UPDATE" >> "$GITHUB_OUTPUT"
           echo "setup=$IS_ONBOARDING" >> "$GITHUB_OUTPUT"
@@ -31,11 +38,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         if: steps.scope.outputs.deps == 'true' || steps.scope.outputs.setup == 'true'
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         if: steps.scope.outputs.setup == 'true'
         with:
-          node-version: '26.13.1'
+          node-version: '24.22.3'
           package-manager-cache: false
       - name: Validate the Renovate configuration
         if: steps.scope.outputs.setup == 'true'
@@ -43,7 +51,7 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         if: steps.scope.outputs.deps == 'true'
         with:
-          node-version: '26'
+          node-version: '24.22.3'
           package-manager-cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         if: steps.scope.outputs.deps == 'true'
@@ -53,7 +61,8 @@ jobs:
         if: steps.scope.outputs.deps == 'true'
         run: |
           python -m pip install -e '.[browser,robinhood,discord,telemetry,telemetry-test]'
-          python -m playwright install --with-deps chromium
+          node .github/scripts/install-browser-deps.mjs
+          python -m playwright install chromium
           node --check relay/static/app.js
           node --test ops/test-deploy-openwoof.mjs
           node --test .github/scripts/test-install-browser-deps.mjs
