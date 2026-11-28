@@ -57,13 +57,28 @@ jobs:
         if: steps.scope.outputs.deps == 'true'
         with:
           python-version: '3.11'
-      - name: Test Python and JavaScript application
+      - name: Install test dependencies and run JavaScript checks
         if: steps.scope.outputs.deps == 'true'
         run: |
           python -m pip install -e '.[browser,robinhood,discord,telemetry,telemetry-test]'
-          node .github/scripts/install-browser-deps.mjs
-          python -m playwright install chromium
           node --check relay/static/app.js
           node --test ops/test-deploy-openwoof.mjs
           node --test .github/scripts/test-install-browser-deps.mjs
+      - name: Stage Chromium system libraries
+        if: steps.scope.outputs.deps == 'true'
+        run: node .github/scripts/install-browser-deps.mjs
+      - name: Install Playwright Chromium and run Python tests
+        if: steps.scope.outputs.deps == 'true'
+        run: |
+          python -m playwright install chromium
           python -m unittest discover -s tests -v
+      - name: Remove temporary browser dependencies
+        if: always() && steps.scope.outputs.deps == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          staged_roots=( "$RUNNER_TEMP"/discord-playwright-deps-* )
+          if (( ${#staged_roots[@]} )); then
+            rm -rf -- "${staged_roots[@]}"
+          fi
